@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# tai - Tail an AI agent log and narrate what's happening using a fast model.
+#
+# Currently understands Claude Code stream-json logs (assistant text, tool_use,
+# tool_result events). One short sentence per change is printed to stdout.
+#
+# Usage: tai <log-file>
+# Env:
+#   TAI_MODEL    model passed to `claude -p` (default: claude-haiku-4-5)
+#   TAI_IDLE     seconds of idleness before flushing the buffer (default: 3)
+#   TAI_MAX_BUF  max events buffered before forcing a flush (default: 40)
+
+set -uo pipefail
+
+MODEL="${TAI_MODEL:-claude-haiku-4-5}"
+IDLE_FLUSH="${TAI_IDLE:-3}"
+MAX_BUF="${TAI_MAX_BUF:-40}"
+
+SYSTEM='You narrate what an AI coding agent is doing, in real time, for a human watching. You will receive a chunk of recent events: [say] = assistant text, [tool:Name] = tool call, [result] = tool result. Reply with ONE short sentence (max ~20 words) describing what is happening NOW. Be concrete: name the tool/file/command if relevant. No preamble, no quotes, no markdown.'
+
+usage() {
+  cat <<EOF
+usage: tai <log-file>
+
+Tails a Claude Code stream-json log and narrates the agent's activity
+using a fast model (default: claude-haiku-4-5).
+
+Env vars: TAI_MODEL, TAI_IDLE, TAI_MAX_BUF
+EOF
+}
+
+if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage; exit 2
+fi
+
+LOG="$1"
+
+for cmd in jq claude tail; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "tai: requires '$cmd' on PATH" >&2; exit 1; }
+done
+
+while [[ ! -e "$LOG" ]]; do
+  echo "tai: waiting for $LOG ..." >&2
+  sleep 0.5
+done
+
+# jq filter: turn stream-json lines into one-line human-readable events.
+# Uses -R to read raw lines and `fromjson?` to skip non-JSON header/blank lines.
+JQ_FILTER='
+def trunc: tostring | gsub("\n"; " ") | if length > 400 then .[0:400] + "…" else . end;
+fromjson? // empty |
+if .type == "assistant" then
+  (.message.content // [])[]
+  | if .type == "text" and ((.text // "") | length) > 0 then
+      "[say] " + (.text | trunc)
+    elif .type == "tool_use" then
+      "[tool:" + (.name // "?") + "] " +
+      ((.input.description // .input.command // .input.file_path // .input.pattern // (.input | tostring)) | trunc)
+    else empty end
+elif .type == "user" then
+  (.message.content // [])[]
+  | select(type == "object" and .type == "tool_result")
+  | ((.content | if type == "array" then map(.text // "") | join(" ") else tostring end) | trunc) as $c
+  | (if .is_error == true then "[result ERROR] " else "[result] " end) + $c
+else empty end
+'
+
+echo "tai: watching $LOG  (model=$MODEL, idle=${IDLE_FLUSH}s)" >&2
+
+LAST_SUMMARY=""
+
+flush() {
+  local payload="$1"
+  [[ -z "$payload" ]] && return 0
+  local out
+  out=$(claude -p --model "$MODEL" --append-system-prompt "$SYSTEM" "$payload" 2>/dev/null) || return 0
+  out="$(printf '%s' "$out" | tr -d '\r' | awk 'NF{print; exit}')"
+  [[ -z "$out" ]] && return 0
+  if [[ "$out" == "$LAST_SUMMARY" ]]; then return 0; fi
+  LAST_SUMMARY="$out"
+  printf '%s  %s\n' "$(date +%H:%M:%S)" "$out"
+}
+
+# Stream: tail -F | jq | read loop with idle timeout.
+# Uses a coproc-style pipe via process substitution so `read -t` works.
+{
+  tail -n 0 -F "$LOG" 2>/dev/null \
+    | jq -rcR --unbuffered "$JQ_FILTER" 2>/dev/null
+} | {
+  BUF=""
+  COUNT=0
+  while :; do
+    if IFS= read -r -t "$IDLE_FLUSH" line; then
+      [[ -z "$line" ]] && continue
+      BUF+="$line"$'\n'
+      COUNT=$((COUNT + 1))
+      if (( COUNT >= MAX_BUF )); then
+        flush "$BUF"; BUF=""; COUNT=0
+      fi
+    else
+      rc=$?
+      if (( COUNT > 0 )); then
+        flush "$BUF"; BUF=""; COUNT=0
+      fi
+      # rc > 128 means timeout; rc == 1 with no input means EOF -> exit
+      if (( rc == 1 )); then exit 0; fi
+    fi
+  done
+}
