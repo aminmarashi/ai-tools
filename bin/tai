@@ -5,16 +5,19 @@
 # tool_result events). One short sentence per change is printed to stdout.
 #
 # Usage: tai [--mute] <log-file>
-#   --mute       do not pipe the narration to `tts-read` even if it is installed
+#   --mute        do not pipe the narration to `tts-read` even if it is installed
 # Env:
-#   TAI_MODEL    model passed to `claude -p` (default: claude-haiku-4-5)
-#   TAI_IDLE     seconds of idleness before flushing the buffer (default: 3)
-#   TAI_MAX_BUF  max events buffered before forcing a flush (default: 40)
-#   TAI_TAIL     raw lines of existing log to seed context on startup
-#                (default: 200). These lines are NOT summarized on their own;
-#                they only provide context when the next new line arrives.
-#                Set to 0 to behave like `tail -n 0 -F`.
-#   TAI_RING     max events kept in the rolling context window (default: 50).
+#   TAI_MODEL     model passed to `claude -p` (default: claude-haiku-4-5)
+#   TAI_IDLE      seconds of idleness before flushing the buffer (default: 3)
+#   TAI_MAX_BUF   max events buffered before forcing a flush (default: 40)
+#   TAI_TAIL      raw lines of existing log to seed context on startup
+#                 (default: 200). These lines are NOT summarized on their own;
+#                 they only provide context when the next new line arrives.
+#                 Set to 0 to behave like `tail -n 0 -F`.
+#   TAI_RING      max events kept in the rolling context window (default: 50).
+#   TAI_TIMEOUT   seconds to wait for `claude -p` before giving up on a flush
+#                 (default: 45). On timeout the events stay in the rolling
+#                 context window, so the next batch can still summarize them.
 
 set -uo pipefail
 
@@ -23,6 +26,7 @@ IDLE_FLUSH="${TAI_IDLE:-3}"
 MAX_BUF="${TAI_MAX_BUF:-40}"
 TAIL_LINES="${TAI_TAIL:-200}"
 RING_SIZE="${TAI_RING:-50}"
+CALL_TIMEOUT="${TAI_TIMEOUT:-45}"
 
 SYSTEM='You are a narrator watching the live log of ANOTHER AI coding agent and describing what THAT agent is doing, in real time, for a human observer. You are not the agent — you are reporting on it. The input is a chunk of recent events from the agent ['"'"'s log: [say] = the agent'"'"'s assistant text, [tool:Name] = a tool the agent invoked, [result] = the tool result the agent received. Reply with ONE short sentence (max ~20 words) describing what the agent is doing NOW. Use third person ("the agent is …"), be concrete, and name the tool/file/command if relevant. No preamble, no quotes, no markdown.'
 
@@ -72,6 +76,17 @@ for cmd in jq claude tail; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "tai: requires '$cmd' on PATH" >&2; exit 1; }
 done
 
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(timeout "$CALL_TIMEOUT")
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(gtimeout "$CALL_TIMEOUT")
+elif command -v perl >/dev/null 2>&1; then
+  TIMEOUT_CMD=(perl -e 'alarm shift; exec @ARGV' "$CALL_TIMEOUT")
+else
+  echo "tai: warning: no timeout/perl on PATH; model calls won't be bounded" >&2
+  TIMEOUT_CMD=(env)
+fi
+
 while [[ ! -e "$LOG" ]]; do
   echo "tai: waiting for $LOG ..." >&2
   sleep 0.5
@@ -99,7 +114,7 @@ else empty end
 '
 
 if (( TTS_ENABLED == 1 )); then TTS_STATE="on"; elif (( MUTE == 1 )); then TTS_STATE="muted"; else TTS_STATE="no tts-read"; fi
-echo "tai: watching $LOG  (model=$MODEL, idle=${IDLE_FLUSH}s, seed=${TAIL_LINES} lines, tts=${TTS_STATE})" >&2
+echo "tai: watching $LOG  (model=$MODEL, idle=${IDLE_FLUSH}s, timeout=${CALL_TIMEOUT}s, seed=${TAIL_LINES} lines, tts=${TTS_STATE})" >&2
 
 if [[ -t 2 ]]; then SPIN_TTY=1; else SPIN_TTY=0; fi
 
@@ -110,12 +125,15 @@ start_spinner() {
   (( SPIN_TTY == 1 )) || return 0
   [[ -n "$SPIN_PID" ]] && return 0
   local msg="${1:-thinking}"
+  local started
+  started=$(date +%s)
   (
     frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
     i=0
     while :; do
       f="${frames[$((i % ${#frames[@]}))]}"
-      printf '\r\033[2K%s %s' "$f" "$msg" >&2
+      elapsed=$(( $(date +%s) - started ))
+      printf '\r\033[2K%s %s [%ds]' "$f" "$msg" "$elapsed" >&2
       i=$((i+1))
       sleep 0.1
     done
@@ -136,8 +154,18 @@ trap 'stop_spinner' EXIT INT TERM
 flush() {
   local payload="$1"
   [[ -z "$payload" ]] && return 0
-  local out
-  out=$(claude -p --model "$MODEL" --append-system-prompt "$SYSTEM" "$payload" 2>/dev/null) || { stop_spinner; return 0; }
+  local out rc
+  out=$("${TIMEOUT_CMD[@]}" claude -p --model "$MODEL" --append-system-prompt "$SYSTEM" "$payload" 2>/dev/null)
+  rc=$?
+  if (( rc != 0 )); then
+    stop_spinner
+    # 124 = `timeout`/`gtimeout` timeout, 142 = SIGALRM (perl `alarm`).
+    if (( rc == 124 || rc == 142 )); then
+      printf '%s  tai: model call timed out after %ds (rc=%d) — events kept for next batch\n' \
+        "$(date +%H:%M:%S)" "$CALL_TIMEOUT" "$rc" >&2
+    fi
+    return 0
+  fi
   out="$(printf '%s' "$out" | tr -d '\r' | awk 'NF{print; exit}')"
   stop_spinner
   [[ -z "$out" ]] && return 0

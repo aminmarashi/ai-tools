@@ -56,7 +56,13 @@ you hear the description aloud. Pass `--mute` to disable.
 
 Requirements: `jq`, the `claude` CLI on `PATH`. Optional: `tts-read`.
 
-Env: `TAI_MODEL`, `TAI_IDLE`, `TAI_MAX_BUF`.
+If `claude -p` doesn't return within `TAI_TIMEOUT` seconds (default
+`45`), the call is killed and a warning is logged; the events stay in
+the rolling context window so the next batch can still describe them.
+The spinner shows elapsed seconds (`narrating (3 new) [12s]`) so a
+slow model call doesn't look like a hang.
+
+Env: `TAI_MODEL`, `TAI_IDLE`, `TAI_MAX_BUF`, `TAI_TIMEOUT`.
 
 ## Adding a tool
 
