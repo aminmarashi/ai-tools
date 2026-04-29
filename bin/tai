@@ -4,7 +4,8 @@
 # Currently understands Claude Code stream-json logs (assistant text, tool_use,
 # tool_result events). One short sentence per change is printed to stdout.
 #
-# Usage: tai <log-file>
+# Usage: tai [--mute] <log-file>
+#   --mute       do not pipe the narration to `tts-read` even if it is installed
 # Env:
 #   TAI_MODEL    model passed to `claude -p` (default: claude-haiku-4-5)
 #   TAI_IDLE     seconds of idleness before flushing the buffer (default: 3)
@@ -23,11 +24,11 @@ MAX_BUF="${TAI_MAX_BUF:-40}"
 TAIL_LINES="${TAI_TAIL:-200}"
 RING_SIZE="${TAI_RING:-50}"
 
-SYSTEM='You narrate what an AI coding agent is doing, in real time, for a human watching. You will receive a chunk of recent events: [say] = assistant text, [tool:Name] = tool call, [result] = tool result. Reply with ONE short sentence (max ~20 words) describing what is happening NOW. Be concrete: name the tool/file/command if relevant. No preamble, no quotes, no markdown.'
+SYSTEM='You are a narrator watching the live log of ANOTHER AI coding agent and describing what THAT agent is doing, in real time, for a human observer. You are not the agent — you are reporting on it. The input is a chunk of recent events from the agent ['"'"'s log: [say] = the agent'"'"'s assistant text, [tool:Name] = a tool the agent invoked, [result] = the tool result the agent received. Reply with ONE short sentence (max ~20 words) describing what the agent is doing NOW. Use third person ("the agent is …"), be concrete, and name the tool/file/command if relevant. No preamble, no quotes, no markdown.'
 
 usage() {
   cat <<EOF
-usage: tai <log-file>
+usage: tai [--mute] <log-file>
 
 Tails a Claude Code stream-json log and narrates the agent's activity
 using a fast model (default: claude-haiku-4-5).
@@ -37,15 +38,35 @@ does NOT summarize until at least one new line is appended. This way
 tai is silent against stale logs and only invokes the model when there
 is genuinely new activity to narrate.
 
+If \`tts-read\` is found on PATH, each narration line is also piped to it
+(echo "<sentence>" | tts-read) so you hear the description aloud. Pass
+--mute to disable that even when tts-read is installed.
+
 Env vars: TAI_MODEL, TAI_IDLE, TAI_MAX_BUF, TAI_TAIL, TAI_RING
 EOF
 }
 
-if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+MUTE=0
+LOG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 2 ;;
+    --mute) MUTE=1; shift ;;
+    --) shift; LOG="${1:-}"; break ;;
+    -*) echo "tai: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) LOG="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$LOG" ]]; then
   usage; exit 2
 fi
 
-LOG="$1"
+if (( MUTE == 0 )) && command -v tts-read >/dev/null 2>&1; then
+  TTS_ENABLED=1
+else
+  TTS_ENABLED=0
+fi
 
 for cmd in jq claude tail; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "tai: requires '$cmd' on PATH" >&2; exit 1; }
@@ -77,7 +98,8 @@ elif .type == "user" then
 else empty end
 '
 
-echo "tai: watching $LOG  (model=$MODEL, idle=${IDLE_FLUSH}s, seed=${TAIL_LINES} lines)" >&2
+if (( TTS_ENABLED == 1 )); then TTS_STATE="on"; elif (( MUTE == 1 )); then TTS_STATE="muted"; else TTS_STATE="no tts-read"; fi
+echo "tai: watching $LOG  (model=$MODEL, idle=${IDLE_FLUSH}s, seed=${TAIL_LINES} lines, tts=${TTS_STATE})" >&2
 
 LAST_SUMMARY=""
 
@@ -91,6 +113,9 @@ flush() {
   if [[ "$out" == "$LAST_SUMMARY" ]]; then return 0; fi
   LAST_SUMMARY="$out"
   printf '%s  %s\n' "$(date +%H:%M:%S)" "$out"
+  if (( TTS_ENABLED == 1 )); then
+    printf '%s\n' "$out" | tts-read >/dev/null 2>&1 &
+  fi
 }
 
 # Stream: tail -F | jq | read loop with idle timeout.

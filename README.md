@@ -37,6 +37,7 @@ a time, using a fast model.
 
 ```bash
 tai /path/to/agent.log
+tai --mute /path/to/agent.log   # skip TTS even if tts-read is installed
 ```
 
 Currently understands Claude Code stream-json logs (assistant text,
@@ -44,7 +45,11 @@ tool calls, tool results). Buffers events and flushes after a short
 idle window, then asks `claude -p --model claude-haiku-4-5` to write a
 single sentence describing what the agent is doing right now.
 
-Requirements: `jq`, the `claude` CLI on `PATH`.
+If [`tts-read`](https://github.com/aminmarashi/tts-read) is on `PATH`,
+each narration line is also piped to it (`echo "..." | tts-read`) so
+you hear the description aloud. Pass `--mute` to disable.
+
+Requirements: `jq`, the `claude` CLI on `PATH`. Optional: `tts-read`.
 
 Env: `TAI_MODEL`, `TAI_IDLE`, `TAI_MAX_BUF`.
 
