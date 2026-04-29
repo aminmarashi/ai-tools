@@ -45,6 +45,11 @@ tool calls, tool results). Buffers events and flushes after a short
 idle window, then asks `claude -p --model claude-haiku-4-5` to write a
 single sentence describing what the agent is doing right now.
 
+While events are buffered or the model is being called, a small
+braille spinner is drawn on stderr (`buffering new log events…` →
+`narrating (N new)`) so you can tell the tool is alive between
+narration lines. The spinner is suppressed when stderr isn't a TTY.
+
 If [`tts-read`](https://github.com/aminmarashi/tts-read) is on `PATH`,
 each narration line is also piped to it (`echo "..." | tts-read`) so
 you hear the description aloud. Pass `--mute` to disable.

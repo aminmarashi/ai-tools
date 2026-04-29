@@ -101,14 +101,45 @@ else empty end
 if (( TTS_ENABLED == 1 )); then TTS_STATE="on"; elif (( MUTE == 1 )); then TTS_STATE="muted"; else TTS_STATE="no tts-read"; fi
 echo "tai: watching $LOG  (model=$MODEL, idle=${IDLE_FLUSH}s, seed=${TAIL_LINES} lines, tts=${TTS_STATE})" >&2
 
+if [[ -t 2 ]]; then SPIN_TTY=1; else SPIN_TTY=0; fi
+
 LAST_SUMMARY=""
+SPIN_PID=""
+
+start_spinner() {
+  (( SPIN_TTY == 1 )) || return 0
+  [[ -n "$SPIN_PID" ]] && return 0
+  local msg="${1:-thinking}"
+  (
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    i=0
+    while :; do
+      f="${frames[$((i % ${#frames[@]}))]}"
+      printf '\r\033[2K%s %s' "$f" "$msg" >&2
+      i=$((i+1))
+      sleep 0.1
+    done
+  ) &
+  SPIN_PID=$!
+}
+
+stop_spinner() {
+  [[ -z "$SPIN_PID" ]] && return 0
+  kill "$SPIN_PID" 2>/dev/null
+  wait "$SPIN_PID" 2>/dev/null
+  SPIN_PID=""
+  (( SPIN_TTY == 1 )) && printf '\r\033[2K' >&2
+}
+
+trap 'stop_spinner' EXIT INT TERM
 
 flush() {
   local payload="$1"
   [[ -z "$payload" ]] && return 0
   local out
-  out=$(claude -p --model "$MODEL" --append-system-prompt "$SYSTEM" "$payload" 2>/dev/null) || return 0
+  out=$(claude -p --model "$MODEL" --append-system-prompt "$SYSTEM" "$payload" 2>/dev/null) || { stop_spinner; return 0; }
   out="$(printf '%s' "$out" | tr -d '\r' | awk 'NF{print; exit}')"
+  stop_spinner
   [[ -z "$out" ]] && return 0
   if [[ "$out" == "$LAST_SUMMARY" ]]; then return 0; fi
   LAST_SUMMARY="$out"
@@ -131,6 +162,8 @@ flush() {
   # We keep a rolling ring of the most recent events purely as context. The
   # model is only invoked when at least one NEW line has arrived since the
   # last flush — so a stale log produces zero agent calls.
+  trap 'stop_spinner' EXIT INT TERM
+
   EVENTS=()
   NEW=0
 
@@ -144,6 +177,8 @@ flush() {
   flush_events() {
     local payload="" e
     for e in "${EVENTS[@]}"; do payload+="$e"$'\n'; done
+    stop_spinner
+    start_spinner "narrating ($NEW new)"
     flush "$payload"
     NEW=0
   }
@@ -163,6 +198,9 @@ flush() {
       [[ -z "$line" ]] && continue
       push_event "$line"
       NEW=$((NEW + 1))
+      if [[ -z "$SPIN_PID" ]]; then
+        start_spinner "buffering new log events…"
+      fi
       if (( NEW >= MAX_BUF )); then
         flush_events
       fi
