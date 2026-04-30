@@ -13,12 +13,12 @@
 # no syntax-highlight color, headings tuned for short scrolls.
 #
 # Usage:
-#   plan2pdf <plan.md> [-o out.pdf] [--repo <dir>]... [-k]
+#   plan2pdf <plan.md> [-o out.pdf] [-k]
 #   plan2pdf - [-o out.pdf]                       # read plan from stdin
 #
-# By default plan2pdf runs claude from your current working directory,
-# so claude inherits read access to whatever repo you launched it in.
-# Pass --repo for each additional directory the plan refers to.
+# Run plan2pdf from the directory whose code the plan refers to. Claude
+# inherits read access to the current working directory and uses its
+# auto permission mode to decide which files to inspect.
 #
 # Required:
 #   claude, pandoc, python3, and a Chromium-based browser
@@ -53,13 +53,15 @@ ALLOWED_TOOLS_STR="${PLAN2PDF_ALLOWED_TOOLS:-Read Grep Glob}"
 
 usage() {
   cat <<EOF
-usage: plan2pdf <plan-file|-> [-o output.pdf] [--repo <dir>]... [-k]
+usage: plan2pdf <plan-file|-> [-o output.pdf] [-k]
 
 Rewrites an implementation plan into a self-contained, Kindle-friendly
-PDF using the latest Haiku model with low thinking effort. Claude is
-given read access to the current directory (and any --repo dirs) so it
-can replace file paths, line numbers, and copy-pasted code with prose
-the developer can read end-to-end while away from their laptop.
+PDF using the latest Haiku model with low thinking effort. Claude runs
+in auto permission mode against the current working directory so it
+can read whatever files the plan references and replace file paths,
+line numbers, and copy-pasted code with prose the developer can read
+end-to-end while away from their laptop. Run plan2pdf from inside the
+repo the plan describes.
 
 Mermaid diagrams in the plan (or in the rewritten plan) are rendered
 as images in the PDF via mermaid.js loaded by headless Chrome at
@@ -68,7 +70,6 @@ print time.
 Arguments:
   <plan-file|->     markdown file to read, or '-' for stdin
   -o <output.pdf>   output PDF path (default: <plan-stem>.pdf)
-  --repo <dir>      grant claude read access to <dir> (repeatable)
   -k, --keep-md     also save the rewritten markdown next to the PDF
 
 Env vars: PLAN2PDF_MODEL, PLAN2PDF_EFFORT, PLAN2PDF_KEEP_MD,
@@ -80,7 +81,6 @@ EOF
 INPUT=""
 OUT=""
 KEEP_MD=0
-ADD_DIRS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 2 ;;
@@ -88,15 +88,6 @@ while [[ $# -gt 0 ]]; do
       shift
       OUT="${1:-}"
       [[ -z "$OUT" ]] && { echo "plan2pdf: -o needs an argument" >&2; exit 2; }
-      shift
-      ;;
-    --repo)
-      shift
-      D="${1:-}"
-      [[ -z "$D" ]] && { echo "plan2pdf: --repo needs a directory" >&2; exit 2; }
-      [[ -d "$D" ]] || { echo "plan2pdf: --repo: not a directory: $D" >&2; exit 2; }
-      ABS_D="$(cd "$D" 2>/dev/null && pwd)" || { echo "plan2pdf: cannot resolve $D" >&2; exit 2; }
-      ADD_DIRS+=("$ABS_D")
       shift
       ;;
     -k|--keep-md) KEEP_MD=1; shift ;;
@@ -153,11 +144,15 @@ fi
 
 [[ -z "${PLAN_TEXT// }" ]] && { echo "plan2pdf: input is empty" >&2; exit 1; }
 
-[[ -z "$OUT" ]] && OUT="${STEM}.pdf"
-case "$OUT" in
-  *.pdf) ;;
-  *) OUT="${OUT}.pdf" ;;
-esac
+if [[ -z "$OUT" ]]; then
+  OUT="${STEM}.pdf"
+elif [[ "$OUT" == */ ]] || [[ -d "$OUT" ]]; then
+  # -o points at a directory — write <plan-stem>.pdf inside it.
+  [[ -d "$OUT" ]] || { echo "plan2pdf: output directory does not exist: $OUT" >&2; exit 1; }
+  OUT="${OUT%/}/${STEM}.pdf"
+elif [[ "$OUT" != *.pdf ]]; then
+  OUT="${OUT}.pdf"
+fi
 out_dir="$(dirname "$OUT")"
 [[ -d "$out_dir" ]] || { echo "plan2pdf: output directory does not exist: $out_dir" >&2; exit 1; }
 
@@ -264,15 +259,12 @@ CLAUDE_OPTS=(
   -p
   --model "$MODEL"
   --effort "$EFFORT"
+  --permission-mode auto
   --append-system-prompt "$SYSTEM"
   --allowedTools "$ALLOWED_TOOLS_STR"
 )
-if [[ ${#ADD_DIRS[@]} -gt 0 ]]; then
-  CLAUDE_OPTS+=(--add-dir "${ADD_DIRS[@]}")
-fi
 
 INFO="model=$MODEL effort=$EFFORT renderer=$BROWSER_NAME"
-[[ ${#ADD_DIRS[@]} -gt 0 ]] && INFO+=" extra-repos=${#ADD_DIRS[@]}"
 echo "plan2pdf: rewriting plan ($INFO); claude can take several minutes with --effort=$EFFORT" >&2
 start_spinner "thinking with $MODEL"
 

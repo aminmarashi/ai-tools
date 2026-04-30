@@ -81,17 +81,17 @@ supplements (TTS skips them, so the surrounding prose stands alone).
 The result reads aloud like a chapter of a technical audiobook.
 
 ```bash
-plan2pdf plan.md                            # -> plan.pdf
+plan2pdf plan.md                       # -> plan.pdf
 plan2pdf plan.md -o ~/kindle/plan.pdf
-plan2pdf plan.md --repo ~/devel/other-repo  # add another repo claude can read
-cat plan.md | plan2pdf - -o plan.pdf        # read plan from stdin
-plan2pdf plan.md -k                         # also keep the rewritten .md
+plan2pdf plan.md -o pdfs/              # -> pdfs/plan.pdf (dir target)
+cat plan.md | plan2pdf - -o plan.pdf   # read plan from stdin
+plan2pdf plan.md -k                    # also keep the rewritten .md
 ```
 
-Claude is given read access to the directory you run `plan2pdf` from
-(`Read`, `Grep`, `Glob`) so it can look up anything the plan
-references and explain it in its own words. Pass `--repo <dir>` for
-each additional directory the plan touches.
+Run `plan2pdf` from inside the repo whose code the plan refers to.
+Claude inherits read access to the current directory (limited to
+`Read`, `Grep`, `Glob`) and runs with claude's auto permission mode,
+so it decides on its own which files to inspect.
 
 Mermaid diagrams in the plan (or in claude's rewrite) are rendered as
 images in the PDF by `mermaid.js`, which headless Chrome loads from
