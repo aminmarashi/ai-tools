@@ -1,2 +1,3 @@
 # List of installable tools in bin/. One per line. Lines starting with # are ignored.
 tai
+plan2pdf

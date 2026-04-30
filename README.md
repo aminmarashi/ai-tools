@@ -64,6 +64,48 @@ slow model call doesn't look like a hang.
 
 Env: `TAI_MODEL`, `TAI_IDLE`, `TAI_MAX_BUF`, `TAI_TIMEOUT`.
 
+### `plan2pdf`
+
+Convert an implementation plan into a self-contained PDF sized for a
+Kindle Scribe (or comparable e-ink reader). The plan is rewritten by
+`claude -p --model haiku --effort low` so it reads well **away from
+the codebase**: file paths, line numbers, and copy-pasted hunks are
+stripped and replaced with prose informed by what the code actually
+does.
+
+The rewrite is also tuned to be **text-to-speech friendly** — flowing
+prose rather than telegraphic bullets, English where a code identifier
+would otherwise live, transition sentences between phases, no
+arrow/slash punctuation, and Mermaid diagrams only as visual
+supplements (TTS skips them, so the surrounding prose stands alone).
+The result reads aloud like a chapter of a technical audiobook.
+
+```bash
+plan2pdf plan.md                            # -> plan.pdf
+plan2pdf plan.md -o ~/kindle/plan.pdf
+plan2pdf plan.md --repo ~/devel/other-repo  # add another repo claude can read
+cat plan.md | plan2pdf - -o plan.pdf        # read plan from stdin
+plan2pdf plan.md -k                         # also keep the rewritten .md
+```
+
+Claude is given read access to the directory you run `plan2pdf` from
+(`Read`, `Grep`, `Glob`) so it can look up anything the plan
+references and explain it in its own words. Pass `--repo <dir>` for
+each additional directory the plan touches.
+
+Mermaid diagrams in the plan (or in claude's rewrite) are rendered as
+images in the PDF by `mermaid.js`, which headless Chrome loads from
+jsDelivr at print time. An internet connection is required (`claude`
+needs one too).
+
+Requirements: `claude`, `pandoc`, `python3`, and a Chromium-based
+browser — Google Chrome / Chromium / Brave / Microsoft Edge.
+
+Env: `PLAN2PDF_MODEL`, `PLAN2PDF_EFFORT`, `PLAN2PDF_KEEP_MD`,
+`PLAN2PDF_PAGE`, `PLAN2PDF_FONT`, `PLAN2PDF_FONTSIZE`,
+`PLAN2PDF_TIMEOUT`, `PLAN2PDF_CHROME_TIMEOUT`,
+`PLAN2PDF_ALLOWED_TOOLS`, `PLAN2PDF_DEBUG`.
+
 ## Adding a tool
 
 1. Drop the script into `bin/` and `chmod +x` it.

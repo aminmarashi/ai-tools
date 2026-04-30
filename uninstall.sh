@@ -26,7 +26,8 @@ fi
 
 # Fallback to a built-in list if the manifest can't be fetched.
 if [[ -z "$TOOLS" ]]; then
-  TOOLS="tai"
+  TOOLS="tai
+plan2pdf"
 fi
 
 while IFS= read -r tool; do

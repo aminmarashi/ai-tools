@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# plan2pdf - Convert an implementation plan into a Kindle-friendly PDF.
+#
+# Pipes the plan through `claude -p --model haiku --effort low` with a
+# system prompt that rewrites it for offline reading. Claude is given
+# read access to the local code (Read, Grep, Glob) so it can look up
+# anything the plan references (file paths, function names, line
+# numbers, configuration keys, copy-pasted hunks) and replace those
+# references with self-contained prose informed by what the code
+# actually does. The resulting Markdown — which may include Mermaid
+# diagrams — is rendered to a 6"x9" PDF sized for a Kindle Scribe (or
+# comparable e-ink reader): generous line spacing, ~13pt serif text,
+# no syntax-highlight color, headings tuned for short scrolls.
+#
+# Usage:
+#   plan2pdf <plan.md> [-o out.pdf] [--repo <dir>]... [-k]
+#   plan2pdf - [-o out.pdf]                       # read plan from stdin
+#
+# By default plan2pdf runs claude from your current working directory,
+# so claude inherits read access to whatever repo you launched it in.
+# Pass --repo for each additional directory the plan refers to.
+#
+# Required:
+#   claude, pandoc, python3, and a Chromium-based browser
+#   (Google Chrome / Chromium / Brave / Edge).
+#
+# Mermaid diagrams in the plan or rewrite are rendered by mermaid.js,
+# loaded from jsDelivr at print time. An internet connection is
+# required while plan2pdf runs (it is also required for `claude`).
+#
+# Env:
+#   PLAN2PDF_MODEL          model alias for `claude` (default: haiku)
+#   PLAN2PDF_EFFORT         --effort value (default: low)
+#   PLAN2PDF_KEEP_MD        if set, save the rewritten markdown alongside the PDF
+#   PLAN2PDF_PAGE           CSS @page size (default: "6in 9in")
+#   PLAN2PDF_FONT           CSS font-family (default: Georgia, "Times New Roman", serif)
+#   PLAN2PDF_FONTSIZE       base font-size (default: 13pt)
+#   PLAN2PDF_TIMEOUT        seconds to wait on the model (default: 1800)
+#   PLAN2PDF_CHROME_TIMEOUT seconds to wait on headless chrome (default: 60)
+#   PLAN2PDF_ALLOWED_TOOLS  override claude --allowedTools list (default: Read Grep Glob)
+#   PLAN2PDF_DEBUG          if 1, leave the temp dir in place
+
+set -uo pipefail
+
+MODEL="${PLAN2PDF_MODEL:-haiku}"
+EFFORT="${PLAN2PDF_EFFORT:-low}"
+PAGE_SIZE="${PLAN2PDF_PAGE:-6in 9in}"
+FONT_FAMILY="${PLAN2PDF_FONT:-Georgia, \"Times New Roman\", serif}"
+FONT_SIZE="${PLAN2PDF_FONTSIZE:-13pt}"
+CALL_TIMEOUT="${PLAN2PDF_TIMEOUT:-1800}"
+DEBUG="${PLAN2PDF_DEBUG:-0}"
+ALLOWED_TOOLS_STR="${PLAN2PDF_ALLOWED_TOOLS:-Read Grep Glob}"
+
+usage() {
+  cat <<EOF
+usage: plan2pdf <plan-file|-> [-o output.pdf] [--repo <dir>]... [-k]
+
+Rewrites an implementation plan into a self-contained, Kindle-friendly
+PDF using the latest Haiku model with low thinking effort. Claude is
+given read access to the current directory (and any --repo dirs) so it
+can replace file paths, line numbers, and copy-pasted code with prose
+the developer can read end-to-end while away from their laptop.
+
+Mermaid diagrams in the plan (or in the rewritten plan) are rendered
+as images in the PDF via mermaid.js loaded by headless Chrome at
+print time.
+
+Arguments:
+  <plan-file|->     markdown file to read, or '-' for stdin
+  -o <output.pdf>   output PDF path (default: <plan-stem>.pdf)
+  --repo <dir>      grant claude read access to <dir> (repeatable)
+  -k, --keep-md     also save the rewritten markdown next to the PDF
+
+Env vars: PLAN2PDF_MODEL, PLAN2PDF_EFFORT, PLAN2PDF_KEEP_MD,
+PLAN2PDF_PAGE, PLAN2PDF_FONT, PLAN2PDF_FONTSIZE, PLAN2PDF_TIMEOUT,
+PLAN2PDF_CHROME_TIMEOUT, PLAN2PDF_ALLOWED_TOOLS, PLAN2PDF_DEBUG.
+EOF
+}
+
+INPUT=""
+OUT=""
+KEEP_MD=0
+ADD_DIRS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 2 ;;
+    -o|--output)
+      shift
+      OUT="${1:-}"
+      [[ -z "$OUT" ]] && { echo "plan2pdf: -o needs an argument" >&2; exit 2; }
+      shift
+      ;;
+    --repo)
+      shift
+      D="${1:-}"
+      [[ -z "$D" ]] && { echo "plan2pdf: --repo needs a directory" >&2; exit 2; }
+      [[ -d "$D" ]] || { echo "plan2pdf: --repo: not a directory: $D" >&2; exit 2; }
+      ABS_D="$(cd "$D" 2>/dev/null && pwd)" || { echo "plan2pdf: cannot resolve $D" >&2; exit 2; }
+      ADD_DIRS+=("$ABS_D")
+      shift
+      ;;
+    -k|--keep-md) KEEP_MD=1; shift ;;
+    --) shift; INPUT="${1:-}"; [[ -n "$INPUT" ]] && shift; break ;;
+    -*) echo "plan2pdf: unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *)
+      [[ -n "$INPUT" ]] && { echo "plan2pdf: unexpected arg: $1" >&2; exit 2; }
+      INPUT="$1"
+      shift
+      ;;
+  esac
+done
+
+[[ -z "$INPUT" ]] && { usage >&2; exit 2; }
+
+for cmd in claude pandoc python3; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "plan2pdf: requires '$cmd' on PATH" >&2; exit 1; }
+done
+
+# Locate a Chromium-based browser. plan2pdf renders the PDF via headless
+# Chrome — that is the only supported renderer.
+detect_chrome() {
+  for c in google-chrome-stable google-chrome chromium chromium-browser chrome brave; do
+    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
+  done
+  for app in \
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+    "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+  do
+    [[ -x "$app" ]] && { echo "$app"; return; }
+  done
+  return 1
+}
+
+BROWSER="$(detect_chrome || true)"
+if [[ -z "$BROWSER" ]]; then
+  echo "plan2pdf: needs a Chromium-based browser (Google Chrome, Chromium, Brave, or Edge) for headless PDF rendering" >&2
+  exit 1
+fi
+BROWSER_NAME="$(basename "$BROWSER")"
+
+if [[ "$INPUT" == "-" ]]; then
+  PLAN_TEXT=$(cat)
+  STEM="plan"
+else
+  [[ -r "$INPUT" ]] || { echo "plan2pdf: cannot read '$INPUT'" >&2; exit 1; }
+  PLAN_TEXT=$(cat "$INPUT")
+  base="${INPUT##*/}"
+  STEM="${base%.*}"
+  [[ -z "$STEM" ]] && STEM="plan"
+fi
+
+[[ -z "${PLAN_TEXT// }" ]] && { echo "plan2pdf: input is empty" >&2; exit 1; }
+
+[[ -z "$OUT" ]] && OUT="${STEM}.pdf"
+case "$OUT" in
+  *.pdf) ;;
+  *) OUT="${OUT}.pdf" ;;
+esac
+out_dir="$(dirname "$OUT")"
+[[ -d "$out_dir" ]] || { echo "plan2pdf: output directory does not exist: $out_dir" >&2; exit 1; }
+
+WORKDIR=$(mktemp -d -t plan2pdf.XXXXXX) || { echo "plan2pdf: mktemp failed" >&2; exit 1; }
+
+cleanup_files() {
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "plan2pdf: leaving temp dir at $WORKDIR" >&2
+  else
+    rm -rf "$WORKDIR"
+  fi
+}
+
+SPIN_PID=""
+[[ -t 2 ]] && SPIN_TTY=1 || SPIN_TTY=0
+start_spinner() {
+  (( SPIN_TTY == 1 )) || return 0
+  [[ -n "$SPIN_PID" ]] && return 0
+  local msg="${1:-thinking}"
+  local started; started=$(date +%s)
+  (
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    i=0
+    while :; do
+      f="${frames[$((i % ${#frames[@]}))]}"
+      elapsed=$(( $(date +%s) - started ))
+      printf '\r\033[2K%s %s [%ds]' "$f" "$msg" "$elapsed" >&2
+      i=$((i+1))
+      sleep 0.1
+    done
+  ) &
+  SPIN_PID=$!
+}
+stop_spinner() {
+  [[ -z "$SPIN_PID" ]] && return 0
+  kill "$SPIN_PID" 2>/dev/null
+  wait "$SPIN_PID" 2>/dev/null
+  SPIN_PID=""
+  (( SPIN_TTY == 1 )) && printf '\r\033[2K' >&2
+}
+
+cleanup() { stop_spinner; cleanup_files; }
+trap cleanup EXIT INT TERM
+
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(timeout "$CALL_TIMEOUT")
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(gtimeout "$CALL_TIMEOUT")
+elif command -v perl >/dev/null 2>&1; then
+  TIMEOUT_CMD=(perl -e 'alarm shift; exec @ARGV' "$CALL_TIMEOUT")
+else
+  TIMEOUT_CMD=(env)
+fi
+
+SYSTEM='You are reformatting an implementation plan so its author can both READ it on a Kindle Scribe (or similar e-ink device) AND LISTEN to it via a text-to-speech engine — that is, OFFLINE and AWAY from the codebase. The reader is the developer who wrote (or will write) the code being changed; assume they already know the project, its conventions, and its high-level architecture, but they cannot open their editor while reading or listening.
+
+You DO have read access to the local code (Read, Grep, Glob). USE IT. Whenever the plan references a file path, function or type or symbol name, line number, configuration key, command, or any concrete code construct, look it up so you understand exactly what is being talked about. Then replace the reference in your rewrite with a short, self-contained explanation: what the thing does today, what role it plays, and (where the plan touches it) what the change is and why. Investigate proactively whenever a step would otherwise be opaque without the code in front of you. Spend the tool budget you need.
+
+Rewrite the plan so it is:
+
+1. Self-contained for offline reading and listening.
+   - Strip every reference that only makes sense at the keyboard: file paths, line numbers, copy-pasted code blocks longer than ~15 lines, "see foo.ts:42"-style links, raw diff hunks. Replace each with a short prose summary informed by what you actually read in the code.
+   - When the plan says "modify the X function in path/y.ts", look up X, then write something like: "X is the function that does Y today; we need to change it to Z because …". The reader will navigate to it on their own when they are back at the laptop; do not waste lines on locations.
+   - Keep short pseudo-code, type signatures, or schema fragments only when they materially clarify intent. Drop large code dumps. Prefer English.
+
+2. Linear and self-paced.
+   - Organize as numbered phases or steps, each with a clear WHAT and WHY. Someone reading on a Kindle, or listening on a walk, should never need to flip back to the codebase to understand the next step.
+   - Surface assumptions, ordering constraints, and dependencies between steps. If step 3 only makes sense after step 2 has been verified, say so.
+   - List open questions, decisions, and risks explicitly so the reader can mull them over while away from the laptop.
+   - Where the original plan is vague, look up enough context in the code to infer the obvious intent and state it; do not invent new tasks or drop tasks the author included.
+
+3. Pleasant to read on e-ink AND to listen to via text-to-speech. Write the plan as if it were a chapter of a well-edited technical audiobook.
+   - PROSE FIRST. Write in flowing, complete sentences. Bullets are allowed but each bullet must be a full, readable-aloud sentence or short paragraph — never a telegraphic fragment. Use bullets only for genuinely parallel items; reason in prose.
+   - Each phase, and each sub-step, should open with a smooth transition sentence that frames what this phase accomplishes and how it follows from the previous one. Do NOT jump straight from a heading into a bullet list; a heading followed immediately by terse bullets reads terribly aloud.
+   - **Identifiers belong in the prose only as English noun phrases.** Read every sentence aloud in your head before writing it. If it would sound like a TTS engine spelling out a string of dashes and brackets, REWRITE IT.
+     * Hyphenated kebab-case names (e.g. "order-api-line-items", "auth-service-prod"), dotted module paths ("handlers/mod.rs", "us-east-1.lambda.amazonaws.com"), URL-shaped strings, and angle-bracket placeholders ("<env>", "<id>", "{stage}") MUST NOT appear verbatim in narrative sentences. They are unreadable aloud.
+     * When the plan refers to a family of similarly-named resources (e.g. five DynamoDB tables called "order-api-orders-<env>", "order-api-invoices-<env>", "order-api-line-items-<env>", and so on), collapse them into a single English description: "five database tables — one each for orders, invoices, line items, push subscriptions, and websocket subscriptions, each one suffixed with the environment name". Surface the SHAPE and PURPOSE of the resources, not the strings.
+     * For functions, types, variables, and symbols: name the thing in plain English. "the flush function" not "flush()". "the consecutive-failures counter" not "CONSEC_FAILS". "the request scope" not "RequestScope { tenant_id }". If a name must appear, introduce it once with a backtick and a definition ("a small struct we will call `RequestScope`, which carries the app id"), then refer to it in English from then on.
+     * For code expressions: translate them. "if tenant_id == \"acme\"" becomes "when the request is for acme". "GET /orders?tenantId=acme" becomes "an order-list request scoped to acme". Never quote a raw expression in the middle of a sentence and expect TTS to handle it.
+     * For URLs, query strings, and topic strings: do NOT cite literal examples in narration. "GET /orders?tenantId=acme", "wss://api/ws?tenantId=acme", "<tenantId>:<scope>:<id>", "acme:order:abc", "?tenantId=acme" — these are unreadable aloud and add no value beyond the prose around them. Describe the request or topic in English ("a list request for the orders belonging to the acme tenant", "topics are now keyed by tenant, then scope, then id"). If you absolutely need to show a literal shape (rare), put it in a fenced code block on its own line, prefaced by a sentence the listener can hear; never embed it in the middle of a paragraph.
+     * For file paths: do not name files at all. Describe the module in English ("the orders handler", "the migrations runner") — the developer knows where it lives.
+   - Spell out abbreviations on first use, then use the short form afterwards. Avoid arrow characters ("->", "=>"), forward slashes as separators, ampersands, "&&" / "||", parenthetical asides nested more than one level deep, and any sequence of punctuation that has no spoken equivalent. When such tokens are unavoidable, surround them with words that make the sentence still parse aloud.
+   - Numbers and quantities: small ones ("two", "three") read as words; technical magnitudes ("about forty events", "around three seconds") read as you would say them.
+   - Mermaid diagrams (fenced as ```mermaid) are OPTIONAL and SUPPLEMENTAL only. They render as images for the e-ink reader, but text-to-speech will skip them entirely, so the surrounding prose must already convey the same information end-to-end. Use mermaid sparingly and only where a picture genuinely helps; if the prose carries the meaning on its own, omit the diagram. Always introduce a diagram with a sentence like "The flow looks like this:" so the audio listener has context before the silence.
+   - Use a single H1 title, H2 per phase, H3 for sub-steps. Keep paragraphs short (two to four sentences) so the listener can pause and resume cleanly.
+   - No HTML. No front-matter. No metadata block. **The very first character of your reply MUST be the "#" of the H1 title.** Do not write a preamble, a meta-comment, an explanation of what you are about to do, a note about repository access, or any sentence at all before the H1. If you feel the urge to say "I will rewrite the plan…" or "The codebase referenced…" or "Here is the rewritten plan:", DELETE that sentence. Just start with the title.
+   - Output GitHub-flavored Markdown only. Do NOT wrap your reply in an outer code fence.
+
+Before you finalize, do one last pass: imagine a friend reading the plan aloud to you on a long walk. Anywhere they would have to pause and spell something out, or where the phrasing would make them grimace, REWRITE that sentence. Then check the very first line: if it is not the H1 title, DELETE everything before the H1.
+
+The plan to rewrite follows below.'
+
+USER_MSG="Rewrite the following implementation plan for offline Kindle reading, using your code-reading tools to look up anything the plan references. Output ONLY the rewritten Markdown.
+
+<plan>
+${PLAN_TEXT}
+</plan>"
+
+MD_OUT="$WORKDIR/rewritten.md"
+HTML_OUT="$WORKDIR/rewritten.html"
+ERR_FILE="$WORKDIR/claude.err"
+
+CLAUDE_OPTS=(
+  -p
+  --model "$MODEL"
+  --effort "$EFFORT"
+  --append-system-prompt "$SYSTEM"
+  --allowedTools "$ALLOWED_TOOLS_STR"
+)
+if [[ ${#ADD_DIRS[@]} -gt 0 ]]; then
+  CLAUDE_OPTS+=(--add-dir "${ADD_DIRS[@]}")
+fi
+
+INFO="model=$MODEL effort=$EFFORT renderer=$BROWSER_NAME"
+[[ ${#ADD_DIRS[@]} -gt 0 ]] && INFO+=" extra-repos=${#ADD_DIRS[@]}"
+echo "plan2pdf: rewriting plan ($INFO); claude can take several minutes with --effort=$EFFORT" >&2
+start_spinner "thinking with $MODEL"
+
+printf '%s' "$USER_MSG" \
+  | "${TIMEOUT_CMD[@]}" claude "${CLAUDE_OPTS[@]}" \
+      > "$MD_OUT" 2> "$ERR_FILE"
+RC=$?
+stop_spinner
+
+if (( RC != 0 )); then
+  echo "plan2pdf: claude failed (rc=$RC)" >&2
+  if [[ -s "$ERR_FILE" ]]; then
+    echo "plan2pdf: claude stderr:" >&2
+    head -c 4000 "$ERR_FILE" >&2
+    echo >&2
+  fi
+  exit 1
+fi
+
+if [[ ! -s "$MD_OUT" ]]; then
+  echo "plan2pdf: claude returned no output" >&2
+  if [[ -s "$ERR_FILE" ]]; then
+    head -c 4000 "$ERR_FILE" >&2
+    echo >&2
+  fi
+  exit 1
+fi
+
+first_line=$(head -n 1 "$MD_OUT" | tr -d '\r')
+if [[ "$first_line" == "Execution error"* || "$first_line" == "API Error"* ]]; then
+  echo "plan2pdf: claude returned an error: $first_line" >&2
+  exit 1
+fi
+
+# Clean up the model output, then split into two artifacts:
+#   - rewritten.original.md: the clean Markdown the user keeps with `-k`.
+#     Outer code fence stripped; any preamble before the H1 stripped;
+#     mermaid blocks left intact as ```mermaid fences so the file is
+#     human-editable and re-renderable.
+#   - rewritten.md (MD_OUT): the same content, but with mermaid blocks
+#     rewritten as <div class="mermaid"> for mermaid.js in the printed page.
+MERMAID_COUNT=$(python3 - "$MD_OUT" "$WORKDIR/rewritten.original.md" <<'PY'
+import re, sys, pathlib
+md = pathlib.Path(sys.argv[1])
+keep = pathlib.Path(sys.argv[2])
+text = md.read_text()
+# Strip an outer ```markdown code fence the model may have wrapped its reply in.
+text = re.sub(r'\A\s*```(?:markdown|md)?\s*\n', '', text, count=1)
+text = re.sub(r'\n```\s*\Z', '\n', text, count=1)
+# If the reply does not start with a Markdown heading, drop any preamble the
+# model wrote before the first heading. The system prompt forbids preamble,
+# but weaker models sometimes ignore that — strip it here as a safety net.
+if not text.lstrip().startswith('#'):
+    m = re.search(r'^#+\s', text, re.MULTILINE)
+    if m:
+        text = text[m.start():]
+keep.write_text(text)
+pattern = re.compile(r'```mermaid[^\n]*\n(.*?)\n```', re.DOTALL)
+n = len(pattern.findall(text))
+text = pattern.sub(lambda m: f'\n<div class="mermaid">\n{m.group(1)}\n</div>\n', text)
+md.write_text(text)
+print(n)
+PY
+)
+[[ -z "$MERMAID_COUNT" ]] && MERMAID_COUNT=0
+[[ "$DEBUG" == "1" ]] && echo "plan2pdf: detected $MERMAID_COUNT mermaid block(s) in rewritten markdown" >&2
+
+CSS_FILE="$WORKDIR/style.css"
+cat > "$CSS_FILE" <<EOF
+@page { size: $PAGE_SIZE; margin: 0.6in 0.65in 0.7in 0.65in; }
+html, body { background: #fff; color: #000; }
+header#title-block-header { display: none; }
+body {
+  font-family: $FONT_FAMILY;
+  font-size: $FONT_SIZE;
+  line-height: 1.55;
+  margin: 0;
+  padding: 0;
+  hyphens: auto;
+  -webkit-hyphens: auto;
+}
+h1 { font-size: 1.7em; line-height: 1.25; margin: 0 0 0.5em; }
+h2 { font-size: 1.35em; line-height: 1.3; margin: 1.4em 0 0.4em; page-break-after: avoid; }
+h3 { font-size: 1.15em; line-height: 1.3; margin: 1.2em 0 0.3em; page-break-after: avoid; }
+h4 { font-size: 1em; margin: 1em 0 0.2em; page-break-after: avoid; }
+p { margin: 0 0 0.8em; orphans: 3; widows: 3; }
+ul, ol { margin: 0 0 0.8em; padding-left: 1.4em; }
+li { margin: 0.15em 0; }
+li > p { margin-bottom: 0.3em; }
+blockquote { margin: 0.6em 0; padding: 0 0.9em; border-left: 2px solid #888; color: #222; }
+code { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.92em; }
+pre {
+  font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.85em;
+  line-height: 1.4; background: #f2f2f2; padding: 0.6em 0.7em;
+  border-left: 2px solid #888; white-space: pre-wrap; word-wrap: break-word;
+  page-break-inside: avoid;
+}
+pre code { font-size: inherit; background: transparent; padding: 0; }
+hr { border: 0; border-top: 1px solid #999; margin: 1.5em 0; }
+table { border-collapse: collapse; margin: 0.8em 0; font-size: 0.95em; }
+th, td { border: 1px solid #999; padding: 0.3em 0.5em; }
+th { background: #eee; }
+a { color: #000; text-decoration: underline; }
+img, svg { max-width: 100%; height: auto; page-break-inside: avoid; display: block; margin: 0.6em auto; }
+.mermaid { page-break-inside: avoid; text-align: center; margin: 0.8em 0; }
+.mermaid svg { max-width: 100%; height: auto; }
+EOF
+
+PANDOC_OPTS=(
+  -f gfm -t html5
+  --standalone --no-highlight
+  --metadata "title=$STEM"
+  --metadata "lang=en"
+  --css "$CSS_FILE"
+  --embed-resources
+)
+
+# Virtual time keeps Chrome from snapshotting before mermaid's async render
+# finishes. It advances as fast as pending JS allows, so for plain plans
+# without mermaid it exhausts immediately and adds no real-time wait.
+PRINT_FLAGS=(--virtual-time-budget=4000)
+
+if (( MERMAID_COUNT > 0 )); then
+  HEADER_HTML="$WORKDIR/header.html"
+  cat > "$HEADER_HTML" <<'HTML'
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  if (window.mermaid) {
+    mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' });
+    document.addEventListener('DOMContentLoaded', () => { mermaid.run(); });
+  }
+</script>
+HTML
+  PANDOC_OPTS+=(--include-in-header "$HEADER_HTML")
+  echo "plan2pdf: $MERMAID_COUNT mermaid diagram(s) — will be rendered by mermaid.js inside Chrome" >&2
+fi
+
+if ! pandoc "$MD_OUT" "${PANDOC_OPTS[@]}" -o "$HTML_OUT" 2> "$WORKDIR/pandoc.err"; then
+  echo "plan2pdf: pandoc failed:" >&2
+  [[ -s "$WORKDIR/pandoc.err" ]] && head -c 4000 "$WORKDIR/pandoc.err" >&2
+  exit 1
+fi
+
+echo "plan2pdf: rendering PDF via $BROWSER_NAME" >&2
+
+# Remove any prior PDF at the output path so the kill-on-stable loop below
+# doesn't see a stale file's size as "stable" and kill chrome before it
+# has a chance to write the new one.
+rm -f "$OUT"
+
+# Chrome 14x on macOS often hangs after writing the PDF (GoogleUpdater,
+# GCM background tasks etc. keep the process alive). Don't wait for chrome
+# to exit on its own — spawn it, watch the output PDF, kill chrome the
+# moment the file size stops changing.
+CHROME_TIMEOUT="${PLAN2PDF_CHROME_TIMEOUT:-45}"
+
+"$BROWSER" \
+  --headless=new \
+  --user-data-dir="$WORKDIR/chrome-profile" \
+  --no-pdf-header-footer \
+  "${PRINT_FLAGS[@]}" \
+  --print-to-pdf="$OUT" \
+  "file://$HTML_OUT" >/dev/null 2>"$WORKDIR/chrome.err" &
+CHROME_PID=$!
+
+LAST_SIZE=-1
+STABLE=0
+DEADLINE=$(( $(date +%s) + CHROME_TIMEOUT ))
+while (( $(date +%s) < DEADLINE )); do
+  kill -0 "$CHROME_PID" 2>/dev/null || break
+  if [[ -s "$OUT" ]]; then
+    SZ=$(wc -c <"$OUT" 2>/dev/null || echo 0)
+    if (( SZ == LAST_SIZE )); then
+      STABLE=$((STABLE + 1))
+      (( STABLE >= 3 )) && break    # ~0.6s of size stability = chrome is done
+    else
+      STABLE=0
+      LAST_SIZE=$SZ
+    fi
+  fi
+  sleep 0.2
+done
+
+if kill -0 "$CHROME_PID" 2>/dev/null; then
+  kill -TERM "$CHROME_PID" 2>/dev/null
+  sleep 0.3
+  kill -KILL "$CHROME_PID" 2>/dev/null
+fi
+wait "$CHROME_PID" 2>/dev/null
+
+if [[ ! -s "$OUT" ]]; then
+  echo "plan2pdf: $BROWSER_NAME did not produce a PDF within ${CHROME_TIMEOUT}s" >&2
+  [[ -s "$WORKDIR/chrome.err" ]] && head -c 4000 "$WORKDIR/chrome.err" >&2
+  exit 1
+fi
+
+if [[ ! -s "$OUT" ]]; then
+  echo "plan2pdf: PDF was not produced" >&2
+  exit 1
+fi
+
+if (( KEEP_MD == 1 )) || [[ -n "${PLAN2PDF_KEEP_MD:-}" ]]; then
+  KEEP_PATH="${OUT%.pdf}.md"
+  rm -f "$KEEP_PATH"
+  cp "$WORKDIR/rewritten.original.md" "$KEEP_PATH"
+  echo "plan2pdf: saved rewritten markdown -> $KEEP_PATH" >&2
+fi
+
+echo "plan2pdf: wrote $OUT" >&2
