@@ -92,6 +92,9 @@ while [[ $# -gt 0 ]]; do
       ;;
     -k|--keep-md) KEEP_MD=1; shift ;;
     --) shift; INPUT="${1:-}"; [[ -n "$INPUT" ]] && shift; break ;;
+    -)
+      [[ -n "$INPUT" ]] && { echo "plan2pdf: unexpected arg: $1" >&2; exit 2; }
+      INPUT="-"; shift ;;
     -*) echo "plan2pdf: unknown option: $1" >&2; usage >&2; exit 2 ;;
     *)
       [[ -n "$INPUT" ]] && { echo "plan2pdf: unexpected arg: $1" >&2; exit 2; }
@@ -131,18 +134,23 @@ if [[ -z "$BROWSER" ]]; then
 fi
 BROWSER_NAME="$(basename "$BROWSER")"
 
+WORKDIR=$(mktemp -d -t plan2pdf.XXXXXX) || { echo "plan2pdf: mktemp failed" >&2; exit 1; }
+
+# Resolve PLAN_FILE — the path we will stream to claude — without ever loading
+# the plan into a bash variable. For stdin we drain into a temp file once.
 if [[ "$INPUT" == "-" ]]; then
-  PLAN_TEXT=$(cat)
+  PLAN_FILE="$WORKDIR/plan.input.md"
+  cat > "$PLAN_FILE"
   STEM="plan"
 else
   [[ -r "$INPUT" ]] || { echo "plan2pdf: cannot read '$INPUT'" >&2; exit 1; }
-  PLAN_TEXT=$(cat "$INPUT")
+  PLAN_FILE="$INPUT"
   base="${INPUT##*/}"
   STEM="${base%.*}"
   [[ -z "$STEM" ]] && STEM="plan"
 fi
 
-[[ -z "${PLAN_TEXT// }" ]] && { echo "plan2pdf: input is empty" >&2; exit 1; }
+[[ -s "$PLAN_FILE" ]] || { echo "plan2pdf: input is empty" >&2; exit 1; }
 
 if [[ -z "$OUT" ]]; then
   OUT="${STEM}.pdf"
@@ -155,8 +163,6 @@ elif [[ "$OUT" != *.pdf ]]; then
 fi
 out_dir="$(dirname "$OUT")"
 [[ -d "$out_dir" ]] || { echo "plan2pdf: output directory does not exist: $out_dir" >&2; exit 1; }
-
-WORKDIR=$(mktemp -d -t plan2pdf.XXXXXX) || { echo "plan2pdf: mktemp failed" >&2; exit 1; }
 
 cleanup_files() {
   if [[ "$DEBUG" == "1" ]]; then
@@ -245,10 +251,11 @@ Before you finalize, do one last pass: imagine a friend reading the plan aloud t
 
 The plan to rewrite follows below.'
 
-USER_MSG="Rewrite the following implementation plan for offline Kindle reading, using your code-reading tools to look up anything the plan references. Output ONLY the rewritten Markdown.
+PROMPT_PREFIX="Rewrite the following implementation plan for offline Kindle reading, using your code-reading tools to look up anything the plan references. Output ONLY the rewritten Markdown.
 
 <plan>
-${PLAN_TEXT}
+"
+PROMPT_SUFFIX="
 </plan>"
 
 MD_OUT="$WORKDIR/rewritten.md"
@@ -262,20 +269,89 @@ CLAUDE_OPTS=(
   --permission-mode auto
   --append-system-prompt "$SYSTEM"
   --allowedTools "$ALLOWED_TOOLS_STR"
+  --output-format stream-json
+  --verbose
 )
 
 INFO="model=$MODEL effort=$EFFORT renderer=$BROWSER_NAME"
-echo "plan2pdf: rewriting plan ($INFO); claude can take several minutes with --effort=$EFFORT" >&2
+echo "plan2pdf: rewriting plan ($INFO); each line below is a tool call claude makes while researching" >&2
 start_spinner "thinking with $MODEL"
 
-printf '%s' "$USER_MSG" \
-  | "${TIMEOUT_CMD[@]}" claude "${CLAUDE_OPTS[@]}" \
-      > "$MD_OUT" 2> "$ERR_FILE"
+# The parser must live in its own file: if we passed it via `python3 - <<EOF`,
+# the heredoc would steal python's stdin and claude's pipe would have nowhere
+# to land.
+PARSER="$WORKDIR/parser.py"
+cat > "$PARSER" <<'PY'
+import json, sys
+
+md_out_path = sys.argv[1]
+result_text = None
+result_subtype = None
+saw_any_event = False
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    saw_any_event = True
+    t = ev.get('type')
+    if t == 'assistant':
+        for item in ev.get('message', {}).get('content', []) or []:
+            if item.get('type') == 'tool_use':
+                name = item.get('name', '?')
+                inp = item.get('input', {}) or {}
+                target = (
+                    inp.get('description') or inp.get('file_path') or
+                    inp.get('pattern') or inp.get('path') or
+                    inp.get('query') or inp.get('command') or ''
+                )
+                if isinstance(target, list):
+                    target = ' '.join(map(str, target))
+                target = str(target).replace('\n', ' ').strip()
+                if len(target) > 100:
+                    target = target[:100] + '…'
+                # On a TTY, \r + clear-line nudges past the spinner so the
+                # tool-call line lands above it; off a TTY (pipe/file), use
+                # plain text so logs stay clean.
+                clr = '\r\033[2K' if sys.stderr.isatty() else ''
+                sys.stderr.write(f'{clr}  {name}: {target}\n')
+                sys.stderr.flush()
+    elif t == 'result':
+        result_subtype = ev.get('subtype')
+        result_text = ev.get('result')
+
+if not saw_any_event:
+    sys.stderr.write('\nplan2pdf: claude produced no events on stdout\n')
+    sys.exit(2)
+if result_text is None:
+    sys.stderr.write(f'\nplan2pdf: claude did not emit a result event (subtype={result_subtype})\n')
+    sys.exit(3)
+if result_subtype and result_subtype != 'success':
+    sys.stderr.write(f'\nplan2pdf: claude reported result subtype={result_subtype}\n')
+    sys.exit(4)
+with open(md_out_path, 'w') as f:
+    f.write(result_text)
+PY
+
+# Stream the plan into claude's stdin (no bash variable bloat for big plans),
+# get stream-json events back, parse them in python: emit one stderr line per
+# tool call so the user can see activity, and write the final markdown to MD_OUT.
+{
+  printf '%s' "$PROMPT_PREFIX"
+  cat "$PLAN_FILE"
+  printf '%s' "$PROMPT_SUFFIX"
+} \
+  | "${TIMEOUT_CMD[@]}" claude "${CLAUDE_OPTS[@]}" 2> "$ERR_FILE" \
+  | python3 "$PARSER" "$MD_OUT"
 RC=$?
 stop_spinner
 
 if (( RC != 0 )); then
-  echo "plan2pdf: claude failed (rc=$RC)" >&2
+  echo "plan2pdf: claude/parser pipeline failed (rc=$RC)" >&2
   if [[ -s "$ERR_FILE" ]]; then
     echo "plan2pdf: claude stderr:" >&2
     head -c 4000 "$ERR_FILE" >&2
@@ -285,17 +361,8 @@ if (( RC != 0 )); then
 fi
 
 if [[ ! -s "$MD_OUT" ]]; then
-  echo "plan2pdf: claude returned no output" >&2
-  if [[ -s "$ERR_FILE" ]]; then
-    head -c 4000 "$ERR_FILE" >&2
-    echo >&2
-  fi
-  exit 1
-fi
-
-first_line=$(head -n 1 "$MD_OUT" | tr -d '\r')
-if [[ "$first_line" == "Execution error"* || "$first_line" == "API Error"* ]]; then
-  echo "plan2pdf: claude returned an error: $first_line" >&2
+  echo "plan2pdf: claude returned no markdown" >&2
+  [[ -s "$ERR_FILE" ]] && head -c 4000 "$ERR_FILE" >&2
   exit 1
 fi
 
