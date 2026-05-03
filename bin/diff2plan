@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# diff2plan - Reverse-engineer a git diff into the implementation plan that
+# would have produced it.
+#
+# Captures a unified diff via `git diff <YOUR-ARGS>`, then asks `claude -p`
+# to look up the affected code (Read, Grep, Glob) and write a Markdown plan
+# describing the work — phrased as instructions a future implementer could
+# follow to reproduce the diff. Anything that follows diff2plan's own
+# options is forwarded verbatim to `git diff`, so any invocation that works
+# with `git diff` works here too.
+#
+# Usage:
+#   diff2plan [-o output.md] [git diff arguments...]
+#
+# Examples:
+#   diff2plan                          # working tree diff -> stdout
+#   diff2plan --staged                 # staged diff -> stdout
+#   diff2plan HEAD~3                   # diff vs 3 commits ago -> stdout
+#   diff2plan main..feature            # range diff -> stdout
+#   diff2plan -o plan.md HEAD~3        # plan.md
+#   diff2plan HEAD~5 -- src/           # path filter forwarded to git
+#
+# Run diff2plan from inside the working tree so claude can read the
+# affected files while writing the plan.
+#
+# Required: claude, git, python3
+#
+# Env:
+#   DIFF2PLAN_MODEL          model alias for `claude` (default: haiku)
+#   DIFF2PLAN_EFFORT         --effort value (default: medium)
+#   DIFF2PLAN_TIMEOUT        seconds to wait on the model (default: 1800)
+#   DIFF2PLAN_ALLOWED_TOOLS  override claude --allowedTools list
+#                            (default: Read Grep Glob)
+#   DIFF2PLAN_DEBUG          if 1, leave the temp dir in place
+
+set -uo pipefail
+
+MODEL="${DIFF2PLAN_MODEL:-haiku}"
+EFFORT="${DIFF2PLAN_EFFORT:-medium}"
+CALL_TIMEOUT="${DIFF2PLAN_TIMEOUT:-1800}"
+DEBUG="${DIFF2PLAN_DEBUG:-0}"
+ALLOWED_TOOLS_STR="${DIFF2PLAN_ALLOWED_TOOLS:-Read Grep Glob}"
+
+usage() {
+  cat <<EOF
+usage: diff2plan [-o output.md] [git diff arguments...]
+
+Reverse-engineers a git diff into a Markdown implementation plan. Runs
+\`git diff <YOUR-ARGS>\` against the current working tree and pipes the
+result through \`claude -p\`, which looks up the affected code (Read,
+Grep, Glob) and writes a plan that, if executed, would produce the
+changes shown in the diff.
+
+Arguments after diff2plan's own options are forwarded verbatim to
+\`git diff\`. Run diff2plan from inside the working tree.
+
+Examples:
+  diff2plan                          # working tree diff -> stdout
+  diff2plan --staged                 # staged diff -> stdout
+  diff2plan HEAD~3                   # diff vs 3 commits ago -> stdout
+  diff2plan main..feature            # range diff -> stdout
+  diff2plan -o plan.md HEAD~3        # plan.md
+  diff2plan HEAD~5 -- src/           # path filter forwarded to git
+
+Options:
+  -o, --output <file>   write the plan to <file> (default: stdout). If
+                        <file> is a directory, writes <file>/diff.md;
+                        if <file> has no extension, .md is appended.
+  -h, --help            show this help
+
+Env vars: DIFF2PLAN_MODEL, DIFF2PLAN_EFFORT, DIFF2PLAN_TIMEOUT,
+DIFF2PLAN_ALLOWED_TOOLS, DIFF2PLAN_DEBUG.
+EOF
+}
+
+OUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 2 ;;
+    -o|--output)
+      shift
+      OUT="${1:-}"
+      [[ -z "$OUT" ]] && { echo "diff2plan: -o needs an argument" >&2; exit 2; }
+      shift
+      ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+# Whatever remains in "$@" is forwarded to `git diff`.
+
+for cmd in claude git python3; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "diff2plan: requires '$cmd' on PATH" >&2; exit 1; }
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  echo "diff2plan: not inside a git working tree" >&2; exit 1
+}
+
+WORKDIR=$(mktemp -d -t diff2plan.XXXXXX) || { echo "diff2plan: mktemp failed" >&2; exit 1; }
+
+cleanup_files() {
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "diff2plan: leaving temp dir at $WORKDIR" >&2
+  else
+    rm -rf "$WORKDIR"
+  fi
+}
+
+SPIN_PID=""
+[[ -t 2 ]] && SPIN_TTY=1 || SPIN_TTY=0
+start_spinner() {
+  (( SPIN_TTY == 1 )) || return 0
+  [[ -n "$SPIN_PID" ]] && return 0
+  local msg="${1:-thinking}"
+  local started; started=$(date +%s)
+  (
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    i=0
+    while :; do
+      f="${frames[$((i % ${#frames[@]}))]}"
+      elapsed=$(( $(date +%s) - started ))
+      printf '\r\033[2K%s %s [%ds]' "$f" "$msg" "$elapsed" >&2
+      i=$((i+1))
+      sleep 0.1
+    done
+  ) &
+  SPIN_PID=$!
+}
+stop_spinner() {
+  [[ -z "$SPIN_PID" ]] && return 0
+  kill "$SPIN_PID" 2>/dev/null
+  wait "$SPIN_PID" 2>/dev/null
+  SPIN_PID=""
+  (( SPIN_TTY == 1 )) && printf '\r\033[2K' >&2
+}
+cleanup() { stop_spinner; cleanup_files; }
+trap cleanup EXIT INT TERM
+
+DIFF_FILE="$WORKDIR/diff.patch"
+GIT_ERR="$WORKDIR/git.err"
+
+# `--no-pager` keeps git from invoking less if a pager is forced via config.
+# `-c color.*=false` strips ANSI even when the user has color.ui=always set,
+# so the diff handed to the model is plain text.
+git --no-pager -c color.diff=false -c color.ui=false diff "$@" \
+  > "$DIFF_FILE" 2> "$GIT_ERR"
+RC=$?
+if (( RC != 0 )); then
+  echo "diff2plan: git diff exited with status $RC" >&2
+  [[ -s "$GIT_ERR" ]] && head -c 4000 "$GIT_ERR" >&2
+  exit "$RC"
+fi
+if [[ ! -s "$DIFF_FILE" ]]; then
+  echo "diff2plan: no changes — git diff produced an empty diff" >&2
+  exit 0
+fi
+DIFF_BYTES=$(wc -c <"$DIFF_FILE" | tr -d ' ')
+
+# Resolve OUT: a directory target becomes <dir>/diff.md; a name without an
+# extension gets .md tacked on.
+if [[ -n "$OUT" ]]; then
+  if [[ "$OUT" == */ ]] || [[ -d "$OUT" ]]; then
+    [[ -d "$OUT" ]] || { echo "diff2plan: output directory does not exist: $OUT" >&2; exit 1; }
+    OUT="${OUT%/}/diff.md"
+  elif [[ "$OUT" != *.md ]]; then
+    OUT="${OUT}.md"
+  fi
+  out_dir="$(dirname "$OUT")"
+  [[ -d "$out_dir" ]] || { echo "diff2plan: output directory does not exist: $out_dir" >&2; exit 1; }
+fi
+
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(timeout "$CALL_TIMEOUT")
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(gtimeout "$CALL_TIMEOUT")
+elif command -v perl >/dev/null 2>&1; then
+  TIMEOUT_CMD=(perl -e 'alarm shift; exec @ARGV' "$CALL_TIMEOUT")
+else
+  TIMEOUT_CMD=(env)
+fi
+
+SYSTEM='You are reverse-engineering a unified git diff into the implementation plan that would have produced it. Given the diff below, write the plan a developer would have followed to make those exact changes — phrased as instructions for a future implementer who has not yet started work.
+
+You have read access to the current state of the codebase via Read, Grep, and Glob. USE IT. Look up the files the diff touches so you understand what the changed code does, how the modified module fits into the broader system, and what callers and callees look like. The diff alone often does not explain why a change is shaped a particular way; the surrounding code does. Investigate proactively wherever a hunk would otherwise be opaque, and only then describe the work.
+
+Write a Markdown implementation plan that is:
+
+- ACCURATE. Every step you write should map to real hunks in the diff. Do not invent work the diff does not contain, and do not omit work it does. If the diff renames a symbol across many files, call out the rename explicitly rather than gloss over it.
+- ORGANIZED BY ENGINEERING INTENT, not by file order. Group hunks into phases that reflect the work — "add the new X type", "thread X through the handler", "update the tests". A diff that touches twenty files because of a single rename should produce one step describing the rename, not twenty.
+- CONCRETE. Name files, functions, types, constants, and config keys directly. The reader will be at their keyboard ready to apply the plan; file paths, function names, and short code snippets are welcome where they materially help.
+- EXPLANATORY when you can be. State WHY each step exists when the reason is inferable from the diff or the surrounding code. When the rationale is genuinely unclear from what you can see, write "purpose unclear from the diff" rather than inventing a justification.
+- PROPORTIONATE. A small mechanical change should produce a short plan. A large refactor should produce multiple phases. Match the size of the plan to the size of the change; do not pad.
+
+Structure:
+  - One H1 title: a short noun phrase naming the change ("Add support for X", "Refactor Y out of Z", "Fix a bug in W").
+  - Optionally a one or two sentence summary right after the title, framing the overall goal.
+  - H2 headings per phase, with the steps in each phase listed as a numbered list or bullets. If the change is small enough that phases would be overkill, skip H2s and list steps directly under the H1.
+
+Do NOT:
+  - Wrap your reply in an outer code fence.
+  - Use first person. Write in the imperative ("Add X.", "Rename Y to Z.").
+  - Reproduce the diff verbatim or paste long code blocks. Short snippets that materially clarify intent are fine.
+  - Add a meta-preamble like "Here is the plan:" or "I will rewrite...". Start directly with the H1 title — the very first character of your reply must be "#".
+
+Output GitHub-flavored Markdown only. The diff to reverse-engineer follows below.'
+
+PROMPT_PREFIX="Reverse-engineer the following unified diff into a Markdown implementation plan, using your code-reading tools to look up anything the diff references. Output ONLY the plan.
+
+<diff>
+"
+PROMPT_SUFFIX="
+</diff>"
+
+MD_OUT="$WORKDIR/plan.md"
+ERR_FILE="$WORKDIR/claude.err"
+
+CLAUDE_OPTS=(
+  -p
+  --model "$MODEL"
+  --effort "$EFFORT"
+  --permission-mode auto
+  --append-system-prompt "$SYSTEM"
+  --allowedTools "$ALLOWED_TOOLS_STR"
+  --output-format stream-json
+  --verbose
+)
+
+INFO="model=$MODEL effort=$EFFORT diff=${DIFF_BYTES}B"
+echo "diff2plan: reverse-engineering diff ($INFO); each line below is a tool call claude makes while researching" >&2
+start_spinner "thinking with $MODEL"
+
+# The parser must live in its own file: a heredoc would steal python's stdin
+# and claude's pipe would have nowhere to land.
+PARSER="$WORKDIR/parser.py"
+cat > "$PARSER" <<'PY'
+import json, sys
+
+md_out_path = sys.argv[1]
+result_text = None
+result_subtype = None
+saw_any_event = False
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    saw_any_event = True
+    t = ev.get('type')
+    if t == 'assistant':
+        for item in ev.get('message', {}).get('content', []) or []:
+            if item.get('type') == 'tool_use':
+                name = item.get('name', '?')
+                inp = item.get('input', {}) or {}
+                target = (
+                    inp.get('description') or inp.get('file_path') or
+                    inp.get('pattern') or inp.get('path') or
+                    inp.get('query') or inp.get('command') or ''
+                )
+                if isinstance(target, list):
+                    target = ' '.join(map(str, target))
+                target = str(target).replace('\n', ' ').strip()
+                if len(target) > 100:
+                    target = target[:100] + '…'
+                # On a TTY, \r + clear-line nudges past the spinner so the
+                # tool-call line lands above it; off a TTY (pipe/file), use
+                # plain text so logs stay clean.
+                clr = '\r\033[2K' if sys.stderr.isatty() else ''
+                sys.stderr.write(f'{clr}  {name}: {target}\n')
+                sys.stderr.flush()
+    elif t == 'result':
+        result_subtype = ev.get('subtype')
+        result_text = ev.get('result')
+
+if not saw_any_event:
+    sys.stderr.write('\ndiff2plan: claude produced no events on stdout\n')
+    sys.exit(2)
+if result_text is None:
+    sys.stderr.write(f'\ndiff2plan: claude did not emit a result event (subtype={result_subtype})\n')
+    sys.exit(3)
+if result_subtype and result_subtype != 'success':
+    sys.stderr.write(f'\ndiff2plan: claude reported result subtype={result_subtype}\n')
+    sys.exit(4)
+with open(md_out_path, 'w') as f:
+    f.write(result_text)
+PY
+
+# Stream the diff into claude's stdin (no bash variable bloat for huge diffs);
+# parse stream-json events: emit one stderr line per tool call so the user
+# can see activity, and write the final markdown to MD_OUT.
+{
+  printf '%s' "$PROMPT_PREFIX"
+  cat "$DIFF_FILE"
+  printf '%s' "$PROMPT_SUFFIX"
+} \
+  | "${TIMEOUT_CMD[@]}" claude "${CLAUDE_OPTS[@]}" 2> "$ERR_FILE" \
+  | python3 "$PARSER" "$MD_OUT"
+RC=$?
+stop_spinner
+
+if (( RC != 0 )); then
+  echo "diff2plan: claude/parser pipeline failed (rc=$RC)" >&2
+  if [[ -s "$ERR_FILE" ]]; then
+    echo "diff2plan: claude stderr:" >&2
+    head -c 4000 "$ERR_FILE" >&2
+    echo >&2
+  fi
+  exit 1
+fi
+
+if [[ ! -s "$MD_OUT" ]]; then
+  echo "diff2plan: claude returned no markdown" >&2
+  [[ -s "$ERR_FILE" ]] && head -c 4000 "$ERR_FILE" >&2
+  exit 1
+fi
+
+# Clean up the model's reply: strip an outer ```markdown code fence if the
+# model wrapped its reply in one, and drop any preamble before the first
+# heading. The system prompt forbids both, but weaker models sometimes
+# ignore that — strip here as a safety net.
+python3 - "$MD_OUT" <<'PY'
+import re, sys, pathlib
+md = pathlib.Path(sys.argv[1])
+text = md.read_text()
+text = re.sub(r'\A\s*```(?:markdown|md)?\s*\n', '', text, count=1)
+text = re.sub(r'\n```\s*\Z', '\n', text, count=1)
+if not text.lstrip().startswith('#'):
+    m = re.search(r'^#+\s', text, re.MULTILINE)
+    if m:
+        text = text[m.start():]
+md.write_text(text)
+PY
+
+if [[ -n "$OUT" ]]; then
+  cp "$MD_OUT" "$OUT"
+  echo "diff2plan: wrote $OUT" >&2
+else
+  cat "$MD_OUT"
+fi

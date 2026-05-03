@@ -106,6 +106,45 @@ Env: `PLAN2PDF_MODEL`, `PLAN2PDF_EFFORT`, `PLAN2PDF_KEEP_MD`,
 `PLAN2PDF_TIMEOUT`, `PLAN2PDF_CHROME_TIMEOUT`,
 `PLAN2PDF_ALLOWED_TOOLS`, `PLAN2PDF_DEBUG`.
 
+### `diff2plan`
+
+The inverse of `plan2pdf`: turn an existing `git diff` into the
+Markdown implementation plan that would have produced it. Useful for
+documenting a change after the fact, recovering a plan for a stash or
+WIP branch, or feeding a clean prose description of a diff into a
+follow-up conversation.
+
+Arguments after `diff2plan`'s own options are forwarded verbatim to
+`git diff`, so anything `git diff` accepts works here too.
+
+```bash
+diff2plan                          # working tree diff -> stdout
+diff2plan --staged                 # staged diff -> stdout
+diff2plan HEAD~3                   # diff vs 3 commits ago -> stdout
+diff2plan main..feature            # range diff -> stdout
+diff2plan -o plan.md HEAD~3        # write to plan.md
+diff2plan HEAD~5 -- src/           # path filter forwarded to git
+```
+
+`diff2plan` runs `git diff <YOUR-ARGS>` against the current working
+tree, then pipes the unified diff through `claude -p` with read access
+to the local code (limited to `Read`, `Grep`, `Glob`) and claude's
+auto permission mode. Claude looks up the affected files so the plan
+names things by their actual roles, groups hunks by engineering intent
+(not file order), and keeps file paths and function names in the
+output — this is a working plan, not an offline-reading rewrite.
+
+Run `diff2plan` from inside the working tree whose changes the diff
+describes. The default output is stdout; pass `-o plan.md` (or `-o
+some/dir/`) to write to a file. Status messages and the live tool-call
+log are written to stderr, so `diff2plan ... > plan.md` keeps the
+plan clean.
+
+Requirements: `claude`, `git`, `python3`.
+
+Env: `DIFF2PLAN_MODEL`, `DIFF2PLAN_EFFORT`, `DIFF2PLAN_TIMEOUT`,
+`DIFF2PLAN_ALLOWED_TOOLS`, `DIFF2PLAN_DEBUG`.
+
 ## Adding a tool
 
 1. Drop the script into `bin/` and `chmod +x` it.
