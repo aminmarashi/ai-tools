@@ -110,10 +110,13 @@ for cmd in claude pandoc python3; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "plan2pdf: requires '$cmd' on PATH" >&2; exit 1; }
 done
 
-# plan2pdf renders the final PDF via Playwright, which drives a Chromium
-# browser through a short Node.js script run with npx.
+# plan2pdf renders the final PDF via Playwright, which runs through npx and
+# Node.js. Fail early with a clear install hint if either one is missing.
 for cmd in npx node; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "plan2pdf: requires '$cmd' on PATH" >&2; exit 1; }
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "plan2pdf: needs '$cmd' on PATH. Install Node.js so both node and npx are available." >&2
+    exit 1
+  fi
 done
 
 WORKDIR=$(mktemp -d -t plan2pdf.XXXXXX) || { echo "plan2pdf: mktemp failed" >&2; exit 1; }
