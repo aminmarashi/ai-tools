@@ -110,29 +110,11 @@ for cmd in claude pandoc python3; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "plan2pdf: requires '$cmd' on PATH" >&2; exit 1; }
 done
 
-# Locate a Chromium-based browser. plan2pdf renders the PDF via headless
-# Chrome — that is the only supported renderer.
-detect_chrome() {
-  for c in google-chrome-stable google-chrome chromium chromium-browser chrome brave; do
-    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
-  done
-  for app in \
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-    "/Applications/Chromium.app/Contents/MacOS/Chromium" \
-    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
-    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-  do
-    [[ -x "$app" ]] && { echo "$app"; return; }
-  done
-  return 1
-}
-
-BROWSER="$(detect_chrome || true)"
-if [[ -z "$BROWSER" ]]; then
-  echo "plan2pdf: needs a Chromium-based browser (Google Chrome, Chromium, Brave, or Edge) for headless PDF rendering" >&2
-  exit 1
-fi
-BROWSER_NAME="$(basename "$BROWSER")"
+# plan2pdf renders the final PDF via Playwright, which drives a Chromium
+# browser through a short Node.js script run with npx.
+for cmd in npx node; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "plan2pdf: requires '$cmd' on PATH" >&2; exit 1; }
+done
 
 WORKDIR=$(mktemp -d -t plan2pdf.XXXXXX) || { echo "plan2pdf: mktemp failed" >&2; exit 1; }
 
@@ -273,7 +255,7 @@ CLAUDE_OPTS=(
   --verbose
 )
 
-INFO="model=$MODEL effort=$EFFORT renderer=$BROWSER_NAME"
+INFO="model=$MODEL effort=$EFFORT renderer=playwright"
 echo "plan2pdf: rewriting plan ($INFO); each line below is a tool call claude makes while researching" >&2
 start_spinner "thinking with $MODEL"
 
@@ -475,61 +457,48 @@ if ! pandoc "$MD_OUT" "${PANDOC_OPTS[@]}" -o "$HTML_OUT" 2> "$WORKDIR/pandoc.err
   exit 1
 fi
 
-echo "plan2pdf: rendering PDF via $BROWSER_NAME" >&2
+echo "plan2pdf: rendering PDF via Playwright" >&2
 
-# Remove any prior PDF at the output path so the kill-on-stable loop below
-# doesn't see a stale file's size as "stable" and kill chrome before it
-# has a chance to write the new one.
+# Remove any prior PDF at the output path so a stale file does not hide a
+# fresh render failure.
 rm -f "$OUT"
 
-# Chrome 14x on macOS often hangs after writing the PDF (GoogleUpdater,
-# GCM background tasks etc. keep the process alive). Don't wait for chrome
-# to exit on its own — spawn it, watch the output PDF, kill chrome the
-# moment the file size stops changing.
-CHROME_TIMEOUT="${PLAN2PDF_CHROME_TIMEOUT:-45}"
+PLAYWRIGHT_SCRIPT="$WORKDIR/render-pdf.mjs"
+cat > "$PLAYWRIGHT_SCRIPT" <<'JS'
+import { chromium } from 'playwright';
+import { pathToFileURL } from 'node:url';
 
-"$BROWSER" \
-  --headless=new \
-  --user-data-dir="$WORKDIR/chrome-profile" \
-  --no-pdf-header-footer \
-  "${PRINT_FLAGS[@]}" \
-  --print-to-pdf="$OUT" \
-  "file://$HTML_OUT" >/dev/null 2>"$WORKDIR/chrome.err" &
-CHROME_PID=$!
+const [htmlPath, pdfPath] = process.argv.slice(2);
+const browser = await chromium.launch({ headless: true });
+try {
+  const page = await browser.newPage({
+    viewport: { width: 1200, height: 1600 },
+    deviceScaleFactor: 1,
+  });
+  await page.goto(pathToFileURL(htmlPath).href, { waitUntil: 'networkidle' });
+  await page.evaluate(async () => {
+    if (window.mermaid?.run) {
+      await window.mermaid.run();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  });
+  await page.pdf({ path: pdfPath, printBackground: true, preferCSSPageSize: true });
+  await browser.close();
+} catch (err) {
+  await browser.close();
+  throw err;
+}
+JS
 
-LAST_SIZE=-1
-STABLE=0
-DEADLINE=$(( $(date +%s) + CHROME_TIMEOUT ))
-while (( $(date +%s) < DEADLINE )); do
-  kill -0 "$CHROME_PID" 2>/dev/null || break
-  if [[ -s "$OUT" ]]; then
-    SZ=$(wc -c <"$OUT" 2>/dev/null || echo 0)
-    if (( SZ == LAST_SIZE )); then
-      STABLE=$((STABLE + 1))
-      (( STABLE >= 3 )) && break    # ~0.6s of size stability = chrome is done
-    else
-      STABLE=0
-      LAST_SIZE=$SZ
-    fi
-  fi
-  sleep 0.2
-done
-
-if kill -0 "$CHROME_PID" 2>/dev/null; then
-  kill -TERM "$CHROME_PID" 2>/dev/null
-  sleep 0.3
-  kill -KILL "$CHROME_PID" 2>/dev/null
-fi
-wait "$CHROME_PID" 2>/dev/null
-
-if [[ ! -s "$OUT" ]]; then
-  echo "plan2pdf: $BROWSER_NAME did not produce a PDF within ${CHROME_TIMEOUT}s" >&2
+if ! npx --yes playwright node "$PLAYWRIGHT_SCRIPT" "$HTML_OUT" "$OUT" 2>"$WORKDIR/chrome.err"; then
+  echo "plan2pdf: Playwright PDF render failed" >&2
   [[ -s "$WORKDIR/chrome.err" ]] && head -c 4000 "$WORKDIR/chrome.err" >&2
   exit 1
 fi
 
 if [[ ! -s "$OUT" ]]; then
   echo "plan2pdf: PDF was not produced" >&2
+  [[ -s "$WORKDIR/chrome.err" ]] && head -c 4000 "$WORKDIR/chrome.err" >&2
   exit 1
 fi
 
