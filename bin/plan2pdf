@@ -478,17 +478,18 @@ if [[ -z "$CHROME_BIN" && -x "/Applications/Brave Browser.app/Contents/MacOS/Bra
 fi
 [[ -n "$CHROME_BIN" ]] || { echo "plan2pdf: needs a Chromium-based browser on PATH or in Applications" >&2; exit 1; }
 
-HTML_URL="file://$(python3 - <<'PY' "$HTML_OUT"
-import pathlib, sys
-print(pathlib.Path(sys.argv[1]).resolve().as_uri())
-PY
-)"
+HTML_DIR="$(dirname "$HTML_OUT")"
+HTML_BASENAME="$(basename "$HTML_OUT")"
+HTTP_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+python3 -m http.server "$HTTP_PORT" --bind 127.0.0.1 --directory "$HTML_DIR" >"$WORKDIR/http.log" 2>&1 &
+HTTP_PID=$!
+sleep 1
+HTML_URL="http://127.0.0.1:$HTTP_PORT/$HTML_BASENAME"
 
 if ! "$CHROME_BIN" \
   --headless \
   --disable-gpu \
   --no-sandbox \
-  --allow-file-access-from-files \
   --run-all-compositor-stages-before-draw \
   --virtual-time-budget="${PLAN2PDF_CHROME_TIMEOUT:-60}000" \
   --print-to-pdf="$OUT" \
