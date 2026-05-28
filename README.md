@@ -172,6 +172,29 @@ pushes, opens a PR via `gh` → orchestrator runs codex against the
 diff, summarises the findings, and applies the ones that matter → loop
 until codex is quiet → optionally `doc-write` at the end.
 
+**AGENTS.md bootstrap.** The first time `cerebro execute` runs against
+a repo that lacks `AGENTS.md` / `CLAUDE.md` at the root, it adds them
+from the templates at `~/.cerebro/templates/` as a separate first
+commit on the PR. The defaults set Conventional Commits with ≤ 80-char
+subjects, Angular-style branch prefixes (`feat/`, `fix/`, `chore/`,
+`refactor/`, …), no commits without an explicit ask, and no DB/infra
+changes without an explicit ask. Edit
+`~/.cerebro/templates/AGENTS.md` to customize what new repos get;
+cerebro never overwrites an existing AGENTS.md in a user repo.
+
+**Scope-filtered review forwarding.** When summarising a `cerebro
+review`, the orchestrator forwards only findings clearly within the
+plan's scope to `cerebro apply-review`. Out-of-scope improvements
+(unrelated refactors, nits in untouched files) are named to you but
+not acted on; ambiguous findings prompt a clarifying question first.
+
+**Incremental re-reviews.** After an `apply-review`, the next
+`cerebro review` defaults to diffing against the SHA that was HEAD at
+the time of the previous review, not `main`. Codex only re-evaluates
+the new changes, so the review loop stays cheap. State lives under
+`sessions/<id>/review-state/`; pass `--base` to override and force a
+wider review.
+
 **Interactive-only.** `cerebro` refuses to run under a non-terminal
 parent (pipes, scripts, cron). Sub-agents are exempt via the
 `CEREBRO_SESSION_ID` environment variable that the orchestrator inherits.
@@ -193,11 +216,15 @@ Session state lives under `$CEREBRO_HOME` (default `~/.cerebro/`):
   hook.sh                            # UserPromptSubmit hook, routes by session id
   system-prompt.md                   # orchestrator system prompt
   .claude/settings.local.json        # registers the hook
+  templates/
+    AGENTS.md                        # default dropped into repos that lack one
+    CLAUDE.md                        # default stub that links to AGENTS.md
   sessions/<claude-session-uuid>/
     metadata.json
     transcript.jsonl                 # user prompts + cerebro milestone events
     plans/                           # plan markdown files
     children/                        # stream-json logs of every sub-agent
+    review-state/                    # per-repo last-reviewed SHA, for incremental re-review
 ```
 
 The `UserPromptSubmit` hook routes each user message to the matching

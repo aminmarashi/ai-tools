@@ -248,6 +248,7 @@ build_timeout_cmd() {
 # content differs, so subsequent runs see an up-to-date copy without churn.
 materialise_home() {
   mkdir -p "$CEREBRO_HOME/.claude" "$CEREBRO_HOME/sessions" \
+    "$CEREBRO_HOME/templates" \
     || die "cannot create $CEREBRO_HOME"
 
   write_if_changed "$CEREBRO_HOME/system-prompt.md" "$(cerebro_system_prompt)"
@@ -256,6 +257,12 @@ materialise_home() {
 
   local settings; settings="$(cerebro_settings_json "$CEREBRO_HOME/hook.sh")"
   write_if_changed "$CEREBRO_HOME/.claude/settings.local.json" "$settings"
+
+  # Templates are user-editable defaults: write only when the file is
+  # missing so a user who customizes ~/.cerebro/templates/AGENTS.md
+  # isn't clobbered on the next launch.
+  write_if_missing "$CEREBRO_HOME/templates/AGENTS.md" "$(cerebro_default_agents_md)"
+  write_if_missing "$CEREBRO_HOME/templates/CLAUDE.md" "$(cerebro_default_claude_md)"
 }
 
 write_if_changed() {
@@ -263,6 +270,12 @@ write_if_changed() {
   if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$content" ]]; then
     return 0
   fi
+  printf '%s' "$content" > "$path"
+}
+
+write_if_missing() {
+  local path="$1" content="$2"
+  [[ -f "$path" ]] && return 0
   printf '%s' "$content" > "$path"
 }
 
@@ -399,19 +412,34 @@ behalf, by calling them through your Bash tool (which is restricted to
     Spawn a full-edit child claude with cwd=<repo>. It branches,
     implements the plan, commits, pushes, and opens a PR via gh. Use
     this AFTER the user has read the plan and told you to proceed.
+    AGENTS.md bootstrap: if the repo lacks AGENTS.md / CLAUDE.md at
+    the root, execute auto-adds them from the user-editable templates
+    at $CEREBRO_HOME/templates/ as a separate first commit before the
+    plan work. Existing AGENTS.md / CLAUDE.md are never modified. You
+    don't have to mention this explicitly to the user unless they ask.
 
   cerebro review <repo-abs-path> [--base <ref>]
-    Run codex (non-mutating) against the current branch diff vs <ref>
-    (defaults to the PR base, falling back to origin/HEAD). The
-    findings file path is echoed on stdout. Read it with Read and
-    decide which findings matter; if any are unclear, ask the user.
+    Run codex (non-mutating) against the current branch diff vs <ref>.
+    Default base resolution: if a previous `cerebro review` ran in
+    this session on the same repo + branch, the base defaults to the
+    SHA that was HEAD at that time -- so re-reviews after an
+    `apply-review` only inspect the new changes, not the entire PR
+    diff again. Otherwise the default is the PR base from gh, then
+    origin/HEAD, then `main`. Pass --base explicitly only when you
+    deliberately want to widen the scope (e.g., the user asks for a
+    full re-review). The findings file path is echoed on stdout.
 
   cerebro apply-review <repo-abs-path> <findings-path> [--notes "..."]
     Spawn a full-edit child claude with cwd=<repo> to apply the review
-    fixes you've decided to act on. Include your judgment notes
-    ("apply only the input-validation point; skip the style nits") in
-    --notes. The child commits and pushes on the same branch, so the
-    existing PR updates in place.
+    fixes you've decided to act on. SCOPE: include in --notes only
+    findings that are clearly within the scope of the plan being
+    worked on. Out-of-scope improvements (unrelated refactors, style
+    nits in files the plan didn't touch, broader tech-debt
+    suggestions) must be NAMED to the user in your chat summary but
+    NOT forwarded as --notes. If a finding's relevance to the
+    original task is ambiguous, ASK the user before acting on it. The
+    child commits and pushes on the same branch, so the existing PR
+    updates in place.
 
   cerebro doc-write <repo-abs-path> <plan-path> [--notes "..."]
     Spawn a full-edit child claude with cwd=<repo> to update docs based
@@ -478,11 +506,17 @@ For a single feature:
      to the user; ask them to read it.
   3. Wait for the user to say "go" / "execute it" / etc.
   4. `cerebro execute <repo> <plan-path>`. Narrate progress briefly.
-  5. `cerebro review <repo>`. Read the findings. Summarise to the user
-     which findings you'll act on and which you'll skip, and why.
-  6. If any findings warrant action: `cerebro apply-review <repo>
-     <findings> --notes "..."`, then `cerebro review` again. Loop
-     until codex is quiet or the remaining findings are deliberate
+  5. `cerebro review <repo>`. Read the findings. Bucket them: (a)
+     clearly within the plan's scope -- act on; (b) clearly out of
+     scope (refactors / nits in untouched files / broader tech debt)
+     -- name to the user, do NOT forward; (c) ambiguous -- ASK the
+     user before deciding. Summarise the buckets and your reasoning.
+  6. If any in-scope findings warrant action: `cerebro apply-review
+     <repo> <findings> --notes "..."` containing only the in-scope
+     items. Then call `cerebro review <repo>` again WITHOUT --base --
+     it will automatically diff against the previously-reviewed
+     commit so codex only sees what you just changed. Loop until
+     codex is quiet or the remaining findings are deliberate
      non-issues.
   7. Optionally `cerebro doc-write <repo> <plan>` to update docs.
 
@@ -500,6 +534,61 @@ so they can open them in their editor. Those are legitimate state.
 Never paste a sub-agent's raw stream-json log into the chat. If the
 user wants to see it, hand them the path.
 PROMPT
+}
+
+# Default AGENTS.md / CLAUDE.md that `cerebro execute` drops into a repo
+# that doesn't already have them. These are not authoritative rules baked
+# into cerebro -- they are templates the user can edit at
+# `$CEREBRO_HOME/templates/AGENTS.md`. Once written, cerebro never
+# overwrites them.
+
+cerebro_default_agents_md() {
+  cat <<'AGENTS'
+# Agent Instructions
+
+**The user's direct instructions always take precedence over these
+instructions.**
+
+## Branches
+
+Use Angular-style Conventional Commits prefixes for branch names:
+`feat/`, `fix/`, `chore/`, `refactor/`, `docs/`, `test/`, `perf/`,
+`style/`, `build/`, `ci/`, `revert/`. The portion after the prefix is
+kebab-case and stays short.
+
+Examples: `feat/oauth-login`, `fix/null-pointer-on-resume`,
+`refactor/extract-payments-service`, `chore/bump-deps`.
+
+## Commits
+
+Use [Conventional Commits](https://www.conventionalcommits.org/)
+format: `<type>(<optional-scope>): <subject>`. The subject line must
+be **80 characters or fewer**.
+
+No AI attribution: commits use the locally configured git user.
+Never add co-author tags, agent names, or any other AI-attribution
+metadata to commit messages or trailers.
+
+## Rules (apply to every repository)
+
+- **Never commit unless the user explicitly asks for it.** Leave
+  changes staged or unstaged for the user to inspect.
+- **Never make database or infrastructure changes unless the user
+  explicitly asks.** This covers migrations, schema changes,
+  Infrastructure-as-Code (Terraform / CloudFormation / Pulumi / Helm /
+  Kubernetes manifests), CI workflow changes, and deployment
+  configuration.
+AGENTS
+}
+
+cerebro_default_claude_md() {
+  cat <<'CLAUDE'
+# Claude Instructions
+
+See [AGENTS.md](AGENTS.md) for development conventions, branch and
+commit rules, and project-wide guardrails. Treat it as required
+reading before making changes.
+CLAUDE
 }
 
 # ----- session metadata -----------------------------------------------------
@@ -792,12 +881,14 @@ cmd_execute() {
 
   local sys_prompt
   sys_prompt='You are executing an implementation plan in a git repository.
-Create a new feature branch with a short, descriptive name (kebab-case)
-based on the plan. Implement the plan. Run the tests, type checks, or
-linters that the repo conventions imply. Commit with a clear message,
-push the branch, and open a pull request via the `gh` CLI. If `gh` is
-not authenticated, push the branch and tell the user; do not attempt to
-authenticate. Stop after the PR is open.'
+Read AGENTS.md at the repo root first (or the bootstrap content in the
+prompt body, if AGENTS.md is missing) and follow it for branch naming,
+commit format, and project-wide guardrails. Create a new feature branch
+per AGENTS.md conventions. Implement the plan. Run the tests, type
+checks, or linters that the repo conventions imply. Commit per
+AGENTS.md, push the branch, and open a pull request via the `gh` CLI.
+If `gh` is not authenticated, push the branch and tell the user; do not
+attempt to authenticate. Stop after the PR is open.'
 
   say "cerebro: executing $plan_path in $repo"
   log_event "execute_started" "plan=$plan_path repo=$repo"
@@ -808,9 +899,30 @@ authenticate. Stop after the PR is open.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
+  # Bootstrap files: cerebro ships defaults at
+  # $CEREBRO_HOME/templates/{AGENTS.md,CLAUDE.md}. We hand them to the
+  # child claude along with an instruction to create them in the repo
+  # only when missing; existing files are left alone. The user can edit
+  # the template files to customize what new repos get.
+  local agents_template="" claude_template=""
+  if [[ -r "$CEREBRO_HOME/templates/AGENTS.md" ]]; then
+    agents_template="$(cat "$CEREBRO_HOME/templates/AGENTS.md")"
+  fi
+  if [[ -r "$CEREBRO_HOME/templates/CLAUDE.md" ]]; then
+    claude_template="$(cat "$CEREBRO_HOME/templates/CLAUDE.md")"
+  fi
+
   local rc
   ( cd "$repo" && \
-    { printf 'Execute the following plan in this repository. Branch, implement, commit, push, and open a PR via gh.\n\n<plan>\n'
+    { printf 'Execute the following plan in this repository. Branch, implement, commit, push, and open a PR via gh.\n\n'
+      printf 'Before implementing the plan, ensure the repo has AGENTS.md and CLAUDE.md at the root:\n'
+      printf '  * If AGENTS.md is missing, create it from <bootstrap-agents-md> below as a SEPARATE first commit (e.g. "chore: add AGENTS.md") before doing the plan work.\n'
+      printf '  * If CLAUDE.md is missing, create it from <bootstrap-claude-md> in the same first commit.\n'
+      printf '  * If either file already exists, do NOT modify it.\n'
+      printf 'Then read AGENTS.md (existing or just-written) and follow its branch/commit rules for the rest of this run.\n\n'
+      printf '<bootstrap-agents-md>\n%s\n</bootstrap-agents-md>\n\n' "$agents_template"
+      printf '<bootstrap-claude-md>\n%s\n</bootstrap-claude-md>\n\n' "$claude_template"
+      printf '<plan>\n'
       cat "$plan_path"
       printf '\n</plan>\n'
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
@@ -846,33 +958,74 @@ cmd_review() {
   [[ "$repo" = /* ]] || die "review: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "review: repo not a directory: $repo"
 
-  # Resolve the base ref: explicit --base wins; otherwise try the PR base
-  # via gh; then origin/HEAD; then 'main'.
-  if [[ -z "$base" ]]; then
-    base="$(cd "$repo" && gh pr view --json baseRefName -q .baseRefName 2>/dev/null)"
-  fi
-  if [[ -z "$base" ]]; then
-    base="$(cd "$repo" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
-  fi
-  [[ -z "$base" ]] && base="main"
+  # Canonical worktree root keys the per-repo review-state file so
+  # re-reviews diff against the previously-reviewed commit instead of
+  # main/origin (otherwise codex would re-evaluate the entire PR diff
+  # every time apply-review made new commits).
+  local canonical_repo
+  canonical_repo="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" \
+    || die "review: not a git worktree: $repo"
+  local repo_key
+  repo_key="$(python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])' "$canonical_repo")"
+  local state_dir="$CEREBRO_SESSION_DIR/review-state"
+  local state_file="$state_dir/$repo_key.json"
 
-  # Prefer the remote-tracking ref when it exists, so reviews still work on
-  # branches whose local copy of the base is stale. Fall back to the local
-  # branch, then to a raw commit. Matches the dev-tools `review` tool.
   local base_ref base_description
-  if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then
-    base_ref="origin/$base"
-  elif git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
-    base_ref="$base"
-  elif git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
-    base_ref="$base"
-  else
-    die "review: could not resolve base reference '$base' in $repo"
+  local using_review_state="false"
+
+  # If the orchestrator did not pin --base, prefer the previously-reviewed
+  # commit so codex only inspects what changed since the last review.
+  # Preconditions guard against stale state after rebases / branch
+  # switches: the recorded SHA must still parse, still be an ancestor of
+  # HEAD, and the branch name must match.
+  if [[ "$explicit_base" == "false" && -f "$state_file" ]]; then
+    local last_sha last_branch current_branch
+    last_sha="$(jq -r '.last_reviewed_sha // empty' "$state_file" 2>/dev/null)"
+    last_branch="$(jq -r '.branch // empty' "$state_file" 2>/dev/null)"
+    current_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if [[ -n "$last_sha" && -n "$last_branch" && -n "$current_branch" \
+          && "$last_branch" == "$current_branch" ]] \
+       && git -C "$repo" rev-parse --verify --quiet "$last_sha^{commit}" \
+            >/dev/null 2>&1 \
+       && git -C "$repo" merge-base --is-ancestor "$last_sha" HEAD \
+            >/dev/null 2>&1; then
+      local short_sha
+      short_sha="$(git -C "$repo" rev-parse --short "$last_sha" 2>/dev/null)"
+      base_ref="$last_sha"
+      base_description="previously-reviewed commit $short_sha"
+      using_review_state="true"
+      say "cerebro: re-review mode, diffing against $short_sha"
+    fi
   fi
-  if [[ "$base_ref" == "$base" ]]; then
-    base_description="base reference '$base'"
-  else
-    base_description="base reference '$base' (resolved locally as '$base_ref')"
+
+  if [[ "$using_review_state" == "false" ]]; then
+    # Resolve the base ref: explicit --base wins; otherwise try the PR
+    # base via gh; then origin/HEAD; then 'main'.
+    if [[ -z "$base" ]]; then
+      base="$(cd "$repo" && gh pr view --json baseRefName -q .baseRefName 2>/dev/null)"
+    fi
+    if [[ -z "$base" ]]; then
+      base="$(cd "$repo" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+    fi
+    [[ -z "$base" ]] && base="main"
+
+    # Prefer the remote-tracking ref when it exists, so reviews still work
+    # on branches whose local copy of the base is stale. Fall back to the
+    # local branch, then to a raw commit. Matches dev-tools `review`.
+    if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+      base_ref="origin/$base"
+    elif git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
+      base_ref="$base"
+    elif git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+      base_ref="$base"
+    else
+      die "review: could not resolve base reference '$base' in $repo"
+    fi
+    if [[ "$base_ref" == "$base" ]]; then
+      base_description="base reference '$base'"
+    else
+      base_description="base reference '$base' (resolved locally as '$base_ref')"
+    fi
   fi
 
   local merge_base
@@ -915,6 +1068,20 @@ cmd_review() {
   # Drop the (likely empty) err file to keep the children dir tidy.
   [[ -s "$err_path" ]] || rm -f "$err_path"
 
+  # Record the HEAD we just reviewed. The next `cerebro review` (without
+  # --base) will diff against this SHA so codex only sees what
+  # apply-review changed, not the full PR diff again.
+  local current_sha current_branch
+  current_sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null)"
+  current_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [[ -n "$current_sha" && -n "$current_branch" ]]; then
+    mkdir -p "$state_dir"
+    jq -n --arg repo "$canonical_repo" --arg branch "$current_branch" \
+          --arg sha "$current_sha" --arg ts "$(ts_iso)" \
+          '{repo:$repo, branch:$branch, last_reviewed_sha:$sha, ts:$ts}' \
+          > "$state_file" 2>/dev/null || true
+  fi
+
   log_event "review_finished" "$out_path"
   echo "$out_path"
 }
@@ -943,11 +1110,13 @@ cmd_apply_review() {
 
   local sys_prompt
   sys_prompt='You are applying a code reviewer'\''s findings to a git repository.
+Read AGENTS.md at the repo root first and follow it for commit format
+and project guardrails. Do NOT modify AGENTS.md or CLAUDE.md.
 Stay on the current branch -- do not create a new one. Apply only the
 findings the orchestrator indicated should be acted on (see the notes
 block). Skip nits and style-only items unless explicitly called out.
 Run the repo'\''s test or type-check command if one is obvious. Commit
-with a short message and push so the existing PR updates in place.'
+per AGENTS.md and push so the existing PR updates in place.'
 
   say "cerebro: applying review fixes in $repo"
   log_event "apply_review_started" "findings=$findings"
@@ -1000,11 +1169,13 @@ cmd_doc_write() {
 
   local sys_prompt
   sys_prompt='You are updating the user-facing documentation in a git repository
-to reflect a change that just shipped. Stay on the current branch.
+to reflect a change that just shipped. Read AGENTS.md at the repo root
+first and follow it for commit format and project guardrails. Do NOT
+modify AGENTS.md or CLAUDE.md. Stay on the current branch.
 Read the relevant README or docs files first. Update the prose, code
 samples, and command summaries so the docs accurately describe the new
 behaviour. Do not invent features the diff does not contain. Commit
-with a short message and push so the open PR updates.'
+per AGENTS.md and push so the open PR updates.'
 
   say "cerebro: updating docs in $repo"
   log_event "doc_write_started" "plan=$plan"
