@@ -17,6 +17,7 @@
 # Sub-commands called by the orchestrator via Bash(cerebro:*) -- the user
 # never types these; they exist for the chat to drive:
 #   cerebro plan <repo> "<desc>" [--out <name>]
+#   cerebro note "<markdown-body>" [--out <name>]
 #   cerebro plans
 #   cerebro execute <repo> <plan-path>
 #   cerebro review <repo> [--base <ref>]
@@ -116,17 +117,6 @@ canonical_worktree_root() {
     || err_path "not a git worktree: $repo"
   [[ -n "$root" ]] || err_path "not a git worktree: $repo"
   printf '%s\n' "$root"
-}
-
-# Reject any arg that contains shell metacharacters. We never go through a
-# shell so these are inert; rejecting them keeps the orchestrator's intent
-# auditable in the session log.
-reject_dangerous_arg() {
-  local a="$1"
-  case "$a" in
-    *'>'*|*'|'*|*';'*|*'&'*|*'$('*|*'`'*)
-      err_flag "arg contains shell metacharacter: $a" ;;
-  esac
 }
 
 usage() {
@@ -376,11 +366,19 @@ behalf, by calling them through your Bash tool (which is restricted to
    English ("I'll draft a plan now", "the reviewer flagged two
    issues -- I'll apply the ones about input validation"). Keep
    narration short.
-3. When the user describes a feature or change, you DRAFT A PLAN FIRST
-   with `cerebro plan <repo> "<description>"`. You then tell the user
-   where the plan landed and wait for them to read it and explicitly
-   say to proceed. Do NOT jump straight to `cerebro execute` from a
-   feature description.
+3. Default: when the user describes a feature or change, DRAFT A PLAN
+   FIRST with `cerebro plan <repo> "<description>"`, tell the user
+   where it landed, and wait for explicit "go" before `cerebro execute`.
+   Skip `cerebro plan` when:
+     - the work is mechanical: a single-file edit you can describe in
+       2-3 lines, a purely-additive merge-conflict resolution, a
+       one-line config bump, a typo fix; or
+     - the user has already described the change precisely enough
+       that you can write the apply-review/execute notes in under
+       ~200 chars without losing fidelity.
+   Always plan for: cross-file refactors, new modules, schema
+   changes, anything described in under two sentences that needs
+   synthesis across files. When in doubt, plan.
 4. Repos are addressed by absolute path, passed as the first positional
    argument to every sub-agent subcommand. Deduce the path from chat
    context. If the user has not told you which repo, ASK them once
@@ -419,6 +417,12 @@ behalf, by calling them through your Bash tool (which is restricted to
 
   cerebro plans
     List the plan files in the current session with timestamps.
+
+  cerebro note "<text>" [--out <name>]
+    Write <text> to sessions/<id>/plans/<name>.md and echo the path.
+    Use this to stage a hand-written description as input to
+    `cerebro execute` or `cerebro apply-review` when the change is
+    mechanical and a full `cerebro plan` is overkill.
 
   cerebro execute <repo-abs-path> <plan-path>
     Spawn a full-edit child claude with cwd=<repo>. It branches,
@@ -468,8 +472,8 @@ behalf, by calling them through your Bash tool (which is restricted to
     merge-base. diff --no-index, blame --contents, and similar
     path-arg-escape options are rejected. Anything
     mutating (commit, push, checkout, branch -d, config --add, stash
-    push, ...) is rejected. The wrapper never invokes a shell, so `>`
-    redirects and `git diff > file` are inert. Use this for "what does
+    push, ...) is rejected. The wrapper invokes git via execve, so
+    shell metacharacters in args are inert. Use this for "what does
     HEAD look like vs main", "show me the diff", "list branches".
 
   cerebro gh <repo-abs-path> <gh-subcmd> [args...]
@@ -536,6 +540,23 @@ When deciding between a bridge and a planning child: if the answer fits
 in your context after one or two commands, use a bridge. If you need
 cross-file synthesis, an analysis, or a written artefact, spawn
 `cerebro plan` instead.
+
+# Shortcuts
+
+You have four execution shortcuts. Pick the smallest that fits:
+
+  * `cerebro plan` -> `cerebro execute`: default for feature work.
+  * `cerebro execute` direct (skip plan): when rule 3's "skip" criteria
+    apply and the change is a fresh edit (not a fix to existing PR
+    output). Pass the user's description as part of the plan-path
+    by first staging it with `cerebro note "<description>"`.
+  * `cerebro review` -> `cerebro apply-review`: after `execute` writes
+    a PR, or any time the user asks for a re-review pass.
+  * `cerebro apply-review` direct (skip plan AND skip review): for a
+    mechanical fix-up to an open PR (merge conflict, lint
+    autofix the user already diagnosed). Materialise the
+    description with `cerebro note "<text>" --out fix-notes` and pass
+    the returned path as the findings argument.
 
 # Session paths the user can inspect
 
@@ -854,6 +875,37 @@ $desc
   fi
 
   log_event "plan_written" "$out_path"
+  echo "$out_path"
+}
+
+# ----- subcommand: cerebro note "<body>" [--out <name>] --------------------
+
+cmd_note() {
+  require_session
+  local body="${1:-}"; shift || true
+  local out_name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) shift; out_name="${1:-}"; shift || true ;;
+      *) die "note: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$body" ]] || die "usage: cerebro note \"<markdown-body>\" [--out <name>]"
+
+  local plans_dir="$CEREBRO_SESSION_DIR/plans"
+  mkdir -p "$plans_dir"
+
+  if [[ -z "$out_name" ]]; then
+    local n=1
+    while [[ -e "$plans_dir/note-$n.md" ]]; do n=$((n+1)); done
+    out_name="note-$n"
+  fi
+  out_name="${out_name%.md}"
+  local out_path="$plans_dir/$out_name.md"
+  [[ -e "$out_path" ]] && die "note: refusing to overwrite: $out_path"
+
+  printf '%s\n' "$body" > "$out_path" || die "note: write failed: $out_path"
+  log_event "note_written" "$out_path"
   echo "$out_path"
 }
 
@@ -1371,9 +1423,13 @@ cmd_grep() {
   fi
 
   log_event "grep" "$repo $pattern"
+  # `${arr[@]+"${arr[@]}"}` is the bash-3.2-safe form: on macOS's bash,
+  # expanding an empty `${arr[@]}` under `set -u` is treated as unbound
+  # and aborts. The +alt expansion produces nothing when the array is
+  # empty and the normal quoted expansion otherwise.
   exec rg --no-heading --line-number --color never \
           --max-count 200 --max-columns 400 \
-          "${rg_args[@]}" -- "$pattern" "$target"
+          ${rg_args[@]+"${rg_args[@]}"} -- "$pattern" "$target"
 }
 
 # ----- subcommand: cerebro git <repo> <subcmd> [args...] -------------------
@@ -1560,7 +1616,6 @@ cmd_git() {
 
   local a
   for a in "$@"; do
-    reject_dangerous_arg "$a"
     is_denied_global_git_flag "$a" && err_flag "git: denied global flag: $a"
     is_helper_git_flag "$a" && err_flag "git: external helper flag: $a"
   done
@@ -1657,9 +1712,6 @@ cmd_gh() {
       err_subcmd "gh: top-level command not allow-listed: $top" ;;
   esac
 
-  local a
-  for a in "$@"; do reject_dangerous_arg "$a"; done
-
   log_event "gh" "$repo $top $*"
   cd "$repo" || err_path "gh: cannot cd to $repo"
   exec gh "$top" "$@"
@@ -1677,6 +1729,7 @@ main() {
     --resume) shift; cmd_resume "${1:-}" ;;
     list) shift; cmd_list "$@" ;;
     plan) shift; cmd_plan "$@" ;;
+    note) shift; cmd_note "$@" ;;
     plans) shift; cmd_plans "$@" ;;
     execute) shift; cmd_execute "$@" ;;
     review) shift; cmd_review "$@" ;;

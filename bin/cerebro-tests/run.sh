@@ -93,9 +93,17 @@ run_case 06 "git config user.email x@y denied" 5 -- "$CEREBRO_BIN" git "$REPO" c
 STDERR_CONTAINS="subcommand position cannot be a flag" \
 run_case 07 "git -c foo=bar log denied" 5 -- "$CEREBRO_BIN" git "$REPO" -c foo=bar log
 
-# --- 8. shell metachar rejected ---
-STDERR_CONTAINS="shell metacharacter" \
-run_case 08 "git log ';rm -rf /' denied" 5 -- "$CEREBRO_BIN" git "$REPO" log ';rm -rf /'
+# --- 8. shell metachars are inert (no shell in the exec path) ---
+"$CEREBRO_BIN" git "$REPO" log ';foo;' >/dev/null 2>"$WORKDIR/stderr"
+err="$(cat "$WORKDIR/stderr")"
+if [[ "$err" != *"shell metacharacter"* ]]; then
+  printf 'PASS  08  shell-metachar arg reaches git\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL  08  bridge still rejects shell metachars: %s\n' "$err"
+  fail=$((fail + 1))
+  failures+=("08 :: $err")
+fi
 
 # --- 9. non-repo path ---
 STDERR_CONTAINS="not a git repo" \
@@ -142,6 +150,20 @@ if command -v rg >/dev/null 2>&1; then
   fi
 else
   printf 'SKIP  17  grep happy (rg not installed)\n'
+fi
+
+# --- 17b. grep with NO flag args (regression for nounset + empty rg_args) ---
+if command -v rg >/dev/null 2>&1; then
+  "$CEREBRO_BIN" grep "$REPO" 'no-such-literal' >/dev/null 2>&1
+  rc=$?
+  if [[ $rc -eq 0 || $rc -eq 1 ]]; then
+    printf 'PASS  17b  grep no-flag-args (rc=%d)\n' "$rc"
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  17b  grep no-flag-args [rc=%d expected 0 or 1]\n' "$rc"
+    fail=$((fail + 1))
+    failures+=("17b grep no-flag-args :: rc=$rc")
+  fi
 fi
 
 # --- 18. grep escape ---
@@ -355,6 +377,35 @@ gh_happy() {
 gh_happy 48 "gh pr view 123 dispatches" "pr view 123"        pr view 123
 gh_happy 49 "gh pr list --limit 5 dispatches" "pr list --limit 5" pr list --limit 5
 gh_happy 50 "gh api /repos/foo/bar dispatches" "api /repos/foo/bar" api /repos/foo/bar
+
+# --- 51. shell metachars pass through to gh (jq -q with commas/parens) ---
+gh_happy 51 "gh pr view --json with -q containing commas/parens/spaces" \
+  "pr view 64 --json baseRefName,headRefName,commits -q .baseRefName, .headRefName, (.commits | length)" \
+  pr view 64 --json baseRefName,headRefName,commits -q ".baseRefName, .headRefName, (.commits | length)"
+
+# --- 52. cerebro note writes to sessions/<id>/plans/ ---
+note_path="$("$CEREBRO_BIN" note 'fix: drop stray semicolon in foo.js' --out fix-foo 2>/dev/null)"
+if [[ -f "$note_path" && "$note_path" == *"plans/fix-foo.md" ]] \
+   && grep -q 'fix: drop stray semicolon' "$note_path"; then
+  printf 'PASS  52  cerebro note writes plan file\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  52  cerebro note [path=%s]\n' "$note_path"
+  fail=$((fail + 1)); failures+=("52 note :: path=$note_path")
+fi
+
+# --- 53. cerebro note refuses overwrite ---
+STDERR_CONTAINS="refusing to overwrite" \
+run_case 53 "cerebro note --out fix-foo (collision)" 1 \
+  -- "$CEREBRO_BIN" note 'second body' --out fix-foo
+
+# --- 54. cerebro note auto-names without --out ---
+auto_path="$("$CEREBRO_BIN" note 'auto body' 2>/dev/null)"
+if [[ -f "$auto_path" && "$auto_path" == *"plans/note-1.md" ]]; then
+  printf 'PASS  54  cerebro note auto-names\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  54  cerebro note auto-name [path=%s]\n' "$auto_path"
+  fail=$((fail + 1)); failures+=("54 note auto :: path=$auto_path")
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
