@@ -145,6 +145,75 @@ Requirements: `claude`, `git`, `python3`.
 Env: `DIFF2PLAN_MODEL`, `DIFF2PLAN_EFFORT`, `DIFF2PLAN_TIMEOUT`,
 `DIFF2PLAN_ALLOWED_TOOLS`, `DIFF2PLAN_DEBUG`.
 
+### `cerebro`
+
+Meta-harness for the plan → execute → review loop. Typing `cerebro` in
+a shell drops you into a native interactive `claude` session configured
+as an orchestrator: a restricted tool surface (Read, Grep, Glob, and
+Bash limited to `cerebro:*`) plus a system prompt that catalogues a
+small set of `cerebro <subcommand>` tools. The orchestrator spawns
+short-lived sub-agents on your behalf — `claude -p` for planning and
+code work, `codex exec` for review — while you stay in the chat.
+
+```bash
+cerebro                       # mint a new session, drop into the chat
+cerebro --resume <id>         # resume a specific session
+cerebro --resume              # claude's session picker
+cerebro list                  # list sessions, newest first
+```
+
+You talk only to the orchestrator. It decides when to call `cerebro
+plan`, `cerebro execute`, `cerebro review`, `cerebro apply-review`,
+`cerebro doc-write`, `cerebro recall`, or `cerebro status` based on
+the conversation. A typical feature loop: describe the change → the
+orchestrator drafts a plan and tells you where it landed → you read
+the plan and say "go" → orchestrator executes it on a feature branch,
+pushes, opens a PR via `gh` → orchestrator runs codex against the
+diff, summarises the findings, and applies the ones that matter → loop
+until codex is quiet → optionally `doc-write` at the end.
+
+**Interactive-only.** `cerebro` refuses to run under a non-terminal
+parent (pipes, scripts, cron). Sub-agents are exempt via the
+`CEREBRO_SESSION_ID` environment variable that the orchestrator inherits.
+
+**No concurrency control.** Multiple sessions against the same repo
+are allowed; sequence your own mutating work — this is a power tool,
+not a guard rail.
+
+**No chat/PR/repo-specific flags are ever passed to `claude` or
+`codex`.** The orchestrator addresses repos by absolute path as the
+first positional argument to its sub-agent tools, and `cerebro` sets
+each spawned child's `cwd` to that path. The orchestrator itself only
+ever runs in `$CEREBRO_HOME`.
+
+Session state lives under `$CEREBRO_HOME` (default `~/.cerebro/`):
+
+```
+~/.cerebro/
+  hook.sh                            # UserPromptSubmit hook, routes by session id
+  system-prompt.md                   # orchestrator system prompt
+  .claude/settings.local.json        # registers the hook
+  sessions/<claude-session-uuid>/
+    metadata.json
+    transcript.jsonl                 # user prompts + cerebro milestone events
+    plans/                           # plan markdown files
+    children/                        # stream-json logs of every sub-agent
+```
+
+The `UserPromptSubmit` hook routes each user message to the matching
+session's `transcript.jsonl` by `session_id`, so memory survives
+resume and concurrent sessions never bleed into each other. The hook
+no-ops for non-cerebro claude sessions, so it is safe even though
+`.claude/settings.local.json` lives in a directory claude visits any
+time you `cd` into `~/.cerebro`.
+
+Requirements: `claude`, `codex`, `jq`, `python3`. Child claudes
+additionally need `git` and `gh` for `execute` / `apply-review` /
+`doc-write` to function.
+
+Env: `CEREBRO_HOME`, `CEREBRO_MODEL`, `CEREBRO_REVIEW_MODEL`,
+`CEREBRO_TIMEOUT`, `CEREBRO_CODEX_CMD`, `CEREBRO_DEBUG`.
+
 ## Adding a tool
 
 1. Drop the script into `bin/` and `chmod +x` it.

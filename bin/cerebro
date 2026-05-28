@@ -1,0 +1,986 @@
+#!/usr/bin/env bash
+# cerebro - meta-harness CLI for the plan -> execute -> review loop.
+#
+# `cerebro` launches a native interactive `claude` session as the
+# orchestrator. The orchestrator has a restricted tool surface --
+# Read/Grep/Glob plus Bash limited to `cerebro:*` -- and a system
+# prompt that catalogues the cerebro sub-commands. The user talks only
+# to the orchestrator; the orchestrator spawns short-lived sub-agents
+# (`claude -p` for code work, `codex exec` for review) via those
+# sub-commands.
+#
+# Top-level invocations the user types at a shell:
+#   cerebro                       # mint a new session, drop into the chat
+#   cerebro --resume [<id>]       # resume a session (id, or picker if omitted)
+#   cerebro list                  # list sessions, newest first
+#
+# Sub-commands called by the orchestrator via Bash(cerebro:*) -- the user
+# never types these; they exist for the chat to drive:
+#   cerebro plan <repo> "<desc>" [--out <name>]
+#   cerebro plans
+#   cerebro execute <repo> <plan-path>
+#   cerebro review <repo> [--base <ref>]
+#   cerebro apply-review <repo> <findings-path> [--notes "..."]
+#   cerebro doc-write <repo> <plan-path> [--notes "..."]
+#   cerebro recall <query>
+#   cerebro status
+#
+# Required: claude, codex, jq, python3 on PATH. Child claudes additionally
+# need git and gh for execute / apply-review / doc-write to function.
+#
+# Env:
+#   CEREBRO_HOME          base dir (default: $HOME/.cerebro)
+#   CEREBRO_MODEL         model alias for child `claude -p` (default: unset)
+#   CEREBRO_REVIEW_MODEL  model alias for `codex exec` (default: unset)
+#   CEREBRO_TIMEOUT       seconds for child agent calls (default: 3600)
+#   CEREBRO_CODEX_CMD     codex executable (default: codex)
+#   CEREBRO_DEBUG         if 1, verbose logs and leave temp files
+
+set -uo pipefail
+
+CEREBRO_HOME="${CEREBRO_HOME:-$HOME/.cerebro}"
+CEREBRO_MODEL="${CEREBRO_MODEL:-}"
+CEREBRO_REVIEW_MODEL="${CEREBRO_REVIEW_MODEL:-}"
+CEREBRO_TIMEOUT="${CEREBRO_TIMEOUT:-3600}"
+CEREBRO_CODEX_CMD="${CEREBRO_CODEX_CMD:-codex}"
+CEREBRO_DEBUG="${CEREBRO_DEBUG:-0}"
+
+# ----- helpers --------------------------------------------------------------
+
+say()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf 'cerebro: warning: %s\n' "$*" >&2; }
+die()  { printf 'cerebro: error: %s\n' "$*" >&2; exit 1; }
+dbg()  { [[ "$CEREBRO_DEBUG" == "1" ]] && printf 'cerebro: debug: %s\n' "$*" >&2; return 0; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  cerebro                       # start a new session (interactive chat)
+  cerebro --resume [<id>]       # resume a session (id, or picker if omitted)
+  cerebro list                  # list sessions, newest first
+  cerebro --help                # this help
+
+cerebro launches a native interactive `claude` chat configured as an
+orchestrator. The orchestrator drives the plan -> execute -> review loop
+by calling `cerebro <subcommand>` against your repositories on your
+behalf. You stay in the chat -- you don't type the sub-commands yourself.
+
+The orchestrator's tools are restricted to Read, Grep, Glob, and
+`Bash(cerebro:*)`. Every git/gh/codex action and every file edit happens
+inside a short-lived sub-agent that cerebro spawns; the orchestrator
+itself can't touch repos directly.
+
+Notes:
+  * Interactive-only. cerebro refuses to run under a non-terminal parent
+    (pipes, scripts, cron). Sub-agents launched by the orchestrator are
+    exempt via $CEREBRO_SESSION_ID.
+  * No concurrency control. Multiple sessions against the same repo are
+    allowed; sequence your own mutating work.
+  * No chat/PR/repo-specific flags are ever passed to `claude` or
+    `codex`. The orchestrator addresses repos by absolute path as the
+    first positional arg to its sub-agent tools.
+
+Requirements: claude, codex, jq, python3. Child claudes additionally
+need git and gh on PATH for execute / apply-review / doc-write.
+
+Env: CEREBRO_HOME, CEREBRO_MODEL, CEREBRO_REVIEW_MODEL, CEREBRO_TIMEOUT,
+CEREBRO_CODEX_CMD, CEREBRO_DEBUG.
+EOF
+}
+
+# Interactive guard -- only runs for top-level invocations from a shell.
+# Sub-agents spawned by the orchestrator have CEREBRO_SESSION_ID set and
+# bypass this check; that's how `cerebro plan`, `cerebro execute`, ...
+# can run inside the orchestrator's non-TTY Bash tool.
+require_interactive() {
+  [[ -n "${CEREBRO_SESSION_ID:-}" ]] && return 0
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    die "cerebro is interactive-only; stdin and stdout must be terminals"
+  fi
+  local parent
+  parent="$(ps -o comm= -p "$PPID" 2>/dev/null | awk '{print $1}')"
+  parent="${parent##*/}"
+  case "$parent" in
+    -bash|bash|-zsh|zsh|-fish|fish|-sh|sh|-dash|dash|-ksh|ksh|-tcsh|tcsh) ;;
+    tmux*|screen*|login|sshd) ;;
+    *) die "cerebro is interactive-only; refused to run under parent '$parent'" ;;
+  esac
+}
+
+require_deps() {
+  local cmd
+  for cmd in claude "$CEREBRO_CODEX_CMD" jq python3; do
+    command -v "$cmd" >/dev/null 2>&1 || die "missing required command on PATH: $cmd"
+  done
+}
+
+require_session() {
+  [[ -n "${CEREBRO_SESSION_ID:-}" ]] || {
+    # Bare-resume fallback: hook writes a current-session symlink on
+    # first user prompt, pointing at sessions/<id>/.
+    if [[ -L "$CEREBRO_HOME/current-session" ]]; then
+      local target
+      target="$(readlink "$CEREBRO_HOME/current-session")"
+      target="${target##*/}"
+      [[ -n "$target" ]] && export CEREBRO_SESSION_ID="$target"
+    fi
+  }
+  [[ -n "${CEREBRO_SESSION_ID:-}" ]] || die "no current cerebro session (CEREBRO_SESSION_ID unset and no current-session symlink). Did you launch this from a `cerebro` shell?"
+  CEREBRO_SESSION_DIR="$CEREBRO_HOME/sessions/$CEREBRO_SESSION_ID"
+  [[ -d "$CEREBRO_SESSION_DIR" ]] || die "session dir missing: $CEREBRO_SESSION_DIR"
+  export CEREBRO_SESSION_DIR
+}
+
+mint_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z'
+  else
+    python3 -c 'import uuid; print(uuid.uuid4())'
+  fi
+}
+
+ts_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+ts_compact() { date -u +%Y%m%dT%H%M%SZ; }
+
+# Append a structured event to the active session's transcript.
+log_event() {
+  local what="$1"; shift || true
+  local extra="${1:-}"
+  [[ -z "${CEREBRO_SESSION_DIR:-}" ]] && return 0
+  local file="$CEREBRO_SESSION_DIR/transcript.jsonl"
+  jq -nc --arg ts "$(ts_iso)" --arg what "$what" --arg extra "$extra" \
+    '{kind:"event", ts:$ts, what:$what} + (if $extra == "" then {} else {detail:$extra} end)' \
+    >> "$file" 2>/dev/null || true
+}
+
+# Timeout fallback chain (copied from bin/tai).
+build_timeout_cmd() {
+  if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(timeout "$CEREBRO_TIMEOUT")
+  elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(gtimeout "$CEREBRO_TIMEOUT")
+  elif command -v perl >/dev/null 2>&1; then
+    TIMEOUT_CMD=(perl -e 'alarm shift; exec @ARGV' "$CEREBRO_TIMEOUT")
+  else
+    TIMEOUT_CMD=(env)
+  fi
+}
+
+# Write the embedded payloads (hook.sh, system-prompt.md, settings.local.json)
+# into $CEREBRO_HOME. Idempotent: existing files are overwritten only if their
+# content differs, so subsequent runs see an up-to-date copy without churn.
+materialise_home() {
+  mkdir -p "$CEREBRO_HOME/.claude" "$CEREBRO_HOME/sessions" \
+    || die "cannot create $CEREBRO_HOME"
+
+  write_if_changed "$CEREBRO_HOME/system-prompt.md" "$(cerebro_system_prompt)"
+  write_if_changed "$CEREBRO_HOME/hook.sh" "$(cerebro_hook_script)"
+  chmod +x "$CEREBRO_HOME/hook.sh"
+
+  local settings; settings="$(cerebro_settings_json "$CEREBRO_HOME/hook.sh")"
+  write_if_changed "$CEREBRO_HOME/.claude/settings.local.json" "$settings"
+}
+
+write_if_changed() {
+  local path="$1" content="$2"
+  if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$content" ]]; then
+    return 0
+  fi
+  printf '%s' "$content" > "$path"
+}
+
+# ----- embedded payloads ----------------------------------------------------
+
+cerebro_hook_script() {
+  cat <<'HOOKSH'
+#!/usr/bin/env bash
+# UserPromptSubmit hook for cerebro. Reads claude's hook payload from
+# stdin, routes the prompt to the matching cerebro session's transcript
+# by session_id, and updates the current-session symlink so bare-resume
+# can find its way home. Silently no-ops for non-cerebro claude sessions.
+
+set -uo pipefail
+
+CEREBRO_HOME="${CEREBRO_HOME:-$HOME/.cerebro}"
+
+# Read the whole payload once -- jq doesn't share stdin between filters.
+payload="$(cat 2>/dev/null || true)"
+[[ -z "$payload" ]] && exit 0
+
+if ! command -v jq >/dev/null 2>&1; then
+  exit 0
+fi
+
+sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)"
+text="$(printf '%s' "$payload" | jq -r '.prompt // empty' 2>/dev/null)"
+
+[[ -z "$sid" ]] && exit 0
+
+sess_dir="$CEREBRO_HOME/sessions/$sid"
+[[ -d "$sess_dir" ]] || exit 0
+
+ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+jq -nc --arg ts "$ts" --arg text "$text" '{kind:"user", ts:$ts, text:$text}' \
+  >> "$sess_dir/transcript.jsonl" 2>/dev/null || true
+
+# Keep current-session pointing at whichever session most recently saw a
+# user prompt. Sub-commands consult this when CEREBRO_SESSION_ID is unset
+# (bare `cerebro --resume` path).
+ln -sfn "$sess_dir" "$CEREBRO_HOME/current-session" 2>/dev/null || true
+
+# Touch last_touched in metadata.
+if [[ -f "$sess_dir/metadata.json" ]]; then
+  tmp="$(mktemp 2>/dev/null)" && {
+    if jq --arg ts "$ts" '.last_touched = $ts' "$sess_dir/metadata.json" \
+        > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$sess_dir/metadata.json"
+    else
+      rm -f "$tmp"
+    fi
+  }
+fi
+
+exit 0
+HOOKSH
+}
+
+cerebro_settings_json() {
+  local hook_path="$1"
+  cat <<EOF
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$hook_path"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
+
+cerebro_system_prompt() {
+  cat <<'PROMPT'
+You are the cerebro orchestrator. You drive a plan -> execute -> review
+loop on behalf of a developer who is talking to you in a normal claude
+chat. The developer never types cerebro commands -- you do, on their
+behalf, by calling them through your Bash tool (which is restricted to
+`cerebro:*`).
+
+# Hard rules
+
+1. You may use only these tools: Read, Grep, Glob, and Bash limited to
+   `cerebro <subcommand> ...` invocations. You have no Edit, Write,
+   NotebookEdit, or unrestricted Bash. You cannot run git, gh, codex,
+   or any editor directly. Every filesystem change, every git operation,
+   every PR action, and every codex review goes through `cerebro
+   <subcommand>`.
+2. You do not ask the user for permission to run cerebro subcommands;
+   running them is your job. Do narrate what you are doing in plain
+   English ("I'll draft a plan now", "the reviewer flagged two
+   issues -- I'll apply the ones about input validation"). Keep
+   narration short.
+3. When the user describes a feature or change, you DRAFT A PLAN FIRST
+   with `cerebro plan <repo> "<description>"`. You then tell the user
+   where the plan landed and wait for them to read it and explicitly
+   say to proceed. Do NOT jump straight to `cerebro execute` from a
+   feature description.
+4. Repos are addressed by absolute path, passed as the first positional
+   argument to every sub-agent subcommand. Deduce the path from chat
+   context. If the user has not told you which repo, ASK them once
+   before doing anything else.
+5. You operate on the cerebro home (your cwd). Plans live under
+   `sessions/<id>/plans/`, child agent logs under `sessions/<id>/children/`,
+   and codex findings under the same children dir. Use Read / Grep /
+   Glob to inspect them. You do NOT have a view into the user's repos;
+   anything you need from a repo, ask a sub-agent to produce it.
+
+# Available sub-commands
+
+  cerebro plan <repo-abs-path> "<description>" [--out <name>]
+    Spawn a read-only child claude with cwd=<repo>. It writes a Markdown
+    plan to sessions/<this-session>/plans/<name>.md and the path is
+    echoed on stdout. The child has Read/Grep/Glob only, so the repo is
+    untouched. Use this when the user describes a change.
+
+  cerebro plans
+    List the plan files in the current session with timestamps.
+
+  cerebro execute <repo-abs-path> <plan-path>
+    Spawn a full-edit child claude with cwd=<repo>. It branches,
+    implements the plan, commits, pushes, and opens a PR via gh. Use
+    this AFTER the user has read the plan and told you to proceed.
+
+  cerebro review <repo-abs-path> [--base <ref>]
+    Run codex (non-mutating) against the current branch diff vs <ref>
+    (defaults to the PR base, falling back to origin/HEAD). The
+    findings file path is echoed on stdout. Read it with Read and
+    decide which findings matter; if any are unclear, ask the user.
+
+  cerebro apply-review <repo-abs-path> <findings-path> [--notes "..."]
+    Spawn a full-edit child claude with cwd=<repo> to apply the review
+    fixes you've decided to act on. Include your judgment notes
+    ("apply only the input-validation point; skip the style nits") in
+    --notes. The child commits and pushes on the same branch, so the
+    existing PR updates in place.
+
+  cerebro doc-write <repo-abs-path> <plan-path> [--notes "..."]
+    Spawn a full-edit child claude with cwd=<repo> to update docs based
+    on the plan and the recent diff. Commits and pushes on the same
+    branch.
+
+  cerebro recall <query>
+    Search across all cerebro sessions' transcripts and child logs.
+    Use this when the user references prior work ("did we already do
+    the rename in the orders service?").
+
+  cerebro status
+    Print the current session state -- plans on file, last child
+    invocation, last review.
+
+# The loop
+
+For a single feature:
+
+  1. Optionally `cerebro recall` for prior context.
+  2. `cerebro plan <repo> "<what the user asked for>"`. Echo the path
+     to the user; ask them to read it.
+  3. Wait for the user to say "go" / "execute it" / etc.
+  4. `cerebro execute <repo> <plan-path>`. Narrate progress briefly.
+  5. `cerebro review <repo>`. Read the findings. Summarise to the user
+     which findings you'll act on and which you'll skip, and why.
+  6. If any findings warrant action: `cerebro apply-review <repo>
+     <findings> --notes "..."`, then `cerebro review` again. Loop
+     until codex is quiet or the remaining findings are deliberate
+     non-issues.
+  7. Optionally `cerebro doc-write <repo> <plan>` to update docs.
+
+# Session paths the user can inspect
+
+You may freely tell the user concrete paths under
+`sessions/<id>/` -- plans, transcripts, child logs, codex findings --
+so they can open them in their editor. Those are legitimate state.
+
+Never paste a sub-agent's raw stream-json log into the chat. If the
+user wants to see it, hand them the path.
+PROMPT
+}
+
+# ----- session metadata -----------------------------------------------------
+
+write_metadata_new() {
+  local sess_dir="$1" sid="$2" ts="$3"
+  jq -n --arg sid "$sid" --arg ts "$ts" \
+    '{claude_session_id:$sid, created_at:$ts, last_touched:$ts}' \
+    > "$sess_dir/metadata.json"
+}
+
+touch_metadata() {
+  local sess_dir="$1" ts="$2" tmp
+  [[ -f "$sess_dir/metadata.json" ]] || return 0
+  tmp="$(mktemp)" || return 0
+  jq --arg ts "$ts" '.last_touched = $ts' "$sess_dir/metadata.json" \
+    > "$tmp" 2>/dev/null && mv "$tmp" "$sess_dir/metadata.json" || rm -f "$tmp"
+}
+
+# ----- inline python helpers -----------------------------------------------
+
+# Stream-json parser shared by plan / execute / apply-review / doc-write.
+# Reads claude stream-json on stdin, emits a one-line tool-call summary on
+# stderr per tool use, captures the final `result` event's text to the
+# given file path (if non-empty), and exits non-zero if claude reported
+# anything other than a successful result.
+PY_PARSE_STREAM='
+import json, sys, os
+
+result_path = sys.argv[1] if len(sys.argv) > 1 else ""
+result_text = None
+result_subtype = None
+saw_any_event = False
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    saw_any_event = True
+    t = ev.get("type")
+    if t == "assistant":
+        for item in ev.get("message", {}).get("content", []) or []:
+            if item.get("type") == "tool_use":
+                name = item.get("name", "?")
+                inp = item.get("input", {}) or {}
+                target = (
+                    inp.get("description") or inp.get("file_path") or
+                    inp.get("pattern") or inp.get("path") or
+                    inp.get("query") or inp.get("command") or ""
+                )
+                if isinstance(target, list):
+                    target = " ".join(map(str, target))
+                target = str(target).replace("\n", " ").strip()
+                if len(target) > 120:
+                    target = target[:120] + "..."
+                clr = "\r\033[2K" if sys.stderr.isatty() else ""
+                sys.stderr.write(f"{clr}  {name}: {target}\n")
+                sys.stderr.flush()
+    elif t == "result":
+        result_subtype = ev.get("subtype")
+        result_text = ev.get("result")
+
+if not saw_any_event:
+    sys.stderr.write("\ncerebro: claude produced no stream events\n")
+    sys.exit(2)
+if result_subtype and result_subtype != "success":
+    sys.stderr.write(f"\ncerebro: claude reported result subtype={result_subtype}\n")
+    sys.exit(4)
+if result_path:
+    if result_text is None:
+        sys.stderr.write(f"\ncerebro: claude did not emit a result event\n")
+        sys.exit(3)
+    with open(result_path, "w") as f:
+        f.write(result_text)
+'
+
+# ----- subcommand: cerebro (launch new session) ----------------------------
+
+cmd_launch() {
+  require_interactive
+  require_deps
+  materialise_home
+
+  local sid sess_dir ts
+  sid="$(mint_uuid)"
+  sess_dir="$CEREBRO_HOME/sessions/$sid"
+  mkdir -p "$sess_dir/plans" "$sess_dir/children"
+  : > "$sess_dir/transcript.jsonl"
+  ts="$(ts_iso)"
+  write_metadata_new "$sess_dir" "$sid" "$ts"
+
+  export CEREBRO_SESSION_ID="$sid"
+  export CEREBRO_SESSION_DIR="$sess_dir"
+  export CEREBRO_HOME
+
+  CEREBRO_SESSION_DIR="$sess_dir" log_event "session_created"
+
+  say "cerebro: starting session $sid"
+  cd "$CEREBRO_HOME" || die "cd to $CEREBRO_HOME failed"
+  exec claude \
+    --session-id "$sid" \
+    --append-system-prompt "$(cat "$CEREBRO_HOME/system-prompt.md")" \
+    --allowedTools "Bash(cerebro:*) Read Grep Glob"
+}
+
+# ----- subcommand: cerebro --resume [<id>] ---------------------------------
+
+cmd_resume() {
+  require_interactive
+  require_deps
+  materialise_home
+
+  local id="${1:-}"
+  export CEREBRO_HOME
+
+  if [[ -n "$id" ]]; then
+    local sess_dir="$CEREBRO_HOME/sessions/$id"
+    [[ -d "$sess_dir" ]] || die "no such session: $id"
+    touch_metadata "$sess_dir" "$(ts_iso)"
+    export CEREBRO_SESSION_ID="$id"
+    export CEREBRO_SESSION_DIR="$sess_dir"
+    say "cerebro: resuming session $id"
+  else
+    # Bare resume: claude shows its own picker. The hook will write the
+    # current-session symlink as soon as the user submits their first
+    # prompt, and orchestrator subcommands fall back to that.
+    say "cerebro: resuming via claude's picker"
+  fi
+
+  cd "$CEREBRO_HOME" || die "cd to $CEREBRO_HOME failed"
+  if [[ -n "$id" ]]; then
+    exec claude \
+      --resume "$id" \
+      --append-system-prompt "$(cat "$CEREBRO_HOME/system-prompt.md")" \
+      --allowedTools "Bash(cerebro:*) Read Grep Glob"
+  else
+    exec claude \
+      --resume \
+      --append-system-prompt "$(cat "$CEREBRO_HOME/system-prompt.md")" \
+      --allowedTools "Bash(cerebro:*) Read Grep Glob"
+  fi
+}
+
+# ----- subcommand: cerebro list --------------------------------------------
+
+cmd_list() {
+  require_interactive
+  if [[ ! -d "$CEREBRO_HOME/sessions" ]] || \
+     [[ -z "$(ls -A "$CEREBRO_HOME/sessions" 2>/dev/null)" ]]; then
+    echo "cerebro: no sessions yet"
+    return 0
+  fi
+  # Sort by metadata.last_touched, newest first.
+  python3 - "$CEREBRO_HOME/sessions" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+rows = []
+for name in os.listdir(root):
+    sess = os.path.join(root, name)
+    md = os.path.join(sess, "metadata.json")
+    created = touched = "-"
+    if os.path.isfile(md):
+        try:
+            data = json.load(open(md))
+            created = data.get("created_at", "-")
+            touched = data.get("last_touched", created)
+        except Exception:
+            pass
+    rows.append((touched, name, created))
+rows.sort(reverse=True)
+if not rows:
+    print("cerebro: no sessions yet")
+else:
+    width = max((len(r[1]) for r in rows), default=8)
+    print(f"{'session':<{width}}  created_at            last_touched")
+    for touched, name, created in rows:
+        print(f"{name:<{width}}  {created:<20}  {touched}")
+PY
+}
+
+# ----- subcommand: cerebro plan <repo> "<desc>" [--out <name>] -------------
+
+cmd_plan() {
+  require_session
+  build_timeout_cmd
+
+  local repo="${1:-}"; shift || true
+  local desc="${1:-}"; shift || true
+  local out_name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) shift; out_name="${1:-}"; shift || true ;;
+      *) die "plan: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$repo" && -n "$desc" ]] || die "usage: cerebro plan <repo-abs-path> \"<description>\" [--out <name>]"
+  [[ "$repo" = /* ]] || die "plan: repo path must be absolute: $repo"
+  [[ -d "$repo" ]] || die "plan: repo not a directory: $repo"
+
+  local plans_dir="$CEREBRO_SESSION_DIR/plans"
+  mkdir -p "$plans_dir"
+
+  if [[ -z "$out_name" ]]; then
+    local n=1
+    while [[ -e "$plans_dir/plan-$n.md" ]]; do n=$((n+1)); done
+    out_name="plan-$n"
+  fi
+  out_name="${out_name%.md}"
+  local out_path="$plans_dir/$out_name.md"
+  local child_log="$CEREBRO_SESSION_DIR/children/plan-$(ts_compact).jsonl"
+
+  local sys_prompt
+  sys_prompt='You are drafting an implementation plan for a developer. Look up
+the codebase you have read access to and produce a Markdown plan that
+another engineer (or another claude session) can execute. Keep paths,
+function names, and file names concrete -- this is a working plan, not
+an offline-reading rewrite. Begin your reply with a Markdown H1 title.
+Do not add a preamble before the title. Do not wrap your output in an
+outer code fence. Output ONLY the plan.'
+
+  say "cerebro: planning in $repo -> $out_path"
+  log_event "plan_started" "$out_path"
+
+  local opts=(-p --permission-mode auto --allowedTools "Read Grep Glob"
+              --output-format stream-json --verbose
+              --append-system-prompt "$sys_prompt")
+  [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
+
+  local prompt
+  prompt="Write an implementation plan for the following request, exploring this repository with your read tools as needed.
+
+<request>
+$desc
+</request>"
+
+  local rc
+  ( cd "$repo" && \
+    printf '%s' "$prompt" | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+      "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+      | tee "$child_log" \
+      | python3 -c "$PY_PARSE_STREAM" "$out_path" )
+  rc=$?
+
+  if (( rc != 0 )); then
+    log_event "plan_failed" "rc=$rc"
+    die "plan: child claude failed (rc=$rc); see $child_log"
+  fi
+
+  log_event "plan_written" "$out_path"
+  echo "$out_path"
+}
+
+# ----- subcommand: cerebro plans -------------------------------------------
+
+cmd_plans() {
+  require_session
+  local plans_dir="$CEREBRO_SESSION_DIR/plans"
+  if [[ ! -d "$plans_dir" ]] || [[ -z "$(ls -A "$plans_dir" 2>/dev/null)" ]]; then
+    echo "cerebro: no plans in this session"
+    return 0
+  fi
+  # ls -lt is portable enough; print mtime + filename.
+  local f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    local mtime
+    mtime="$(python3 -c 'import os,sys,datetime; print(datetime.datetime.utcfromtimestamp(os.path.getmtime(sys.argv[1])).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$f")"
+    printf '%s  %s\n' "$mtime" "$f"
+  done < <(find "$plans_dir" -maxdepth 1 -type f -name '*.md' | sort)
+}
+
+# ----- subcommand: cerebro execute <repo> <plan-path> ----------------------
+
+cmd_execute() {
+  require_session
+  build_timeout_cmd
+
+  local repo="${1:-}"; shift || true
+  local plan_path="${1:-}"; shift || true
+  [[ -n "$repo" && -n "$plan_path" ]] || die "usage: cerebro execute <repo-abs-path> <plan-path>"
+  [[ "$repo" = /* ]] || die "execute: repo path must be absolute: $repo"
+  [[ -d "$repo" ]] || die "execute: repo not a directory: $repo"
+  [[ -r "$plan_path" ]] || die "execute: cannot read plan: $plan_path"
+
+  local child_log="$CEREBRO_SESSION_DIR/children/execute-$(ts_compact).jsonl"
+
+  local sys_prompt
+  sys_prompt='You are executing an implementation plan in a git repository.
+Create a new feature branch with a short, descriptive name (kebab-case)
+based on the plan. Implement the plan. Run the tests, type checks, or
+linters that the repo conventions imply. Commit with a clear message,
+push the branch, and open a pull request via the `gh` CLI. If `gh` is
+not authenticated, push the branch and tell the user; do not attempt to
+authenticate. Stop after the PR is open.'
+
+  say "cerebro: executing $plan_path in $repo"
+  log_event "execute_started" "plan=$plan_path repo=$repo"
+
+  local opts=(-p --permission-mode auto
+              --allowedTools "Read Edit Write Bash Grep Glob"
+              --output-format stream-json --verbose
+              --append-system-prompt "$sys_prompt")
+  [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
+
+  local rc
+  ( cd "$repo" && \
+    { printf 'Execute the following plan in this repository. Branch, implement, commit, push, and open a PR via gh.\n\n<plan>\n'
+      cat "$plan_path"
+      printf '\n</plan>\n'
+    } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+      | tee "$child_log" \
+      | python3 -c "$PY_PARSE_STREAM" "" )
+  rc=$?
+
+  if (( rc != 0 )); then
+    log_event "execute_failed" "rc=$rc log=$child_log"
+    die "execute: child claude failed (rc=$rc); see $child_log"
+  fi
+  log_event "execute_finished" "$child_log"
+  echo "$child_log"
+}
+
+# ----- subcommand: cerebro review <repo> [--base <ref>] --------------------
+
+cmd_review() {
+  require_session
+  build_timeout_cmd
+
+  local repo="${1:-}"; shift || true
+  local base=""
+  local explicit_base="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --base) shift; base="${1:-}"; explicit_base="true"; shift || true ;;
+      *) die "review: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$repo" ]] || die "usage: cerebro review <repo-abs-path> [--base <ref>]"
+  [[ "$repo" = /* ]] || die "review: repo path must be absolute: $repo"
+  [[ -d "$repo" ]] || die "review: repo not a directory: $repo"
+
+  # Resolve the base ref: explicit --base wins; otherwise try the PR base
+  # via gh; then origin/HEAD; then 'main'.
+  if [[ -z "$base" ]]; then
+    base="$(cd "$repo" && gh pr view --json baseRefName -q .baseRefName 2>/dev/null)"
+  fi
+  if [[ -z "$base" ]]; then
+    base="$(cd "$repo" && git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+  fi
+  [[ -z "$base" ]] && base="main"
+
+  # Prefer the remote-tracking ref when it exists, so reviews still work on
+  # branches whose local copy of the base is stale. Fall back to the local
+  # branch, then to a raw commit. Matches the dev-tools `review` tool.
+  local base_ref base_description
+  if git -C "$repo" show-ref --verify --quiet "refs/remotes/origin/$base"; then
+    base_ref="origin/$base"
+  elif git -C "$repo" show-ref --verify --quiet "refs/heads/$base"; then
+    base_ref="$base"
+  elif git -C "$repo" rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+    base_ref="$base"
+  else
+    die "review: could not resolve base reference '$base' in $repo"
+  fi
+  if [[ "$base_ref" == "$base" ]]; then
+    base_description="base reference '$base'"
+  else
+    base_description="base reference '$base' (resolved locally as '$base_ref')"
+  fi
+
+  local merge_base
+  merge_base="$(git -C "$repo" merge-base HEAD "$base_ref" 2>/dev/null)" \
+    || die "review: failed to determine merge base against '$base_ref'"
+
+  local out_path="$CEREBRO_SESSION_DIR/children/codex-$(ts_compact).md"
+  local err_path="${out_path%.md}.err"
+
+  say "cerebro: reviewing $repo against $base_description (merge-base $merge_base)"
+  log_event "review_started" "repo=$repo base=$base_ref merge_base=$merge_base"
+
+  # Short, focused prompt borrowed from aminmarashi/dev-tools `review`. We give
+  # codex the merge base directly so it runs the right `git diff` itself
+  # instead of guessing or pre-loading a huge patch into context.
+  local codex_prompt
+  codex_prompt="Review the code changes against the $base_description. The merge base commit for this comparison is $merge_base. Run \`git diff $merge_base\` to inspect the changes included since that merge base. Provide prioritized, actionable findings: bugs, regressions, security issues, missing tests, and correctness problems. Skip style nits and speculative concerns. For each finding, give a one-line title, the file or area affected, and a sentence explaining the concern and a suggested fix. Output Markdown only; no preamble."
+
+  local codex_opts=(exec --sandbox read-only --skip-git-repo-check --cd "$repo")
+  [[ -n "$CEREBRO_REVIEW_MODEL" ]] && codex_opts+=(--model "$CEREBRO_REVIEW_MODEL")
+
+  local rc
+  env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+    "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${codex_opts[@]}" "$codex_prompt" \
+    > "$out_path" 2> "$err_path"
+  rc=$?
+
+  # On any failure -- non-zero exit OR empty output -- preserve the err log
+  # but do NOT echo a findings path. The orchestrator must not feed a failed
+  # review's stderr into apply-review as if it were findings.
+  if (( rc != 0 )) || [[ ! -s "$out_path" ]]; then
+    log_event "review_failed" "rc=$rc err=$err_path out=$out_path"
+    warn "codex exited rc=$rc"
+    [[ -s "$err_path" ]] && warn "see error log: $err_path"
+    [[ -s "$out_path" ]] && warn "partial output preserved at: $out_path"
+    die "review: codex run failed; not echoing a findings path"
+  fi
+
+  # Codex's exit was zero and out_path has content; treat that as findings.
+  # Drop the (likely empty) err file to keep the children dir tidy.
+  [[ -s "$err_path" ]] || rm -f "$err_path"
+
+  log_event "review_finished" "$out_path"
+  echo "$out_path"
+}
+
+# ----- subcommand: cerebro apply-review <repo> <findings> [--notes ...] ----
+
+cmd_apply_review() {
+  require_session
+  build_timeout_cmd
+
+  local repo="${1:-}"; shift || true
+  local findings="${1:-}"; shift || true
+  local notes=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --notes) shift; notes="${1:-}"; shift || true ;;
+      *) die "apply-review: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$repo" && -n "$findings" ]] || die "usage: cerebro apply-review <repo-abs-path> <findings-path> [--notes \"...\"]"
+  [[ "$repo" = /* ]] || die "apply-review: repo path must be absolute: $repo"
+  [[ -d "$repo" ]] || die "apply-review: repo not a directory: $repo"
+  [[ -r "$findings" ]] || die "apply-review: cannot read findings: $findings"
+
+  local child_log="$CEREBRO_SESSION_DIR/children/apply-review-$(ts_compact).jsonl"
+
+  local sys_prompt
+  sys_prompt='You are applying a code reviewer'\''s findings to a git repository.
+Stay on the current branch -- do not create a new one. Apply only the
+findings the orchestrator indicated should be acted on (see the notes
+block). Skip nits and style-only items unless explicitly called out.
+Run the repo'\''s test or type-check command if one is obvious. Commit
+with a short message and push so the existing PR updates in place.'
+
+  say "cerebro: applying review fixes in $repo"
+  log_event "apply_review_started" "findings=$findings"
+
+  local opts=(-p --permission-mode auto
+              --allowedTools "Read Edit Write Bash Grep Glob"
+              --output-format stream-json --verbose
+              --append-system-prompt "$sys_prompt")
+  [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
+
+  local rc
+  ( cd "$repo" && \
+    { printf 'Apply the following review findings on the current branch. Commit and push so the existing PR updates.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<findings>\n' "$notes"
+      cat "$findings"
+      printf '\n</findings>\n'
+    } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+      | tee "$child_log" \
+      | python3 -c "$PY_PARSE_STREAM" "" )
+  rc=$?
+  if (( rc != 0 )); then
+    log_event "apply_review_failed" "rc=$rc log=$child_log"
+    die "apply-review: child claude failed (rc=$rc); see $child_log"
+  fi
+  log_event "apply_review_finished" "$child_log"
+  echo "$child_log"
+}
+
+# ----- subcommand: cerebro doc-write <repo> <plan> [--notes ...] -----------
+
+cmd_doc_write() {
+  require_session
+  build_timeout_cmd
+
+  local repo="${1:-}"; shift || true
+  local plan="${1:-}"; shift || true
+  local notes=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --notes) shift; notes="${1:-}"; shift || true ;;
+      *) die "doc-write: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$repo" && -n "$plan" ]] || die "usage: cerebro doc-write <repo-abs-path> <plan-path> [--notes \"...\"]"
+  [[ "$repo" = /* ]] || die "doc-write: repo path must be absolute: $repo"
+  [[ -d "$repo" ]] || die "doc-write: repo not a directory: $repo"
+  [[ -r "$plan" ]] || die "doc-write: cannot read plan: $plan"
+
+  local child_log="$CEREBRO_SESSION_DIR/children/doc-write-$(ts_compact).jsonl"
+
+  local sys_prompt
+  sys_prompt='You are updating the user-facing documentation in a git repository
+to reflect a change that just shipped. Stay on the current branch.
+Read the relevant README or docs files first. Update the prose, code
+samples, and command summaries so the docs accurately describe the new
+behaviour. Do not invent features the diff does not contain. Commit
+with a short message and push so the open PR updates.'
+
+  say "cerebro: updating docs in $repo"
+  log_event "doc_write_started" "plan=$plan"
+
+  local opts=(-p --permission-mode auto
+              --allowedTools "Read Edit Write Bash Grep Glob"
+              --output-format stream-json --verbose
+              --append-system-prompt "$sys_prompt")
+  [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
+
+  local rc
+  ( cd "$repo" && \
+    { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n' "$notes"
+      cat "$plan"
+      printf '\n</plan>\n'
+    } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+      | tee "$child_log" \
+      | python3 -c "$PY_PARSE_STREAM" "" )
+  rc=$?
+  if (( rc != 0 )); then
+    log_event "doc_write_failed" "rc=$rc log=$child_log"
+    die "doc-write: child claude failed (rc=$rc); see $child_log"
+  fi
+  log_event "doc_write_finished" "$child_log"
+  echo "$child_log"
+}
+
+# ----- subcommand: cerebro recall <query> ----------------------------------
+
+cmd_recall() {
+  require_session
+  local query="${*:-}"
+  [[ -n "$query" ]] || die "usage: cerebro recall <query>"
+
+  local grep_cmd
+  if command -v rg >/dev/null 2>&1; then
+    grep_cmd=(rg --no-heading --line-number --color never --fixed-strings -- "$query")
+  else
+    grep_cmd=(grep -RnF --color=never -- "$query")
+  fi
+
+  local files
+  files=$(find "$CEREBRO_HOME/sessions" -type f \( -name 'transcript.jsonl' -o -name '*.jsonl' \) 2>/dev/null)
+  if [[ -z "$files" ]]; then
+    echo "cerebro: nothing to recall (no session logs yet)"
+    return 0
+  fi
+  # Pass files as args so rg/grep can name them in output.
+  # shellcheck disable=SC2086
+  "${grep_cmd[@]}" $files 2>/dev/null || true
+}
+
+# ----- subcommand: cerebro status ------------------------------------------
+
+cmd_status() {
+  require_session
+  echo "session: $CEREBRO_SESSION_ID"
+  echo "dir:     $CEREBRO_SESSION_DIR"
+  echo
+  echo "plans:"
+  if [[ -d "$CEREBRO_SESSION_DIR/plans" ]] && \
+     [[ -n "$(ls -A "$CEREBRO_SESSION_DIR/plans" 2>/dev/null)" ]]; then
+    (cd "$CEREBRO_SESSION_DIR/plans" && ls -1t *.md 2>/dev/null | sed 's/^/  /')
+  else
+    echo "  (none)"
+  fi
+  echo
+  echo "children (most recent 5):"
+  if [[ -d "$CEREBRO_SESSION_DIR/children" ]] && \
+     [[ -n "$(ls -A "$CEREBRO_SESSION_DIR/children" 2>/dev/null)" ]]; then
+    (cd "$CEREBRO_SESSION_DIR/children" && ls -1t 2>/dev/null | head -5 | sed 's/^/  /')
+  else
+    echo "  (none)"
+  fi
+  echo
+  local last_review
+  last_review="$(ls -1t "$CEREBRO_SESSION_DIR"/children/codex-*.md 2>/dev/null | head -1)"
+  if [[ -n "$last_review" ]]; then
+    echo "last review: $last_review"
+  else
+    echo "last review: (none)"
+  fi
+}
+
+# ----- dispatch ------------------------------------------------------------
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    cmd_launch
+    return
+  fi
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --resume) shift; cmd_resume "${1:-}" ;;
+    list) shift; cmd_list "$@" ;;
+    plan) shift; cmd_plan "$@" ;;
+    plans) shift; cmd_plans "$@" ;;
+    execute) shift; cmd_execute "$@" ;;
+    review) shift; cmd_review "$@" ;;
+    apply-review) shift; cmd_apply_review "$@" ;;
+    doc-write) shift; cmd_doc_write "$@" ;;
+    recall) shift; cmd_recall "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    *) die "unknown subcommand: $1 (try --help)" ;;
+  esac
+}
+
+main "$@"
