@@ -24,6 +24,11 @@
 #   cerebro doc-write <repo> <plan-path> [--notes "..."]
 #   cerebro recall <query>
 #   cerebro status
+#   cerebro git <repo> <git-subcmd> [args...]      # read-only git bridge
+#   cerebro gh <repo> <gh-subcmd> [args...]        # read-only gh bridge
+#   cerebro read <repo> <path> [--range N:M]       # read one file in repo
+#   cerebro grep <repo> <pattern> [opts]           # ripgrep inside repo
+#   cerebro ls <repo> [path]                       # list a dir inside repo
 #
 # Required: claude, codex, jq, python3 on PATH. Child claudes additionally
 # need git and gh for execute / apply-review / doc-write to function.
@@ -51,6 +56,78 @@ say()  { printf '==> %s\n' "$*" >&2; }
 warn() { printf 'cerebro: warning: %s\n' "$*" >&2; }
 die()  { printf 'cerebro: error: %s\n' "$*" >&2; exit 1; }
 dbg()  { [[ "$CEREBRO_DEBUG" == "1" ]] && printf 'cerebro: debug: %s\n' "$*" >&2; return 0; }
+
+# Error helpers for the read-only bridge subcommands (git/gh/read/grep/ls).
+# Exit codes are documented in the orchestrator's system prompt so the model
+# can interpret them programmatically.
+err_usage()  { printf 'cerebro: error: %s\n' "$*" >&2; exit 2; }
+err_path()   { printf 'cerebro: error: %s\n' "$*" >&2; exit 3; }
+err_subcmd() { printf 'cerebro: error: %s\n' "$*" >&2; exit 4; }
+err_flag()   { printf 'cerebro: error: %s\n' "$*" >&2; exit 5; }
+err_escape() { printf 'cerebro: error: %s\n' "$*" >&2; exit 6; }
+
+# True if $1 is among the remaining args.
+contains() {
+  local needle="$1"; shift
+  local hay
+  for hay in "$@"; do [[ "$hay" == "$needle" ]] && return 0; done
+  return 1
+}
+
+# Resolve path $2 relative to repo $1, requiring the result to stay inside
+# the repo. Echoes the absolute resolved path on stdout. Exits 6 if the path
+# escapes. Uses python3 for cross-platform realpath (macOS lacks GNU realpath).
+resolve_in_repo() {
+  local repo="$1" rel="$2"
+  python3 - "$repo" "$rel" <<'PY'
+import os, sys
+repo = os.path.realpath(sys.argv[1])
+cand = sys.argv[2]
+if not os.path.isabs(cand):
+    cand = os.path.join(repo, cand)
+cand = os.path.realpath(cand)
+if cand != repo and not cand.startswith(repo + os.sep):
+    sys.stderr.write(f"cerebro: error: path escapes repo: {sys.argv[2]}\n")
+    sys.exit(6)
+print(cand)
+PY
+}
+
+# Validate that $1 is an absolute path to a git repo. Exits 3 on any failure.
+require_git_repo() {
+  local repo="$1"
+  [[ "$repo" = /* ]] || err_path "repo path must be absolute: $repo"
+  [[ -d "$repo" ]]   || err_path "repo not a directory: $repo"
+  git --no-optional-locks -C "$repo" rev-parse --git-dir >/dev/null 2>&1 \
+    || err_path "not a git repo: $repo"
+}
+
+# Canonicalize $1 to its git worktree root and echo it on stdout. Exits 3
+# if $1 is not an absolute directory inside a git worktree. Bridges that
+# read files from the user's repo (read/grep/ls) call this to anchor
+# subsequent path resolution to the worktree boundary instead of trusting
+# an arbitrary absolute directory.
+canonical_worktree_root() {
+  local repo="$1"
+  [[ "$repo" = /* ]] || err_path "repo path must be absolute: $repo"
+  [[ -d "$repo" ]]   || err_path "repo not a directory: $repo"
+  local root
+  root="$(git --no-optional-locks -C "$repo" rev-parse --show-toplevel 2>/dev/null)" \
+    || err_path "not a git worktree: $repo"
+  [[ -n "$root" ]] || err_path "not a git worktree: $repo"
+  printf '%s\n' "$root"
+}
+
+# Reject any arg that contains shell metacharacters. We never go through a
+# shell so these are inert; rejecting them keeps the orchestrator's intent
+# auditable in the session log.
+reject_dangerous_arg() {
+  local a="$1"
+  case "$a" in
+    *'>'*|*'|'*|*';'*|*'&'*|*'$('*|*'`'*)
+      err_flag "arg contains shell metacharacter: $a" ;;
+  esac
+}
 
 usage() {
   cat <<'EOF'
@@ -298,8 +375,14 @@ behalf, by calling them through your Bash tool (which is restricted to
 5. You operate on the cerebro home (your cwd). Plans live under
    `sessions/<id>/plans/`, child agent logs under `sessions/<id>/children/`,
    and codex findings under the same children dir. Use Read / Grep /
-   Glob to inspect them. You do NOT have a view into the user's repos;
-   anything you need from a repo, ask a sub-agent to produce it.
+   Glob to inspect them. Your Read/Grep/Glob tools see only this home --
+   they cannot reach the user's repos directly. To inspect a user repo
+   without spawning a sub-agent, use the read-only bridge subcommands
+   `cerebro git`, `cerebro gh`, `cerebro read`, `cerebro grep`,
+   `cerebro ls` (documented below). These exec git/gh/rg directly with
+   an enforced read-only allow-list -- they are guaranteed non-mutating.
+   Only spawn a planning sub-agent (`cerebro plan`) when you need
+   synthesis across many files, not for individual lookups.
 
 # Available sub-commands
 
@@ -335,6 +418,48 @@ behalf, by calling them through your Bash tool (which is restricted to
     on the plan and the recent diff. Commits and pushes on the same
     branch.
 
+  cerebro git <repo-abs-path> <git-subcmd> [args...]
+    Run a read-only git command in the user's repo. Allowed subcommands:
+    status, log, diff, show, blame, ls-files, ls-tree, branch (only
+    with --list/-l/-a/-r and the like; no -d/-D/-m/-c/-f/--set-upstream),
+    remote (only -v/show/get-url), rev-parse, cat-file, describe,
+    tag --list, config --get/--list (no --file/--global/--system/--worktree),
+    for-each-ref, stash list/show, reflog show, shortlog, name-rev,
+    merge-base. diff --no-index, blame --contents, and similar
+    path-arg-escape options are rejected. Anything
+    mutating (commit, push, checkout, branch -d, config --add, stash
+    push, ...) is rejected. The wrapper never invokes a shell, so `>`
+    redirects and `git diff > file` are inert. Use this for "what does
+    HEAD look like vs main", "show me the diff", "list branches".
+
+  cerebro gh <repo-abs-path> <gh-subcmd> [args...]
+    Run a read-only gh command. Allowed: pr view/list/diff/checks/status,
+    issue view/list/status, run view/list/watch, repo view/list, release
+    view/list, search repos/prs/issues/code/commits, auth status, and
+    `api` restricted to GET (the -X/--method/-F/-f/--raw-field/--input
+    flags are rejected). Use this for "what's on the PR", "what did the
+    CI run say", "is gh authenticated".
+
+  cerebro read <repo-abs-path> <path> [--range N:M]
+    Read one file from a user repo. Path is resolved inside <repo>;
+    symlinks or `..` that escape the repo are rejected. --range is
+    1-indexed inclusive; either side may be blank for open-ended.
+    Prefer this over spawning a planning child for "show me file X".
+
+  cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]
+    Ripgrep inside a user repo. Hard caps: 200 matches per file, 400
+    columns per line. Use this to find a symbol or string without
+    spawning a child agent.
+
+  cerebro ls <repo-abs-path> [path]
+    List a directory inside a user repo. Trailing `/` marks subdirs.
+
+  Exit codes for the bridges above: 2 usage, 3 bad repo/path,
+  4 subcommand not on the allow-list, 5 denied flag,
+  6 path escapes the repo. git/gh/rg's own non-zero exits are propagated
+  as-is. Treat denied/usage failures as programmer error and adapt; do
+  not retry the same denied call.
+
   cerebro recall <query>
     Search across all cerebro sessions' transcripts and child logs.
     Use this when the user references prior work ("did we already do
@@ -360,6 +485,11 @@ For a single feature:
      until codex is quiet or the remaining findings are deliberate
      non-issues.
   7. Optionally `cerebro doc-write <repo> <plan>` to update docs.
+
+When deciding between a bridge and a planning child: if the answer fits
+in your context after one or two commands, use a bridge. If you need
+cross-file synthesis, an analysis, or a written artefact, spawn
+`cerebro plan` instead.
 
 # Session paths the user can inspect
 
@@ -960,6 +1090,398 @@ cmd_status() {
   fi
 }
 
+# ----- subcommand: cerebro ls <repo> [path] --------------------------------
+
+cmd_ls() {
+  require_session
+  local repo="${1:-}"; shift || true
+  local path="${1:-}"; shift || true
+  [[ -n "$repo" ]] || err_usage "usage: cerebro ls <repo-abs-path> [path]"
+  repo="$(canonical_worktree_root "$repo")" || exit $?
+
+  local target="$repo"
+  if [[ -n "$path" ]]; then
+    target="$(resolve_in_repo "$repo" "$path")" || exit $?
+  fi
+  [[ -d "$target" ]] || err_path "ls: not a directory: $path"
+
+  log_event "ls" "$repo $path"
+  python3 - "$target" <<'PY'
+import os, sys
+root = sys.argv[1]
+for name in sorted(os.listdir(root)):
+    full = os.path.join(root, name)
+    suffix = "/" if os.path.isdir(full) and not os.path.islink(full) else ""
+    print(name + suffix)
+PY
+}
+
+# ----- subcommand: cerebro read <repo> <path> [--range N:M] ----------------
+
+cmd_read() {
+  require_session
+  local repo="${1:-}"; shift || true
+  local path="${1:-}"; shift || true
+  local range=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --range) shift; range="${1:-}"; shift || true ;;
+      *) err_usage "read: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$repo" && -n "$path" ]] || err_usage "usage: cerebro read <repo-abs-path> <path> [--range N:M]"
+  repo="$(canonical_worktree_root "$repo")" || exit $?
+
+  local resolved
+  resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
+  [[ -f "$resolved" ]] || err_path "read: not a regular file: $path"
+
+  log_event "read" "$repo $path"
+
+  if [[ -z "$range" ]]; then
+    cat -- "$resolved"
+    return
+  fi
+  python3 - "$resolved" "$range" <<'PY'
+import sys
+path, rng = sys.argv[1], sys.argv[2]
+lo, _, hi = rng.partition(":")
+lo = int(lo) if lo else 1
+hi = int(hi) if hi else None
+with open(path) as f:
+    for i, line in enumerate(f, 1):
+        if i < lo:
+            continue
+        if hi is not None and i > hi:
+            break
+        sys.stdout.write(line)
+PY
+}
+
+# ----- subcommand: cerebro grep <repo> <pattern> [opts] --------------------
+
+cmd_grep() {
+  require_session
+  local repo="${1:-}"; shift || true
+  local pattern="${1:-}"; shift || true
+  [[ -n "$repo" && -n "$pattern" ]] \
+    || err_usage "usage: cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]"
+  repo="$(canonical_worktree_root "$repo")" || exit $?
+  command -v rg >/dev/null 2>&1 || die "grep: ripgrep (rg) not installed"
+
+  local rg_args=() sub=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --glob)             shift; rg_args+=(--glob "${1:-}") ;;
+      --type)             shift; rg_args+=(--type "${1:-}") ;;
+      --fixed-strings|-F) rg_args+=(--fixed-strings) ;;
+      -i|--ignore-case)   rg_args+=(--ignore-case) ;;
+      --path)             shift; sub="${1:-}" ;;
+      *) err_usage "grep: unknown arg: $1" ;;
+    esac
+    shift || true
+  done
+
+  local target="$repo"
+  if [[ -n "$sub" ]]; then
+    target="$(resolve_in_repo "$repo" "$sub")" || exit $?
+  fi
+
+  log_event "grep" "$repo $pattern"
+  exec rg --no-heading --line-number --color never \
+          --max-count 200 --max-columns 400 \
+          "${rg_args[@]}" -- "$pattern" "$target"
+}
+
+# ----- subcommand: cerebro git <repo> <subcmd> [args...] -------------------
+
+# Read-only git subcommands the orchestrator may invoke. Some allow both
+# read and write modes; per-subcommand validators enforce the read mode.
+readonly CEREBRO_GIT_ALLOWED=(
+  status log diff show blame ls-files ls-tree branch remote
+  rev-parse cat-file describe tag config for-each-ref
+  stash reflog shortlog name-rev merge-base
+)
+
+# Flags that can write or escape the repo when passed to git. Matched in
+# both bare and "=value" forms. Most of these are top-level git options that
+# only work BEFORE the subcommand, which our argv shape (git -C repo sub
+# args...) already prevents; this is defense in depth.
+readonly CEREBRO_GIT_DENY_GLOBAL=(
+  --exec --upload-pack --receive-pack --git-dir --work-tree --namespace
+  -c -C --bare --no-pager --paginate --no-replace-objects --literal-pathspecs
+  --exec-path --html-path --man-path --info-path
+  --output --output-directory
+)
+
+is_denied_global_git_flag() {
+  local a="$1" bad
+  for bad in "${CEREBRO_GIT_DENY_GLOBAL[@]}"; do
+    [[ "$a" == "$bad" || "$a" == "$bad"=* ]] && return 0
+  done
+  return 1
+}
+
+# Flags that explicitly opt into running external helper programs (diff
+# drivers, textconv programs, smudge/clean filters). Rejected on any git
+# subcommand as defense in depth -- diff/log/show already get `--no-ext-diff
+# --no-textconv` injected at invocation time, but allowing `--ext-diff` /
+# `--textconv` / `--filters` on the argv could re-enable a helper. The OFF
+# forms (`--no-ext-diff`, `--no-textconv`) stay allowed.
+is_helper_git_flag() {
+  local a="$1"
+  case "$a" in
+    --ext-diff|--ext-diff=*|--textconv|--textconv=*|--filters|--filters=*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# Overrides injected via `git -c key=value` right after `git`. `core.fsmonitor=`
+# (empty value) disables the fsmonitor hook; `core.hooksPath=/dev/null` points
+# the hooks dir at a non-directory so no hooks load. We do NOT inject
+# `-c diff.external=` -- an empty value makes git try to exec the empty
+# string and fail every diff -- use `--no-ext-diff` per-subcommand instead.
+# Likewise `-c diff.textconv=` and `-c filter.*.smudge=` don't behave like
+# wildcards in git's `-c` parser, so we rely on `--no-textconv` per-subcommand
+# and on rejecting `--filters` to keep smudge/clean from firing.
+readonly CEREBRO_GIT_OVERRIDES=(
+  -c core.fsmonitor=
+  -c core.hooksPath=/dev/null
+)
+
+# Per-subcommand validator. Args: subcmd, remaining-argv.
+validate_git_subcmd_args() {
+  local sub="$1"; shift
+  local a saw_list=0 ok=0
+  case "$sub" in
+    branch)
+      for a in "$@"; do
+        case "$a" in
+          -d|-D|--delete|-m|-M|--move|--copy|--copy=*|-f|--force\
+          |--set-upstream-to|--set-upstream-to=*|--unset-upstream\
+          |--edit-description|--create-reflog|--track|--track=*|--no-track)
+            err_flag "git branch: mutating flag: $a" ;;
+          -*) ;;
+          *) err_flag "git branch: positional arg implies create/rename; deny: $a" ;;
+        esac
+      done ;;
+    tag)
+      for a in "$@"; do
+        case "$a" in
+          --list|-l) saw_list=1 ;;
+          -d|-D|--delete|-m|-a|-s|--sign|-f|--force|--create-reflog|--cleanup=*)
+            err_flag "git tag: mutating flag: $a" ;;
+          -*) ;;
+          *)
+            (( saw_list )) || err_flag "git tag: positional arg without --list: $a" ;;
+        esac
+      done ;;
+    config)
+      for a in "$@"; do
+        case "$a" in
+          --get|--get-all|--get-regexp|--get-urlmatch|-l|--list|--show-origin|--show-scope)
+            ok=1 ;;
+          --add|--unset|--unset-all|--replace-all|--edit|-e\
+          |--rename-section|--remove-section)
+            err_flag "git config: write flag: $a" ;;
+          --file|--file=*|-f|-f*\
+          |--global|--system|--worktree|--blob|--blob=*)
+            err_flag "git config: scope/path flag bypasses repo boundary: $a" ;;
+        esac
+      done
+      (( ok )) || err_flag "git config: missing --get/--list" ;;
+    stash)
+      case "${1:-list}" in
+        list|show) ;;
+        *) err_flag "git stash: only list/show allowed (got ${1:-})" ;;
+      esac ;;
+    remote)
+      # Accept an optional verbosity flag before the action, then require
+      # the action itself to be empty/show/get-url. Without this split,
+      # `git remote -v add foo url` would slip past as a "verbose" form.
+      local action="${1:-}"
+      if [[ "$action" == "-v" || "$action" == "--verbose" ]]; then
+        action="${2:-}"
+      fi
+      case "$action" in
+        ''|show|get-url) ;;
+        add|set-url|remove|rm|rename|prune|update|set-head|set-branches)
+          err_flag "git remote: mutating action: $action" ;;
+        *) err_flag "git remote: only -v/show/get-url allowed (got $action)" ;;
+      esac ;;
+    reflog)
+      case "${1:-show}" in
+        show) ;;
+        *) err_flag "git reflog: only show allowed (got ${1:-})" ;;
+      esac ;;
+    diff)
+      for a in "$@"; do
+        case "$a" in
+          --no-index|--no-index=*)
+            err_flag "git diff: --no-index reads arbitrary paths: $a" ;;
+          --orderfile|--orderfile=*|-O|-O=*)
+            err_flag "git diff: --orderfile reads external file: $a" ;;
+        esac
+      done ;;
+    blame)
+      for a in "$@"; do
+        case "$a" in
+          --contents|--contents=*)
+            err_flag "git blame: --contents reads arbitrary file: $a" ;;
+          --ignore-revs-file|--ignore-revs-file=*)
+            err_flag "git blame: --ignore-revs-file reads external file: $a" ;;
+        esac
+      done ;;
+    show)
+      for a in "$@"; do
+        case "$a" in
+          --orderfile|--orderfile=*|-O|-O=*)
+            err_flag "git show: --orderfile reads external file: $a" ;;
+        esac
+      done ;;
+    log)
+      for a in "$@"; do
+        case "$a" in
+          --orderfile|--orderfile=*|-O|-O=*)
+            err_flag "git log: --orderfile reads external file: $a" ;;
+        esac
+      done ;;
+    ls-files)
+      for a in "$@"; do
+        case "$a" in
+          -X|--exclude-from|--exclude-from=*\
+          |--exclude-per-directory|--exclude-per-directory=*)
+            err_flag "git ls-files: external-file flag: $a" ;;
+        esac
+      done ;;
+  esac
+}
+
+cmd_git() {
+  require_session
+  local repo="${1:-}"; shift || true
+  local sub="${1:-}"; shift || true
+  [[ -n "$repo" && -n "$sub" ]] \
+    || err_usage "usage: cerebro git <repo-abs-path> <subcmd> [args...]"
+  require_git_repo "$repo"
+
+  # The subcommand position must hold a subcommand name, not a flag --
+  # otherwise an arg like `-c foo=bar` would slip past as `git -c foo=bar
+  # <real-subcmd>`, which sets arbitrary git config.
+  case "$sub" in
+    -*) err_flag "git: subcommand position cannot be a flag: $sub" ;;
+  esac
+  contains "$sub" "${CEREBRO_GIT_ALLOWED[@]}" \
+    || err_subcmd "git: subcommand not on allow-list: $sub"
+
+  local a
+  for a in "$@"; do
+    reject_dangerous_arg "$a"
+    is_denied_global_git_flag "$a" && err_flag "git: denied global flag: $a"
+    is_helper_git_flag "$a" && err_flag "git: external helper flag: $a"
+  done
+
+  validate_git_subcmd_args "$sub" "$@"
+
+  log_event "git" "$repo $sub $*"
+  # `--no-optional-locks` keeps reads from touching .git/index. For `config`,
+  # inject `--local` so reads are pinned to the repo and can't pick up
+  # $HOME/.gitconfig or /etc/gitconfig (validate_git_subcmd_args has already
+  # rejected user-supplied scope/path flags). GIT_CONFIG_NOSYSTEM=1 skips
+  # /etc/gitconfig too. The `-c` overrides blank fsmonitor and hooks; for
+  # diff/log/show we additionally inject `--no-ext-diff --no-textconv` so a
+  # repo's `.git/config` cannot slip an external helper past the bridge.
+  export GIT_CONFIG_NOSYSTEM=1
+  if [[ "$sub" == "config" ]]; then
+    exec git "${CEREBRO_GIT_OVERRIDES[@]}" \
+      --no-optional-locks -C "$repo" config --local "$@"
+  fi
+  case "$sub" in
+    diff|log|show)
+      exec git "${CEREBRO_GIT_OVERRIDES[@]}" \
+        --no-optional-locks -C "$repo" \
+        "$sub" --no-ext-diff --no-textconv "$@" ;;
+  esac
+  exec git "${CEREBRO_GIT_OVERRIDES[@]}" \
+    --no-optional-locks -C "$repo" "$sub" "$@"
+}
+
+# ----- subcommand: cerebro gh <repo> <subcmd> [args...] --------------------
+
+cmd_gh() {
+  require_session
+  local repo="${1:-}"; shift || true
+  local top="${1:-}"; shift || true
+  [[ -n "$repo" && -n "$top" ]] \
+    || err_usage "usage: cerebro gh <repo-abs-path> <subcmd> [args...]"
+  require_git_repo "$repo"
+
+  local sub="${1:-}"  # may be empty for `gh auth status`; do not shift yet
+  case "$top" in
+    pr)
+      case "$sub" in
+        view|list|diff|checks|status) ;;
+        *) err_subcmd "gh pr: '$sub' not allow-listed" ;;
+      esac ;;
+    issue)
+      case "$sub" in
+        view|list|status) ;;
+        *) err_subcmd "gh issue: '$sub' not allow-listed" ;;
+      esac ;;
+    run)
+      case "$sub" in
+        view|list|watch) ;;
+        *) err_subcmd "gh run: '$sub' not allow-listed" ;;
+      esac ;;
+    repo)
+      case "$sub" in
+        view|list) ;;
+        *) err_subcmd "gh repo: '$sub' not allow-listed" ;;
+      esac ;;
+    release)
+      case "$sub" in
+        view|list) ;;
+        *) err_subcmd "gh release: '$sub' not allow-listed" ;;
+      esac ;;
+    search)
+      case "$sub" in
+        repos|prs|issues|code|commits) ;;
+        *) err_subcmd "gh search: '$sub' not allow-listed" ;;
+      esac ;;
+    auth)
+      case "$sub" in
+        status) ;;
+        *) err_subcmd "gh auth: only 'status' allowed (got '$sub')" ;;
+      esac ;;
+    api)
+      # api accepts any GET; reject mechanisms that change the method or
+      # add a request body. The `-X*`/`-F*`/`-f*` globs catch attached
+      # short forms like `-XPOST`, `-Ffoo=bar`, `-ffoo=bar` -- gh accepts
+      # those just as eagerly as the spaced form.
+      local a
+      for a in "$@"; do
+        case "$a" in
+          -X*|-F*|-f*\
+          |--method|--method=*\
+          |--field|--field=*\
+          |--raw-field|--raw-field=*\
+          |--input|--input=*)
+            err_flag "gh api: write flag: $a" ;;
+        esac
+      done ;;
+    *)
+      err_subcmd "gh: top-level command not allow-listed: $top" ;;
+  esac
+
+  local a
+  for a in "$@"; do reject_dangerous_arg "$a"; done
+
+  log_event "gh" "$repo $top $*"
+  cd "$repo" || err_path "gh: cannot cd to $repo"
+  exec gh "$top" "$@"
+}
+
 # ----- dispatch ------------------------------------------------------------
 
 main() {
@@ -979,6 +1501,11 @@ main() {
     doc-write) shift; cmd_doc_write "$@" ;;
     recall) shift; cmd_recall "$@" ;;
     status) shift; cmd_status "$@" ;;
+    git)    shift; cmd_git "$@" ;;
+    gh)     shift; cmd_gh "$@" ;;
+    read)   shift; cmd_read "$@" ;;
+    grep)   shift; cmd_grep "$@" ;;
+    ls)     shift; cmd_ls "$@" ;;
     *) die "unknown subcommand: $1 (try --help)" ;;
   esac
 }

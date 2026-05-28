@@ -207,9 +207,13 @@ no-ops for non-cerebro claude sessions, so it is safe even though
 `.claude/settings.local.json` lives in a directory claude visits any
 time you `cd` into `~/.cerebro`.
 
-Requirements: `claude`, `codex`, `jq`, `python3`. Child claudes
-additionally need `git` and `gh` for `execute` / `apply-review` /
-`doc-write` to function.
+Requirements: `claude`, `codex`, `jq`, `python3`. The orchestrator also
+calls `git`/`gh`/`rg` directly through read-only bridge subcommands
+(`cerebro git`, `cerebro gh`, `cerebro grep`, `cerebro read`,
+`cerebro ls`) so it can inspect a user repo without spawning a planning
+child; `git` and `gh` are needed for those bridges, and `rg` (ripgrep)
+is recommended for `cerebro grep`. Child claudes additionally need
+`git` and `gh` for `execute` / `apply-review` / `doc-write` to function.
 
 Env: `CEREBRO_HOME`, `CEREBRO_MODEL`, `CEREBRO_REVIEW_MODEL`,
 `CEREBRO_TIMEOUT`, `CEREBRO_CODEX_CMD`, `CEREBRO_DEBUG`.
