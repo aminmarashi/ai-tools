@@ -118,6 +118,76 @@ canonical_worktree_root() {
   printf '%s\n' "$root"
 }
 
+# Walk upward from an absolute path looking for an enclosing git worktree
+# (a directory containing a `.git` file or directory). Echoes the worktree
+# root on stdout if found; returns non-zero (and prints nothing) otherwise.
+# Bounded to 12 levels so we don't traverse the entire filesystem.
+find_enclosing_worktree() {
+  local p="$1"
+  [[ "$p" = /* ]] || return 1
+  python3 - "$p" <<'PY' 2>/dev/null
+import os, sys
+p = os.path.realpath(sys.argv[1])
+if os.path.isfile(p):
+    p = os.path.dirname(p)
+for _ in range(12):
+    if os.path.exists(os.path.join(p, ".git")):
+        print(p)
+        sys.exit(0)
+    parent = os.path.dirname(p)
+    if parent == p:
+        sys.exit(1)
+    p = parent
+sys.exit(1)
+PY
+}
+
+# Resolve $1 (an absolute path) for a bare-abs read/grep/ls invocation.
+# Echoes the realpathed result on stdout. Exits 3 for any reason the path
+# can't be safely read non-blockingly: must be absolute; must not resolve
+# under /dev /proc /sys (special filesystems / blocking devices); must be
+# a regular file or directory (no FIFO, socket, char/block device). The
+# in-repo escape guard in resolve_in_repo() does NOT apply -- this branch
+# deliberately reads outside any repo.
+resolve_bare_abs() {
+  python3 - "$1" <<'PY'
+import os, stat, sys
+p = sys.argv[1]
+if not os.path.isabs(p):
+    sys.stderr.write(f"cerebro: error: path must be absolute: {p}\n")
+    sys.exit(3)
+try:
+    r = os.path.realpath(p)
+    st = os.stat(r)
+except OSError as e:
+    sys.stderr.write(f"cerebro: error: cannot stat {p}: {e}\n")
+    sys.exit(3)
+for special in ("/dev/", "/proc/", "/sys/"):
+    if r == special.rstrip("/") or r.startswith(special):
+        sys.stderr.write(f"cerebro: error: refusing to read special path: {r}\n")
+        sys.exit(3)
+m = st.st_mode
+if not (stat.S_ISREG(m) or stat.S_ISDIR(m)):
+    sys.stderr.write(f"cerebro: error: not a regular file or directory: {r}\n")
+    sys.exit(3)
+print(r)
+PY
+}
+
+# Map common short rg --type aliases to the canonical rg type name. Unknown
+# inputs are passed through verbatim so rg emits its own diagnostic.
+canonicalise_rg_type() {
+  case "$1" in
+    rs)  printf 'rust\n' ;;
+    tsx) printf 'ts\n' ;;
+    jsx) printf 'js\n' ;;
+    yml) printf 'yaml\n' ;;
+    rb)  printf 'ruby\n' ;;
+    kt)  printf 'kotlin\n' ;;
+    *)   printf '%s\n' "$1" ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 usage:
@@ -468,40 +538,84 @@ behalf, by calling them through your Bash tool (which is restricted to
     Commits and pushes on the same branch.
 
   cerebro git <repo-abs-path> <git-subcmd> [args...]
-    Run a read-only git command in the user's repo. Allowed subcommands:
-    status, log, diff, show, blame, ls-files, ls-tree, branch (only
-    with --list/-l/-a/-r and the like; no -d/-D/-m/-c/-f/--set-upstream),
-    remote (only -v/show/get-url), rev-parse, cat-file, describe,
-    tag --list, config --get/--list (no --file/--global/--system/--worktree),
-    for-each-ref, stash list/show, reflog show, shortlog, name-rev,
-    merge-base. diff --no-index, blame --contents, and similar
-    path-arg-escape options are rejected. Anything
-    mutating (commit, push, checkout, branch -d, config --add, stash
-    push, ...) is rejected. The wrapper invokes git via execve, so
-    shell metacharacters in args are inert. Use this for "what does
-    HEAD look like vs main", "show me the diff", "list branches".
+    Run a read-only git command in the user's repo. Allowed subcommands
+    include but are not limited to: status, log, diff, show, blame,
+    ls-files, ls-tree, branch (list-only), remote (-v/show/get-url),
+    rev-parse, cat-file, describe, tag --list, config --get/--list (no
+    --file/--global/--system/--worktree), for-each-ref, stash list/show,
+    reflog show, shortlog, name-rev, merge-base, rev-list, ls-remote,
+    fetch (no --prune / --force / --shallow-* / --unshallow / --multiple /
+    --update-head-ok / --recurse-submodules-default; bare `git fetch`
+    works), count-objects, show-ref, show-branch, verify-commit,
+    verify-tag, whatchanged, range-diff, diff-tree, diff-index,
+    diff-files, grep (git-grep), check-ignore, check-attr,
+    check-ref-format, var, help, version, patch-id, request-pull,
+    merge-tree, get-tar-commit-id, fast-export (no --export-marks /
+    --import-marks external file flags), archive (stdout only;
+    --output denied), fsck (no --write-cache/--lost-found),
+    hash-object (no -w), interpret-trailers (no --in-place),
+    apply --check, bundle verify/list-heads, notes list/show,
+    submodule status/summary, worktree list, replace --list,
+    bisect view/log, symbolic-ref (read form only -- -d/--delete and
+    the two-positional SET form are denied), column. diff --no-index,
+    blame --contents, and similar path-arg-escape options are
+    rejected. Anything else mutating (commit, push, checkout,
+    branch -d, config --add, stash push, ...) is rejected. The wrapper
+    invokes git via execve, so shell metacharacters in args are inert.
+    Use this for "what does HEAD look like vs main", "show me the
+    diff", "list branches".
 
   cerebro gh <repo-abs-path> <gh-subcmd> [args...]
-    Run a read-only gh command. Allowed: pr view/list/diff/checks/status,
-    issue view/list/status, run view/list/watch, repo view/list, release
-    view/list, search repos/prs/issues/code/commits, auth status, and
-    `api` restricted to GET (the -X/--method/-F/-f/--raw-field/--input
-    flags are rejected). Use this for "what's on the PR", "what did the
-    CI run say", "is gh authenticated".
+    Run a read-only gh command. Allowed verbs by top:
+      pr view/list/diff/checks/status
+      issue view/list/status
+      run view/list/watch
+      repo view/list
+      release view/list/verify
+      search repos/prs/issues/code/commits
+      auth status                     # auth token is NOT allowed
+      workflow view/list              # `run` etc. denied
+      ruleset view/list/check
+      project view/list/field-list/item-list
+      secret list, variable list/get, cache list, label list
+      ssh-key list, gpg-key list, codespace view/list/logs/ports
+        (ports: bare list form only -- forward/visibility denied)
+      attestation verify              # download denied
+      org list, alias list, config get/list
+      extension list/search           # install denied (arbitrary code)
+      gist view/list, licenses list/view
+      status, completion              # bare tops, no verb
+      api                             # GET only; -X/--method/-F/-f/--raw-field/--input denied
+    Side-effecty / interactive tops (browse, copilot, preview,
+    agent-task, co, skill) are rejected wholesale. Use this for
+    "what's on the PR", "what did the CI run say", "is gh
+    authenticated".
 
   cerebro read <repo-abs-path> <path> [--range N:M]
-    Read one file from a user repo. Path is resolved inside <repo>;
-    symlinks or `..` that escape the repo are rejected. --range is
-    1-indexed inclusive; either side may be blank for open-ended.
-    Prefer this over spawning a planning child for "show me file X".
+  cerebro read <abs-file-path> [--range N:M]
+    Read one file. The legacy two-positional form resolves <path>
+    inside <repo>; symlinks or `..` that escape the repo are rejected.
+    The single-positional form accepts an absolute path: cerebro tries
+    to infer the enclosing git worktree (and resolves within it), and
+    falls back to a bare-abs read otherwise. Bare-abs reads refuse
+    /dev/*, /proc/*, /sys/* and anything that is not a regular file
+    or directory. --range is 1-indexed inclusive; either side may be
+    blank for open-ended. Accepted forms: --range N:M | --range N-M
+    (digit-only sides) | --range N..M | --range N M | --range N |
+    --range :M | --from N --to M.
 
   cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]
-    Ripgrep inside a user repo. Hard caps: 200 matches per file, 400
-    columns per line. Use this to find a symbol or string without
-    spawning a child agent.
+  cerebro grep <abs-dir-path> <pattern> [...same flags...]
+    Ripgrep inside a user repo, or against any absolute directory.
+    Hard caps: 200 matches per file, 400 columns per line. Common
+    --type aliases (rs, tsx, jsx, yml, rb, kt) are mapped to their
+    canonical rg type name; unknown values pass through unchanged.
 
   cerebro ls <repo-abs-path> [path]
-    List a directory inside a user repo. Trailing `/` marks subdirs.
+  cerebro ls <abs-dir-path>
+    List a directory inside a user repo, or any absolute directory.
+    Trailing `/` marks subdirs. Bare-abs ls refuses /dev/*, /proc/*,
+    /sys/*.
 
   Exit codes for the bridges above: 2 usage, 3 bad repo/path,
   4 subcommand not on the allow-list, 5 denied flag,
@@ -1388,16 +1502,25 @@ cmd_ls() {
   require_session
   local repo="${1:-}"; shift || true
   local path="${1:-}"; shift || true
-  [[ -n "$repo" ]] || err_usage "usage: cerebro ls <repo-abs-path> [path]"
-  repo="$(canonical_worktree_root "$repo")" || exit $?
+  [[ -n "$repo" ]] || err_usage "usage: cerebro ls <repo-abs-path> [path] | cerebro ls <abs-dir>"
 
-  local target="$repo"
-  if [[ -n "$path" ]]; then
-    target="$(resolve_in_repo "$repo" "$path")" || exit $?
+  local target
+  if root="$(canonical_worktree_root "$repo" 2>/dev/null)"; then
+    repo="$root"
+    target="$repo"
+    if [[ -n "$path" ]]; then
+      target="$(resolve_in_repo "$repo" "$path")" || exit $?
+    fi
+  elif [[ "$repo" = /* && -z "$path" ]]; then
+    target="$(resolve_bare_abs "$repo")" || exit $?
+  else
+    # Re-run the worktree resolution so the user sees the canonical error.
+    canonical_worktree_root "$repo" >/dev/null
+    exit $?
   fi
-  [[ -d "$target" ]] || err_path "ls: not a directory: $path"
+  [[ -d "$target" ]] || err_path "ls: not a directory: ${path:-$repo}; canonical: cerebro ls <repo> [path] | cerebro ls <abs-dir>"
 
-  log_event "ls" "$repo $path"
+  log_event "ls" "$target"
   python3 - "$target" <<'PY'
 import os, sys
 root = sys.argv[1]
@@ -1412,23 +1535,131 @@ PY
 
 cmd_read() {
   require_session
-  local repo="${1:-}"; shift || true
-  local path="${1:-}"; shift || true
-  local range=""
+  local arg1="${1:-}"; shift || true
+  local arg2=""
+  # The second positional is a path only if it isn't a flag. This lets us
+  # spot the "abs-path tumbled into the file slot" shape: when the legacy
+  # `<repo> <path>` form would put a flag where the path belongs, the
+  # caller really meant `cerebro read <abs-path> [--flags]`.
+  if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    arg2="$1"; shift
+  fi
+  local range="" from="" to=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --range) shift; range="${1:-}"; shift || true ;;
-      *) err_usage "read: unknown arg: $1" ;;
+      --range)
+        shift
+        local rv="${1:-}"
+        [[ -n "$rv" ]] || err_usage "read: --range requires a value; canonical: --range N:M | N M | N-M | N..M | N | :M"
+        shift || true
+        local r_lo r_hi
+        case "$rv" in
+          *:*)
+            r_lo="${rv%%:*}"; r_hi="${rv#*:}" ;;
+          *..*)
+            r_lo="${rv%%..*}"; r_hi="${rv##*..}" ;;
+          *-*)
+            # N-M only when both sides are pure digits; leave refs like
+            # HEAD-1 alone.
+            local r_left="${rv%%-*}" r_right="${rv#*-}"
+            if [[ "$r_left" =~ ^[0-9]+$ && "$r_right" =~ ^[0-9]+$ ]]; then
+              r_lo="$r_left"; r_hi="$r_right"
+            else
+              err_usage "read: bad --range value: $rv; canonical: --range N:M | N-M | N..M | N M"
+            fi ;;
+          *)
+            if [[ "$rv" =~ ^[0-9]+$ ]]; then
+              r_lo="$rv"; r_hi=""
+              # Peek next argv: if it's pure-digits, consume it as M.
+              if [[ $# -gt 0 && "${1:-}" =~ ^[0-9]+$ ]]; then
+                r_hi="$1"
+                shift || true
+              fi
+            elif [[ "$rv" == :* && "${rv#:}" =~ ^[0-9]*$ ]]; then
+              r_lo=""; r_hi="${rv#:}"
+            else
+              err_usage "read: bad --range value: $rv; canonical: --range N:M | N-M | N..M | N M"
+            fi ;;
+        esac
+        if [[ -n "$r_lo" && ! "$r_lo" =~ ^[0-9]+$ ]]; then
+          err_usage "read: bad --range lower bound: $r_lo; canonical: --range N:M"
+        fi
+        if [[ -n "$r_hi" && ! "$r_hi" =~ ^[0-9]+$ ]]; then
+          err_usage "read: bad --range upper bound: $r_hi; canonical: --range N:M"
+        fi
+        range="$r_lo:$r_hi" ;;
+      --from)
+        shift
+        local fv="${1:-}"
+        [[ -n "$fv" ]] || err_usage "read: --from requires a value; canonical: --from N --to M"
+        shift || true
+        from="$fv" ;;
+      --to)
+        shift
+        local tv="${1:-}"
+        [[ -n "$tv" ]] || err_usage "read: --to requires a value; canonical: --from N --to M"
+        shift || true
+        to="$tv" ;;
+      *) err_usage "read: unknown arg: $1; canonical: cerebro read <repo> <path> [--range N:M] | cerebro read <abs-path> [--range N:M]" ;;
     esac
   done
-  [[ -n "$repo" && -n "$path" ]] || err_usage "usage: cerebro read <repo-abs-path> <path> [--range N:M]"
-  repo="$(canonical_worktree_root "$repo")" || exit $?
 
-  local resolved
-  resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
-  [[ -f "$resolved" ]] || err_path "read: not a regular file: $path"
+  if [[ -n "$from$to" ]]; then
+    [[ -z "$range" ]] || err_usage "read: --from/--to is mutually exclusive with --range"
+    [[ -n "$from" && -n "$to" ]] || err_usage "read: --from and --to must be paired; canonical: --from N --to M"
+    [[ "$from" =~ ^[0-9]+$ ]] || err_usage "read: bad --from value: $from"
+    [[ "$to"   =~ ^[0-9]+$ ]] || err_usage "read: bad --to value: $to"
+    range="$from:$to"
+  fi
 
-  log_event "read" "$repo $path"
+  [[ -n "$arg1" ]] || err_usage "usage: cerebro read <repo-abs-path> <path> [--range N:M] | cerebro read <abs-path> [--range N:M]"
+
+  local repo="" path="" resolved=""
+  if [[ -n "$arg2" ]]; then
+    # Two positionals supplied. Try the legacy `<repo> <path>` form first.
+    if root="$(canonical_worktree_root "$arg1" 2>/dev/null)"; then
+      repo="$root"
+      path="$arg2"
+      resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
+    elif [[ "$arg1" = /* && -f "$arg1" ]]; then
+      # arg1 is an abs file path with a stray second positional -- treat
+      # arg1 as the file and try to infer the enclosing repo.
+      path="$arg1"
+      if repo="$(find_enclosing_worktree "$arg1")" && [[ -n "$repo" ]]; then
+        warn "read: inferred repo=$repo from abs path"
+        resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
+      else
+        # Fall through to bare-abs reading the file itself.
+        resolved="$(resolve_bare_abs "$arg1")" || exit $?
+      fi
+    else
+      # Re-run worktree resolution to surface the canonical error.
+      canonical_worktree_root "$arg1" >/dev/null
+      exit $?
+    fi
+  else
+    # Single positional. If it's absolute and a regular file, try repo
+    # inference (A1), then fall back to bare-abs (D1).
+    if [[ "$arg1" = /* ]]; then
+      if [[ -f "$arg1" ]]; then
+        if repo="$(find_enclosing_worktree "$arg1")" && [[ -n "$repo" ]]; then
+          path="$arg1"
+          warn "read: inferred repo=$repo from abs path"
+          resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
+        else
+          resolved="$(resolve_bare_abs "$arg1")" || exit $?
+        fi
+      else
+        resolved="$(resolve_bare_abs "$arg1")" || exit $?
+      fi
+    else
+      err_usage "usage: cerebro read <repo-abs-path> <path> [--range N:M] | cerebro read <abs-path> [--range N:M]"
+    fi
+  fi
+
+  [[ -f "$resolved" ]] || err_path "read: not a regular file: ${path:-$arg1}; canonical: cerebro read <repo> <path> | cerebro read <abs-path>"
+
+  log_event "read" "$resolved"
 
   if [[ -z "$range" ]]; then
     cat -- "$resolved"
@@ -1457,29 +1688,45 @@ cmd_grep() {
   local repo="${1:-}"; shift || true
   local pattern="${1:-}"; shift || true
   [[ -n "$repo" && -n "$pattern" ]] \
-    || err_usage "usage: cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]"
-  repo="$(canonical_worktree_root "$repo")" || exit $?
+    || err_usage "usage: cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]; canonical: cerebro grep <repo> <pattern> | cerebro grep <abs-dir> <pattern>"
   command -v rg >/dev/null 2>&1 || die "grep: ripgrep (rg) not installed"
 
   local rg_args=() sub=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --glob)             shift; rg_args+=(--glob "${1:-}") ;;
-      --type)             shift; rg_args+=(--type "${1:-}") ;;
+      --type)
+        shift
+        local raw_type="${1:-}"
+        local ct
+        ct="$(canonicalise_rg_type "$raw_type")"
+        rg_args+=(--type "$ct") ;;
       --fixed-strings|-F) rg_args+=(--fixed-strings) ;;
       -i|--ignore-case)   rg_args+=(--ignore-case) ;;
       --path)             shift; sub="${1:-}" ;;
-      *) err_usage "grep: unknown arg: $1" ;;
+      *) err_usage "grep: unknown arg: $1; canonical: cerebro grep <repo> <pattern> [--glob G] [--type T] [--fixed-strings] [-i] [--path SUB]" ;;
     esac
     shift || true
   done
 
-  local target="$repo"
-  if [[ -n "$sub" ]]; then
-    target="$(resolve_in_repo "$repo" "$sub")" || exit $?
+  local target=""
+  if root="$(canonical_worktree_root "$repo" 2>/dev/null)"; then
+    target="$root"
+    repo="$root"
+    if [[ -n "$sub" ]]; then
+      target="$(resolve_in_repo "$repo" "$sub")" || exit $?
+    fi
+  elif [[ "$repo" = /* ]]; then
+    target="$(resolve_bare_abs "$repo")" || exit $?
+    if [[ -n "$sub" ]]; then
+      target="$(resolve_bare_abs "$target/$sub")" || exit $?
+    fi
+  else
+    canonical_worktree_root "$repo" >/dev/null
+    exit $?
   fi
 
-  log_event "grep" "$repo $pattern"
+  log_event "grep" "$target $pattern"
   # `${arr[@]+"${arr[@]}"}` is the bash-3.2-safe form: on macOS's bash,
   # expanding an empty `${arr[@]}` under `set -u` is treated as unbound
   # and aborts. The +alt expansion produces nothing when the array is
@@ -1493,10 +1740,23 @@ cmd_grep() {
 
 # Read-only git subcommands the orchestrator may invoke. Some allow both
 # read and write modes; per-subcommand validators enforce the read mode.
+# Pure-read entries have no validator; mixed-mode entries (archive, fsck,
+# hash-object, interpret-trailers, apply, bundle, notes, submodule,
+# worktree, replace, bisect, symbolic-ref, mailinfo, fast-export, fetch,
+# branch, tag, config, stash, remote, reflog, diff, show, log, blame,
+# ls-files) are gated by validate_git_subcmd_args().
 readonly CEREBRO_GIT_ALLOWED=(
   status log diff show blame ls-files ls-tree branch remote
   rev-parse cat-file describe tag config for-each-ref
   stash reflog shortlog name-rev merge-base
+  rev-list ls-remote fetch count-objects show-ref show-branch
+  verify-commit verify-tag whatchanged range-diff
+  diff-tree diff-index diff-files grep
+  check-ignore check-attr check-ref-format var help version
+  patch-id request-pull merge-tree get-tar-commit-id fast-export
+  archive fsck hash-object interpret-trailers apply
+  bundle notes submodule worktree replace bisect column columns
+  symbolic-ref mailinfo
 )
 
 # Flags that can write or escape the repo when passed to git. Matched in
@@ -1651,6 +1911,139 @@ validate_git_subcmd_args() {
             err_flag "git ls-files: external-file flag: $a" ;;
         esac
       done ;;
+    archive)
+      for a in "$@"; do
+        case "$a" in
+          -o|-o=*|--output|--output=*)
+            err_flag "git archive: --output writes a file; use stdout: $a" ;;
+        esac
+      done ;;
+    fsck)
+      for a in "$@"; do
+        case "$a" in
+          --write-cache|--write-cache=*)
+            err_flag "git fsck: --write-cache mutates: $a" ;;
+          --lost-found|--lost-found=*)
+            err_flag "git fsck: --lost-found writes files: $a" ;;
+        esac
+      done ;;
+    hash-object)
+      for a in "$@"; do
+        case "$a" in
+          -w|--stdin-paths)
+            err_flag "git hash-object: -w writes to .git/objects: $a" ;;
+        esac
+      done ;;
+    interpret-trailers)
+      for a in "$@"; do
+        case "$a" in
+          --in-place|--in-place=*)
+            err_flag "git interpret-trailers: --in-place writes: $a" ;;
+        esac
+      done ;;
+    apply)
+      local has_check=0
+      for a in "$@"; do [[ "$a" == "--check" ]] && has_check=1; done
+      (( has_check )) || err_flag "git apply: only --check form allowed (would apply otherwise)" ;;
+    bundle)
+      case "${1:-}" in
+        verify|list-heads) ;;
+        *) err_flag "git bundle: only verify/list-heads allowed (got ${1:-})" ;;
+      esac ;;
+    notes)
+      case "${1:-list}" in
+        list|show) ;;
+        *) err_flag "git notes: only list/show allowed (got ${1:-})" ;;
+      esac ;;
+    submodule)
+      case "${1:-}" in
+        status|summary) ;;
+        *) err_flag "git submodule: only status/summary allowed (got ${1:-})" ;;
+      esac ;;
+    worktree)
+      case "${1:-}" in
+        list) ;;
+        *) err_flag "git worktree: only list allowed (got ${1:-})" ;;
+      esac ;;
+    replace)
+      # `git replace` with no args lists replacements; `--list`/`-l` also
+      # lists (optionally filtered by a pattern positional). Any other
+      # positional is the SET form `git replace <object> <replacement>`,
+      # which writes a replacement ref.
+      saw_list=0
+      for a in "$@"; do
+        case "$a" in
+          --list|-l) saw_list=1 ;;
+          --add|--edit|--delete|-d|--graft|--graft=*|--convert-graft-file)
+            err_flag "git replace: mutating flag: $a" ;;
+        esac
+      done
+      for a in "$@"; do
+        case "$a" in
+          -*) ;;
+          *)
+            (( saw_list )) || err_flag "git replace: positional arg without --list: $a" ;;
+        esac
+      done ;;
+    bisect)
+      case "${1:-}" in
+        view|log) ;;
+        *) err_flag "git bisect: only view/log allowed (got ${1:-})" ;;
+      esac ;;
+    symbolic-ref)
+      # `git symbolic-ref <name>` reads; `git symbolic-ref <name> <ref>`
+      # writes. `-d`/`--delete` is also a write but uses only one positional,
+      # so the positional-count guard alone misses it; deny it explicitly.
+      local positional=0
+      for a in "$@"; do
+        case "$a" in
+          -d|--delete)
+            err_flag "git symbolic-ref: mutating flag: $a" ;;
+          -*) ;;
+          *) positional=$((positional + 1)) ;;
+        esac
+      done
+      (( positional <= 1 )) || err_flag "git symbolic-ref: SET form (two positionals) is a write" ;;
+    mailinfo)
+      for a in "$@"; do
+        case "$a" in
+          -*) ;;
+          *) err_flag "git mailinfo: positional args name output files; refuse" ;;
+        esac
+      done ;;
+    fast-export)
+      # `git fast-export` writes its stream to stdout (fine), but
+      # `--export-marks=<file>` and `--import-marks*=<file>` open arbitrary
+      # external paths for write/read outside the repo.
+      for a in "$@"; do
+        case "$a" in
+          --export-marks|--export-marks=*\
+          |--import-marks|--import-marks=*\
+          |--import-marks-if-exists|--import-marks-if-exists=*)
+            err_flag "git fast-export: mutating flag: $a" ;;
+        esac
+      done ;;
+    fetch)
+      # Bare `git fetch [<remote>]` is allowed. The flags below mutate more
+      # than the default fetch (prune refs, force overwrite local refs,
+      # change shallowness, write submodule config) -- reject them. Note
+      # that `--no-write-fetch-head` / `--write-fetch-head=false` are not
+      # denied: they only suppress writing FETCH_HEAD, which is a
+      # narrowing, not a widening.
+      for a in "$@"; do
+        case "$a" in
+          --prune|-p|--prune-tags\
+          |--force|-f\
+          |--update-head-ok\
+          |--multiple\
+          |--shallow-since|--shallow-since=*\
+          |--shallow-exclude|--shallow-exclude=*\
+          |--deepen|--deepen=*\
+          |--unshallow\
+          |--recurse-submodules-default|--recurse-submodules-default=*)
+            err_flag "git fetch: mutating flag: $a" ;;
+        esac
+      done ;;
   esac
 }
 
@@ -1693,16 +2086,67 @@ cmd_git() {
       --no-optional-locks -C "$repo" config --local "$@"
   fi
   case "$sub" in
-    diff|log|show)
+    diff|log|show|whatchanged|diff-tree|diff-index|diff-files|grep|range-diff)
       exec git "${CEREBRO_GIT_OVERRIDES[@]}" \
         --no-optional-locks -C "$repo" \
         "$sub" --no-ext-diff --no-textconv "$@" ;;
+    fsck)
+      exec git "${CEREBRO_GIT_OVERRIDES[@]}" \
+        --no-optional-locks -C "$repo" \
+        fsck --no-progress "$@" ;;
   esac
   exec git "${CEREBRO_GIT_OVERRIDES[@]}" \
     --no-optional-locks -C "$repo" "$sub" "$@"
 }
 
 # ----- subcommand: cerebro gh <repo> <subcmd> [args...] --------------------
+
+# Accept-list dispatcher for a gh top-level command. Compares $sub against
+# the list of allow-listed verbs ($3..$N) and err_subcmds when no match.
+_gh_accept_verb() {
+  local top="$1" sub="$2"; shift 2
+  local v
+  for v in "$@"; do
+    [[ "$sub" == "$v" ]] && return 0
+  done
+  err_subcmd "gh $top: '$sub' not allow-listed (allowed: $*)"
+}
+
+# Validate argv following `gh codespace ports`. The bare form lists forwarded
+# ports (read), but `ports forward <port>` and `ports visibility <port>:vis`
+# are mutating subcommands. A flat scan would false-positive on legitimate
+# reads like `ports --json visibility` (a JSON field) or `-c visibility`
+# (a codespace named `visibility`). Walk argv flag-aware: skip the value of
+# known value-taking flags, treat `--flag=value` as self-contained, then
+# inspect only the first non-flag positional -- the actual subcommand slot.
+_gh_codespace_ports_validate() {
+  # Maintenance burden: gh evolves; if a new value-consuming flag is added to
+  # gh codespace, add it here to avoid false-negatives on the forward/visibility
+  # subcommand check. The list covers flags from any gh codespace subcommand
+  # (not just `ports`) so leaked-through usage still parses correctly.
+  local tok consume=0
+  while (( $# )); do
+    tok="$1"; shift
+    if (( consume )); then
+      consume=0
+      continue
+    fi
+    case "$tok" in
+      --*=*) ;;  # equals-form flag carries its own value
+      --codespace|--repo|--repo-owner|--branch|--json|--jq|--template|\
+      --display-name|--idle-timeout|--retention-period|--machine|--location|\
+      --devcontainer-path)
+        consume=1 ;;
+      -c|-R|-B|-t|-q)
+        consume=1 ;;
+      -*) ;;     # other flags: bool/unknown -- do not consume next
+      forward|visibility)
+        err_subcmd "gh codespace ports: '$tok' not allowed (only bare list form)" ;;
+      *) return 0 ;;  # other positional first -- not a mutating verb
+    esac
+  done
+  return 0
+}
 
 cmd_gh() {
   require_session
@@ -1712,43 +2156,50 @@ cmd_gh() {
     || err_usage "usage: cerebro gh <repo-abs-path> <subcmd> [args...]"
   require_git_repo "$repo"
 
-  local sub="${1:-}"  # may be empty for `gh auth status`; do not shift yet
+  local sub="${1:-}"  # may be empty for `gh status` / `gh completion`
   case "$top" in
-    pr)
+    pr)         _gh_accept_verb "pr"          "$sub" view list diff checks status ;;
+    issue)      _gh_accept_verb "issue"       "$sub" view list status ;;
+    run)        _gh_accept_verb "run"         "$sub" view list watch ;;
+    repo)       _gh_accept_verb "repo"        "$sub" view list ;;
+    release)    _gh_accept_verb "release"     "$sub" view list verify ;;
+    search)     _gh_accept_verb "search"      "$sub" repos prs issues code commits ;;
+    auth)       _gh_accept_verb "auth"        "$sub" status ;;
+    workflow)   _gh_accept_verb "workflow"    "$sub" view list ;;
+    ruleset)    _gh_accept_verb "ruleset"     "$sub" view list check ;;
+    project)    _gh_accept_verb "project"     "$sub" view list field-list item-list ;;
+    secret)     _gh_accept_verb "secret"      "$sub" list ;;
+    variable)   _gh_accept_verb "variable"    "$sub" list get ;;
+    cache)      _gh_accept_verb "cache"       "$sub" list ;;
+    label)      _gh_accept_verb "label"       "$sub" list ;;
+    ssh-key)    _gh_accept_verb "ssh-key"     "$sub" list ;;
+    gpg-key)    _gh_accept_verb "gpg-key"     "$sub" list ;;
+    codespace)
+      _gh_accept_verb "codespace"   "$sub" view list logs ports
+      # `gh codespace ports` (bare) lists forwarded ports;
+      # `gh codespace ports forward <port>` and `... visibility <spec>`
+      # mutate, and `gh` parses them as subcommands even when flags
+      # precede them (`ports -c <name> forward 8080:8080`). Walk the
+      # post-`ports` argv flag-aware so values like `--json visibility`
+      # or `-c visibility` don't trip a flat token scan.
+      [[ "$sub" == "ports" ]] && _gh_codespace_ports_validate "${@:2}"
+      ;;
+    attestation) _gh_accept_verb "attestation" "$sub" verify ;;
+    org)        _gh_accept_verb "org"         "$sub" list ;;
+    alias)      _gh_accept_verb "alias"       "$sub" list ;;
+    config)     _gh_accept_verb "config"      "$sub" get list ;;
+    gist)       _gh_accept_verb "gist"        "$sub" view list ;;
+    licenses)   _gh_accept_verb "licenses"    "$sub" list view ;;
+    extension)
       case "$sub" in
-        view|list|diff|checks|status) ;;
-        *) err_subcmd "gh pr: '$sub' not allow-listed" ;;
+        list|search) ;;
+        install)
+          err_subcmd "gh extension: 'install' runs arbitrary code; not allow-listed" ;;
+        *) err_subcmd "gh extension: '$sub' not allow-listed (allowed: list search)" ;;
       esac ;;
-    issue)
-      case "$sub" in
-        view|list|status) ;;
-        *) err_subcmd "gh issue: '$sub' not allow-listed" ;;
-      esac ;;
-    run)
-      case "$sub" in
-        view|list|watch) ;;
-        *) err_subcmd "gh run: '$sub' not allow-listed" ;;
-      esac ;;
-    repo)
-      case "$sub" in
-        view|list) ;;
-        *) err_subcmd "gh repo: '$sub' not allow-listed" ;;
-      esac ;;
-    release)
-      case "$sub" in
-        view|list) ;;
-        *) err_subcmd "gh release: '$sub' not allow-listed" ;;
-      esac ;;
-    search)
-      case "$sub" in
-        repos|prs|issues|code|commits) ;;
-        *) err_subcmd "gh search: '$sub' not allow-listed" ;;
-      esac ;;
-    auth)
-      case "$sub" in
-        status) ;;
-        *) err_subcmd "gh auth: only 'status' allowed (got '$sub')" ;;
-      esac ;;
+    status|completion)
+      # Bare tops; no verb gating. Args still flow through.
+      ;;
     api)
       # api accepts any GET; reject mechanisms that change the method or
       # add a request body. The `-X*`/`-F*`/`-f*` globs catch attached
@@ -1765,6 +2216,8 @@ cmd_gh() {
             err_flag "gh api: write flag: $a" ;;
         esac
       done ;;
+    browse|copilot|preview|agent-task|co|skill)
+      err_subcmd "gh: top-level command not allow-listed: $top (side-effect: browser/interactive/install)" ;;
     *)
       err_subcmd "gh: top-level command not allow-listed: $top" ;;
   esac

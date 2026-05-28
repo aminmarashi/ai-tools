@@ -121,9 +121,9 @@ run_case 11 "gh pr create denied" 4 -- "$CEREBRO_BIN" gh "$REPO" pr create
 STDERR_CONTAINS="write flag" \
 run_case 12 "gh api -X POST denied" 5 -- "$CEREBRO_BIN" gh "$REPO" api -X POST /repos/x/y
 
-# --- 13. unknown gh top-level ---
+# --- 13. denied gh write (gist create); gist list itself is allow-listed ---
 STDERR_CONTAINS="not allow-listed" \
-run_case 13 "gh gist list denied" 4 -- "$CEREBRO_BIN" gh "$REPO" gist list
+run_case 13 "gh gist create denied" 4 -- "$CEREBRO_BIN" gh "$REPO" gist create
 
 # --- 14. read happy ---
 run_case 14 "read a.txt happy" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt
@@ -194,17 +194,29 @@ run_case 21 "cerebro doesnotexist" 1 -- "$CEREBRO_BIN" doesnotexist
 STDERR_CONTAINS="not a git worktree" \
 run_case 22 "read /etc passwd (not a worktree)" 3 -- "$CEREBRO_BIN" read /etc passwd
 
-# --- 23. grep outside repo refused ---
-STDERR_CONTAINS="not a git worktree" \
-run_case 23 "grep /etc foo (not a worktree)" 3 -- "$CEREBRO_BIN" grep /etc foo
+# --- 23. grep bare-abs: pattern required (no worktree, but pattern missing) ---
+STDERR_CONTAINS="usage" \
+run_case 23 "grep /etc (no pattern) usage error" 2 -- "$CEREBRO_BIN" grep /etc
 
-# --- 24. ls outside repo refused ---
-STDERR_CONTAINS="not a git worktree" \
-run_case 24 "ls /etc (not a worktree)" 3 -- "$CEREBRO_BIN" ls /etc
+# Pre-create a directory the bare-abs cases below can read out of.
+mkdir -p "$WORKDIR/lookups"
+printf 'findme\n' > "$WORKDIR/lookups/needle.txt"
 
-# --- 25. git symbolic-ref removed from allow-list ---
-STDERR_CONTAINS="not on allow-list" \
-run_case 25 "git symbolic-ref denied" 4 -- "$CEREBRO_BIN" git "$REPO" symbolic-ref HEAD refs/heads/x
+# --- 24. ls bare-abs against a directory the sandbox controls ---
+out="$("$CEREBRO_BIN" ls "$WORKDIR/lookups" 2>/dev/null)"
+rc=$?
+if [[ $rc -eq 0 && "$out" == *"needle.txt"* ]]; then
+  printf 'PASS  24  ls bare-abs (lists needle.txt)\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL  24  ls bare-abs [rc=%d out=%s]\n' "$rc" "$out"
+  fail=$((fail + 1))
+  failures+=("24 ls bare-abs :: rc=$rc out=$out")
+fi
+
+# --- 25. git symbolic-ref SET form denied (read form is allowed; see 73) ---
+STDERR_CONTAINS="SET form" \
+run_case 25 "git symbolic-ref SET form denied" 5 -- "$CEREBRO_BIN" git "$REPO" symbolic-ref HEAD refs/heads/x
 
 # --- 26. git remote add denied ---
 STDERR_CONTAINS="git remote" \
@@ -382,6 +394,293 @@ gh_happy 50 "gh api /repos/foo/bar dispatches" "api /repos/foo/bar" api /repos/f
 gh_happy 51 "gh pr view --json with -q containing commas/parens/spaces" \
   "pr view 64 --json baseRefName,headRefName,commits -q .baseRefName, .headRefName, (.commits | length)" \
   pr view 64 --json baseRefName,headRefName,commits -q ".baseRefName, .headRefName, (.commits | length)"
+
+# ========================================================================
+# Category A coverage (52-63): forgiving argv shapes for read/grep/ls.
+# ========================================================================
+
+# --- 52. read abs file path infers enclosing repo ---
+out="$("$CEREBRO_BIN" read "$REPO/a.txt" --range 1:1 2>"$WORKDIR/stderr")"
+rc=$?
+err="$(cat "$WORKDIR/stderr")"
+if [[ $rc -eq 0 && "$err" == *"inferred repo"* ]]; then
+  printf 'PASS  52  read with abs file path infers repo\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL  52  read abs-file repo-infer [rc=%d err=%s]\n' "$rc" "$err"
+  fail=$((fail + 1))
+  failures+=("52 read abs-file repo-infer :: rc=$rc err=$err")
+fi
+
+# --- 53. read abs file no flag (legacy file form ok) ---
+run_case 53 "read abs file no flag happy" 0 -- "$CEREBRO_BIN" read "$REPO/a.txt"
+
+# --- 54. read --range N-M ---
+run_case 54 "read --range N-M" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt --range 1-1
+
+# --- 55. read --range N..M ---
+run_case 55 "read --range N..M" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt --range 1..1
+
+# --- 56. read --range N M (two ints) ---
+run_case 56 "read --range N M" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt --range 1 1
+
+# --- 57. read --from N --to M ---
+run_case 57 "read --from N --to M" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt --from 1 --to 1
+
+# --- 58. read --range N (open-ended) ---
+run_case 58 "read --range bare-N" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt --range 1
+
+# --- 59. read ./a.txt ---
+run_case 59 "read ./a.txt" 0 -- "$CEREBRO_BIN" read "$REPO" ./a.txt
+
+# --- 60. read bogus --range value emits canonical hint ---
+STDERR_CONTAINS="canonical: --range" \
+run_case 60 "read bad --range value with hint" 2 -- "$CEREBRO_BIN" read "$REPO" a.txt --range abc
+
+# --- 61. grep --type rs aliased to rust ---
+if command -v rg >/dev/null 2>&1; then
+  "$CEREBRO_BIN" grep "$REPO" 'pattern' --type rs >/dev/null 2>"$WORKDIR/stderr"
+  rc=$?
+  err="$(cat "$WORKDIR/stderr")"
+  if [[ ( $rc -eq 0 || $rc -eq 1 ) && "$err" != *"unrecognized file type"* ]]; then
+    printf 'PASS  61  grep --type rs aliased to rust (rc=%d)\n' "$rc"
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  61  grep --type rs alias [rc=%d err=%s]\n' "$rc" "$err"
+    fail=$((fail + 1))
+    failures+=("61 grep --type rs alias :: rc=$rc err=$err")
+  fi
+else
+  printf 'SKIP  61  grep --type rs aliased (rg not installed)\n'
+fi
+
+# --- 62. grep --type yml aliased to yaml ---
+if command -v rg >/dev/null 2>&1; then
+  "$CEREBRO_BIN" grep "$REPO" 'pattern' --type yml >/dev/null 2>"$WORKDIR/stderr"
+  rc=$?
+  err="$(cat "$WORKDIR/stderr")"
+  if [[ ( $rc -eq 0 || $rc -eq 1 ) && "$err" != *"unrecognized file type"* ]]; then
+    printf 'PASS  62  grep --type yml aliased to yaml (rc=%d)\n' "$rc"
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  62  grep --type yml alias [rc=%d err=%s]\n' "$rc" "$err"
+    fail=$((fail + 1))
+    failures+=("62 grep --type yml alias :: rc=$rc err=$err")
+  fi
+else
+  printf 'SKIP  62  grep --type yml aliased (rg not installed)\n'
+fi
+
+# --- 63. grep unknown arg with canonical hint ---
+STDERR_CONTAINS="canonical: cerebro grep" \
+run_case 63 "grep unknown arg with hint" 2 -- "$CEREBRO_BIN" grep "$REPO" foo --nope
+
+# ========================================================================
+# Category B coverage (64-73d): broadened git allow-list.
+# ========================================================================
+
+run_case 64 "git rev-list HEAD happy" 0 -- "$CEREBRO_BIN" git "$REPO" rev-list -n 1 HEAD
+run_case 65 "git count-objects happy" 0 -- "$CEREBRO_BIN" git "$REPO" count-objects
+run_case 66 "git show-ref happy" 0 -- "$CEREBRO_BIN" git "$REPO" show-ref
+run_case 67 "git check-ref-format happy" 0 -- "$CEREBRO_BIN" git "$REPO" check-ref-format refs/heads/main
+run_case 68 "git var GIT_EDITOR happy" 0 -- "$CEREBRO_BIN" git "$REPO" var GIT_EDITOR
+run_case 69 "git diff-tree happy" 0 -- "$CEREBRO_BIN" git "$REPO" diff-tree -r HEAD
+run_case 70 "git range-diff self happy" 0 -- "$CEREBRO_BIN" git "$REPO" range-diff HEAD~1..HEAD HEAD~1..HEAD
+
+# --- 71. git archive --output denied (matched by global deny-list) ---
+STDERR_CONTAINS="denied global flag: --output" \
+run_case 71 "git archive --output denied" 5 -- "$CEREBRO_BIN" git "$REPO" archive --output /tmp/x.tar HEAD
+
+# --- 72. git hash-object -w denied ---
+STDERR_CONTAINS="-w writes" \
+run_case 72 "git hash-object -w denied" 5 -- \
+  bash -c "printf x | '$CEREBRO_BIN' git '$REPO' hash-object -w --stdin"
+
+# --- 73. git symbolic-ref read form happy ---
+run_case 73 "git symbolic-ref read form happy" 0 -- "$CEREBRO_BIN" git "$REPO" symbolic-ref HEAD
+
+# --- 73b. git apply requires --check ---
+STDERR_CONTAINS="only --check form allowed" \
+run_case 73b "git apply without --check denied" 5 -- "$CEREBRO_BIN" git "$REPO" apply some.patch
+
+# --- 73c. git fetch reaches git (allow-list + no mutating flags) ---
+"$CEREBRO_BIN" git "$REPO" fetch >/dev/null 2>"$WORKDIR/stderr"
+rc=$?
+err="$(cat "$WORKDIR/stderr")"
+if [[ "$err" != *"not on allow-list"* && "$err" != *"mutating flag"* && "$err" != *"denied global flag"* ]]; then
+  printf 'PASS  73c  git fetch reaches git (rc=%d)\n' "$rc"
+  pass=$((pass + 1))
+else
+  printf 'FAIL  73c  git fetch blocked by bridge [rc=%d err=%s]\n' "$rc" "$err"
+  fail=$((fail + 1))
+  failures+=("73c git fetch reaches git :: rc=$rc err=$err")
+fi
+
+# --- 73d. git fetch --prune denied ---
+STDERR_CONTAINS="mutating flag: --prune" \
+run_case 73d "git fetch --prune denied" 5 -- "$CEREBRO_BIN" git "$REPO" fetch --prune
+
+# --- 73e. git fast-export --export-marks denied ---
+STDERR_CONTAINS="mutating flag: --export-marks" \
+run_case 73e "git fast-export --export-marks denied" 5 -- \
+  "$CEREBRO_BIN" git "$REPO" fast-export --export-marks=/tmp/marks --all
+
+# --- 73f. git replace positional SET form denied (no --list) ---
+STDERR_CONTAINS="positional arg without --list" \
+run_case 73f "git replace SET form denied" 5 -- \
+  "$CEREBRO_BIN" git "$REPO" replace HEAD HEAD~1
+
+# --- 73g. git symbolic-ref --delete denied ---
+STDERR_CONTAINS="mutating flag: --delete" \
+run_case 73g "git symbolic-ref --delete denied" 5 -- \
+  "$CEREBRO_BIN" git "$REPO" symbolic-ref --delete HEAD
+
+# ========================================================================
+# Category C coverage (74-83b): broadened gh allow-list (via PATH stub).
+# ========================================================================
+
+gh_happy 74 "gh workflow list dispatches" "workflow list" workflow list
+
+STDERR_CONTAINS="not allow-listed" \
+run_case 75 "gh workflow run denied" 4 -- "$CEREBRO_BIN" gh "$REPO" workflow run wf.yml
+
+gh_happy 76 "gh secret list dispatches" "secret list" secret list
+
+STDERR_CONTAINS="not allow-listed" \
+run_case 77 "gh secret set denied" 4 -- "$CEREBRO_BIN" gh "$REPO" secret set NAME
+
+gh_happy 78 "gh cache list dispatches" "cache list" cache list
+gh_happy 79 "gh label list dispatches" "label list" label list
+gh_happy 80 "gh codespace list dispatches" "codespace list" codespace list
+
+# --- 80b. gh codespace ports (bare) dispatches ---
+gh_happy 80b "gh codespace ports happy" "codespace ports" codespace ports
+
+# --- 80c. gh codespace ports forward denied (nested mutating verb) ---
+STDERR_CONTAINS="codespace ports" \
+run_case 80c "gh codespace ports forward denied" 4 -- \
+  "$CEREBRO_BIN" gh "$REPO" codespace ports forward 8080
+
+# --- 80d. gh codespace ports visibility denied (nested mutating verb) ---
+STDERR_CONTAINS="codespace ports" \
+run_case 80d "gh codespace ports visibility denied" 4 -- \
+  "$CEREBRO_BIN" gh "$REPO" codespace ports visibility 8080:private
+
+# --- 80e. gh codespace ports -c <name> forward denied (flag-before-subcmd) ---
+STDERR_CONTAINS="forward" \
+run_case 80e "gh codespace ports -c name forward denied" 4 -- \
+  "$CEREBRO_BIN" gh "$REPO" codespace ports -c some-name forward 8080:8080
+
+# --- 80f. gh codespace ports --json visibility happy (visibility as JSON field) ---
+gh_happy 80f "gh codespace ports --json visibility happy" \
+  "codespace ports --json visibility" \
+  codespace ports --json visibility
+
+# --- 80g. gh codespace ports -c visibility forward denied (flag value skipped) ---
+STDERR_CONTAINS="forward" \
+run_case 80g "gh codespace ports -c visibility forward denied" 4 -- \
+  "$CEREBRO_BIN" gh "$REPO" codespace ports -c visibility forward 8080:8080
+
+# --- 80h. gh codespace ports --codespace=visibility happy (equals-form value) ---
+gh_happy 80h "gh codespace ports --codespace=visibility happy" \
+  "codespace ports --codespace=visibility" \
+  codespace ports --codespace=visibility
+
+# --- 80i. gh codespace ports --repo-owner <owner> forward denied (codex case) ---
+STDERR_CONTAINS="forward" \
+run_case 80i "gh codespace ports --repo-owner alice forward denied" 4 -- \
+  "$CEREBRO_BIN" gh "$REPO" codespace ports --repo-owner alice forward 8080:8080
+
+# --- 80j. gh codespace ports --repo-owner=alice happy (equals form is self-contained) ---
+gh_happy 80j "gh codespace ports --repo-owner=alice happy" \
+  "codespace ports --repo-owner=alice" \
+  codespace ports --repo-owner=alice
+
+# --- 80k. gh codespace ports --display-name <name> forward denied (audit-added flag) ---
+STDERR_CONTAINS="forward" \
+run_case 80k "gh codespace ports --display-name name forward denied" 4 -- \
+  "$CEREBRO_BIN" gh "$REPO" codespace ports --display-name my-space forward 8080:8080
+
+STDERR_CONTAINS="not allow-listed" \
+run_case 81 "gh auth token denied" 4 -- "$CEREBRO_BIN" gh "$REPO" auth token
+
+gh_happy 82 "gh config get editor dispatches" "config get editor" config get editor
+
+STDERR_CONTAINS="runs arbitrary code" \
+run_case 83 "gh extension install denied with reason" 4 -- "$CEREBRO_BIN" gh "$REPO" extension install owner/repo
+
+STDERR_CONTAINS="side-effect" \
+run_case 83b "gh browse top-level denied" 4 -- "$CEREBRO_BIN" gh "$REPO" browse
+
+# ========================================================================
+# Category D coverage (84-92): bare-abs read/grep/ls.
+# ========================================================================
+
+# Sandbox-local file outside any worktree.
+printf 'hello\n' > "$WORKDIR/outside.txt"
+
+# --- 84. read bare-abs file happy ---
+out="$("$CEREBRO_BIN" read "$WORKDIR/outside.txt" 2>"$WORKDIR/stderr")"
+rc=$?
+if [[ $rc -eq 0 && "$out" == *"hello"* ]]; then
+  printf 'PASS  84  read bare-abs file happy\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL  84  read bare-abs file happy [rc=%d out=%s]\n' "$rc" "$out"
+  fail=$((fail + 1))
+  failures+=("84 read bare-abs file :: rc=$rc out=$out")
+fi
+
+# --- 85. read bare-abs file with --range ---
+run_case 85 "read bare-abs --range" 0 -- "$CEREBRO_BIN" read "$WORKDIR/outside.txt" --range 1:1
+
+# --- 86. read bare-abs special path denied ---
+STDERR_CONTAINS="special path" \
+run_case 86 "read /dev/null denied" 3 -- "$CEREBRO_BIN" read /dev/null
+
+# --- 87. read bare-abs another special path denied ---
+STDERR_CONTAINS="special path" \
+run_case 87 "read /dev/tty denied (under /dev/)" 3 -- "$CEREBRO_BIN" read /dev/tty
+
+# --- 88. read bare-abs nonexistent ---
+STDERR_CONTAINS="cannot stat" \
+run_case 88 "read nonexistent bare-abs" 3 -- "$CEREBRO_BIN" read /no/such/path/xyz
+
+# --- 89. grep bare-abs happy (sandbox dir) ---
+if command -v rg >/dev/null 2>&1; then
+  out="$("$CEREBRO_BIN" grep "$WORKDIR/lookups" findme 2>/dev/null)"
+  rc=$?
+  if [[ ( $rc -eq 0 || $rc -eq 1 ) && "$out" == *"needle.txt"*"findme"* ]]; then
+    printf 'PASS  89  grep bare-abs happy\n'
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  89  grep bare-abs happy [rc=%d out=%s]\n' "$rc" "$out"
+    fail=$((fail + 1))
+    failures+=("89 grep bare-abs happy :: rc=$rc out=$out")
+  fi
+else
+  printf 'SKIP  89  grep bare-abs happy (rg not installed)\n'
+fi
+
+# --- 90. grep bare-abs missing pattern ---
+STDERR_CONTAINS="usage" \
+run_case 90 "grep bare-abs missing pattern" 2 -- "$CEREBRO_BIN" grep "$WORKDIR/lookups"
+
+# --- 91. ls bare-abs happy ---
+out="$("$CEREBRO_BIN" ls "$WORKDIR/lookups" 2>/dev/null)"
+rc=$?
+if [[ $rc -eq 0 && "$out" == *"needle.txt"* ]]; then
+  printf 'PASS  91  ls bare-abs lists needle.txt\n'
+  pass=$((pass + 1))
+else
+  printf 'FAIL  91  ls bare-abs [rc=%d out=%s]\n' "$rc" "$out"
+  fail=$((fail + 1))
+  failures+=("91 ls bare-abs :: rc=$rc out=$out")
+fi
+
+# --- 92. ls bare-abs special path denied ---
+STDERR_CONTAINS="special path" \
+run_case 92 "ls /dev denied" 3 -- "$CEREBRO_BIN" ls /dev
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
