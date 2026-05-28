@@ -17,12 +17,11 @@
 # Sub-commands called by the orchestrator via Bash(cerebro:*) -- the user
 # never types these; they exist for the chat to drive:
 #   cerebro plan <repo> "<desc>" [--out <name>]
-#   cerebro note "<markdown-body>" [--out <name>]
 #   cerebro plans
-#   cerebro execute <repo> <plan-path>
+#   cerebro execute <repo> (<plan-path> | --prompt "<text>")
 #   cerebro review <repo> [--base <ref>]
-#   cerebro apply-review <repo> <findings-path> [--notes "..."]
-#   cerebro doc-write <repo> <plan-path> [--notes "..."]
+#   cerebro apply-review <repo> (<findings-path> [--notes "..."] | --prompt "<text>")
+#   cerebro doc-write <repo> (<plan-path> [--notes "..."] | --prompt "<text>")
 #   cerebro recall <query>
 #   cerebro status
 #   cerebro git <repo> <git-subcmd> [args...]      # read-only git bridge
@@ -369,16 +368,15 @@ behalf, by calling them through your Bash tool (which is restricted to
 3. Default: when the user describes a feature or change, DRAFT A PLAN
    FIRST with `cerebro plan <repo> "<description>"`, tell the user
    where it landed, and wait for explicit "go" before `cerebro execute`.
-   Skip `cerebro plan` when:
-     - the work is mechanical: a single-file edit you can describe in
-       2-3 lines, a purely-additive merge-conflict resolution, a
-       one-line config bump, a typo fix; or
-     - the user has already described the change precisely enough
-       that you can write the apply-review/execute notes in under
-       ~200 chars without losing fidelity.
-   Always plan for: cross-file refactors, new modules, schema
-   changes, anything described in under two sentences that needs
-   synthesis across files. When in doubt, plan.
+   You may use the inline-prompt shortcut (`cerebro execute`,
+   `cerebro apply-review`, or `cerebro doc-write` with
+   `--prompt "<text>"` instead of a plan/findings file) ONLY when the
+   user has explicitly asked to skip the plan / review step ("just do
+   it", "skip the plan", "no need to plan this", "fix it directly", or
+   similar). Do NOT decide on your own to bypass planning, even for
+   changes that look mechanical -- the planning step exists so the
+   user can sanity-check before you touch the repo. When in doubt,
+   plan.
 4. Repos are addressed by absolute path, passed as the first positional
    argument to every sub-agent subcommand. Deduce the path from chat
    context. If the user has not told you which repo, ASK them once
@@ -418,16 +416,14 @@ behalf, by calling them through your Bash tool (which is restricted to
   cerebro plans
     List the plan files in the current session with timestamps.
 
-  cerebro note "<text>" [--out <name>]
-    Write <text> to sessions/<id>/plans/<name>.md and echo the path.
-    Use this to stage a hand-written description as input to
-    `cerebro execute` or `cerebro apply-review` when the change is
-    mechanical and a full `cerebro plan` is overkill.
-
-  cerebro execute <repo-abs-path> <plan-path>
+  cerebro execute <repo-abs-path> (<plan-path> | --prompt "<text>")
     Spawn a full-edit child claude with cwd=<repo>. It branches,
-    implements the plan, commits, pushes, and opens a PR via gh. Use
-    this AFTER the user has read the plan and told you to proceed.
+    implements the work, commits, pushes, and opens a PR via gh. The
+    default form takes a <plan-path> from `cerebro plan`; use it
+    AFTER the user has read the plan and told you to proceed. The
+    `--prompt "<text>"` form skips the plan file and hands <text>
+    straight to the child as the task to do -- use it only when the
+    user has explicitly asked to skip planning (see rule 3).
     AGENTS.md bootstrap: if the repo lacks AGENTS.md / CLAUDE.md at
     the root, execute auto-adds them from the user-editable templates
     at $CEREBRO_HOME/templates/ as a separate first commit before the
@@ -445,22 +441,31 @@ behalf, by calling them through your Bash tool (which is restricted to
     deliberately want to widen the scope (e.g., the user asks for a
     full re-review). The findings file path is echoed on stdout.
 
-  cerebro apply-review <repo-abs-path> <findings-path> [--notes "..."]
-    Spawn a full-edit child claude with cwd=<repo> to apply the review
-    fixes you've decided to act on. SCOPE: include in --notes only
-    findings that are clearly within the scope of the plan being
-    worked on. Out-of-scope improvements (unrelated refactors, style
-    nits in files the plan didn't touch, broader tech-debt
-    suggestions) must be NAMED to the user in your chat summary but
-    NOT forwarded as --notes. If a finding's relevance to the
-    original task is ambiguous, ASK the user before acting on it. The
-    child commits and pushes on the same branch, so the existing PR
-    updates in place.
+  cerebro apply-review <repo-abs-path>
+                       (<findings-path> [--notes "..."] | --prompt "<text>")
+    Spawn a full-edit child claude with cwd=<repo> to apply fixes on
+    the current branch. The default form takes a <findings-path> from
+    `cerebro review`. SCOPE: include in --notes only findings that
+    are clearly within the scope of the plan being worked on.
+    Out-of-scope improvements (unrelated refactors, style nits in
+    files the plan didn't touch, broader tech-debt suggestions) must
+    be NAMED to the user in your chat summary but NOT forwarded as
+    --notes. If a finding's relevance to the original task is
+    ambiguous, ASK the user before acting on it. The `--prompt
+    "<text>"` form skips the findings file and hands <text> straight
+    to the child as the fix instruction -- use it only when the user
+    has explicitly asked to skip review (see rule 3), e.g. for a
+    merge conflict or a fix they already diagnosed. The child commits
+    and pushes on the same branch, so the existing PR updates in
+    place.
 
-  cerebro doc-write <repo-abs-path> <plan-path> [--notes "..."]
-    Spawn a full-edit child claude with cwd=<repo> to update docs based
-    on the plan and the recent diff. Commits and pushes on the same
-    branch.
+  cerebro doc-write <repo-abs-path>
+                    (<plan-path> [--notes "..."] | --prompt "<text>")
+    Spawn a full-edit child claude with cwd=<repo> to update docs
+    based on the plan and the recent diff. The `--prompt "<text>"`
+    form takes inline doc instructions instead of a plan file -- only
+    when the user has explicitly asked to skip planning (rule 3).
+    Commits and pushes on the same branch.
 
   cerebro git <repo-abs-path> <git-subcmd> [args...]
     Run a read-only git command in the user's repo. Allowed subcommands:
@@ -543,20 +548,21 @@ cross-file synthesis, an analysis, or a written artefact, spawn
 
 # Shortcuts
 
-You have four execution shortcuts. Pick the smallest that fits:
+You have four execution shortcuts. Pick the smallest that fits, but
+remember rule 3: shortcuts that skip planning or review are gated on
+the user explicitly asking for them.
 
   * `cerebro plan` -> `cerebro execute`: default for feature work.
-  * `cerebro execute` direct (skip plan): when rule 3's "skip" criteria
-    apply and the change is a fresh edit (not a fix to existing PR
-    output). Pass the user's description as part of the plan-path
-    by first staging it with `cerebro note "<description>"`.
+  * `cerebro execute <repo> --prompt "<text>"` (skip plan): only
+    when the user has explicitly asked to skip the plan for a fresh
+    edit. <text> is fed to the child agent as the task to do.
   * `cerebro review` -> `cerebro apply-review`: after `execute` writes
     a PR, or any time the user asks for a re-review pass.
-  * `cerebro apply-review` direct (skip plan AND skip review): for a
-    mechanical fix-up to an open PR (merge conflict, lint
-    autofix the user already diagnosed). Materialise the
-    description with `cerebro note "<text>" --out fix-notes` and pass
-    the returned path as the findings argument.
+  * `cerebro apply-review <repo> --prompt "<text>"` (skip plan AND
+    skip review): only when the user has explicitly asked, e.g. to
+    clean up a merge conflict or apply a fix they already diagnosed
+    on an open PR. No findings file is needed; <text> is the
+    instruction.
 
 # Session paths the user can inspect
 
@@ -878,37 +884,6 @@ $desc
   echo "$out_path"
 }
 
-# ----- subcommand: cerebro note "<body>" [--out <name>] --------------------
-
-cmd_note() {
-  require_session
-  local body="${1:-}"; shift || true
-  local out_name=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --out) shift; out_name="${1:-}"; shift || true ;;
-      *) die "note: unknown arg: $1" ;;
-    esac
-  done
-  [[ -n "$body" ]] || die "usage: cerebro note \"<markdown-body>\" [--out <name>]"
-
-  local plans_dir="$CEREBRO_SESSION_DIR/plans"
-  mkdir -p "$plans_dir"
-
-  if [[ -z "$out_name" ]]; then
-    local n=1
-    while [[ -e "$plans_dir/note-$n.md" ]]; do n=$((n+1)); done
-    out_name="note-$n"
-  fi
-  out_name="${out_name%.md}"
-  local out_path="$plans_dir/$out_name.md"
-  [[ -e "$out_path" ]] && die "note: refusing to overwrite: $out_path"
-
-  printf '%s\n' "$body" > "$out_path" || die "note: write failed: $out_path"
-  log_event "note_written" "$out_path"
-  echo "$out_path"
-}
-
 # ----- subcommand: cerebro plans -------------------------------------------
 
 cmd_plans() {
@@ -935,11 +910,40 @@ cmd_execute() {
   build_timeout_cmd
 
   local repo="${1:-}"; shift || true
-  local plan_path="${1:-}"; shift || true
-  [[ -n "$repo" && -n "$plan_path" ]] || die "usage: cerebro execute <repo-abs-path> <plan-path>"
+  local plan_path=""
+  local prompt_text=""
+  # Second positional, if present and not a flag, is the plan path.
+  if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    plan_path="$1"; shift
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prompt) shift; prompt_text="${1:-}"; shift || true ;;
+      *) die "execute: unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$repo" ]] \
+    || die "usage: cerebro execute <repo-abs-path> (<plan-path> | --prompt \"<text>\")"
   [[ "$repo" = /* ]] || die "execute: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "execute: repo not a directory: $repo"
-  [[ -r "$plan_path" ]] || die "execute: cannot read plan: $plan_path"
+  if [[ -n "$plan_path" && -n "$prompt_text" ]]; then
+    die "execute: pass either <plan-path> or --prompt, not both"
+  fi
+  if [[ -z "$plan_path" && -z "$prompt_text" ]]; then
+    die "execute: requires <plan-path> or --prompt \"<text>\""
+  fi
+  if [[ -n "$plan_path" ]]; then
+    [[ -r "$plan_path" ]] || die "execute: cannot read plan: $plan_path"
+  fi
+
+  local plan_body source_desc
+  if [[ -n "$plan_path" ]]; then
+    plan_body="$(cat "$plan_path")"
+    source_desc="plan=$plan_path"
+  else
+    plan_body="$prompt_text"
+    source_desc="prompt=inline"
+  fi
 
   local child_log="$CEREBRO_SESSION_DIR/children/execute-$(ts_compact).jsonl"
 
@@ -954,8 +958,12 @@ AGENTS.md, push the branch, and open a pull request via the `gh` CLI.
 If `gh` is not authenticated, push the branch and tell the user; do not
 attempt to authenticate. Stop after the PR is open.'
 
-  say "cerebro: executing $plan_path in $repo"
-  log_event "execute_started" "plan=$plan_path repo=$repo"
+  if [[ -n "$plan_path" ]]; then
+    say "cerebro: executing $plan_path in $repo"
+  else
+    say "cerebro: executing inline prompt in $repo"
+  fi
+  log_event "execute_started" "$source_desc repo=$repo"
 
   local opts=(-p --permission-mode auto
               --allowedTools "Read Edit Write Bash Grep Glob"
@@ -986,9 +994,7 @@ attempt to authenticate. Stop after the PR is open.'
       printf 'Then read AGENTS.md (existing or just-written) and follow its branch/commit rules for the rest of this run.\n\n'
       printf '<bootstrap-agents-md>\n%s\n</bootstrap-agents-md>\n\n' "$agents_template"
       printf '<bootstrap-claude-md>\n%s\n</bootstrap-claude-md>\n\n' "$claude_template"
-      printf '<plan>\n'
-      cat "$plan_path"
-      printf '\n</plan>\n'
+      printf '<plan>\n%s\n</plan>\n' "$plan_body"
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -1157,33 +1163,56 @@ cmd_apply_review() {
   build_timeout_cmd
 
   local repo="${1:-}"; shift || true
-  local findings="${1:-}"; shift || true
+  local findings=""
+  local prompt_text=""
   local notes=""
+  if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    findings="$1"; shift
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --notes) shift; notes="${1:-}"; shift || true ;;
+      --prompt) shift; prompt_text="${1:-}"; shift || true ;;
+      --notes)  shift; notes="${1:-}";       shift || true ;;
       *) die "apply-review: unknown arg: $1" ;;
     esac
   done
-  [[ -n "$repo" && -n "$findings" ]] || die "usage: cerebro apply-review <repo-abs-path> <findings-path> [--notes \"...\"]"
+  [[ -n "$repo" ]] \
+    || die "usage: cerebro apply-review <repo-abs-path> (<findings-path> [--notes \"...\"] | --prompt \"<text>\")"
   [[ "$repo" = /* ]] || die "apply-review: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "apply-review: repo not a directory: $repo"
-  [[ -r "$findings" ]] || die "apply-review: cannot read findings: $findings"
+  if [[ -n "$findings" && -n "$prompt_text" ]]; then
+    die "apply-review: pass either <findings-path> or --prompt, not both"
+  fi
+  if [[ -z "$findings" && -z "$prompt_text" ]]; then
+    die "apply-review: requires <findings-path> or --prompt \"<text>\""
+  fi
+  if [[ -n "$prompt_text" && -n "$notes" ]]; then
+    die "apply-review: --notes is only meaningful with a findings file; bake the context into --prompt instead"
+  fi
+  if [[ -n "$findings" ]]; then
+    [[ -r "$findings" ]] || die "apply-review: cannot read findings: $findings"
+  fi
 
   local child_log="$CEREBRO_SESSION_DIR/children/apply-review-$(ts_compact).jsonl"
 
   local sys_prompt
-  sys_prompt='You are applying a code reviewer'\''s findings to a git repository.
-Read AGENTS.md at the repo root first and follow it for commit format
-and project guardrails. Do NOT modify AGENTS.md or CLAUDE.md.
-Stay on the current branch -- do not create a new one. Apply only the
-findings the orchestrator indicated should be acted on (see the notes
-block). Skip nits and style-only items unless explicitly called out.
-Run the repo'\''s test or type-check command if one is obvious. Commit
-per AGENTS.md and push so the existing PR updates in place.'
+  sys_prompt='You are doing follow-up work on the current branch of a git
+repository to update an open pull request. Read AGENTS.md at the repo
+root first and follow it for commit format and project guardrails. Do
+NOT modify AGENTS.md or CLAUDE.md. Stay on the current branch -- do
+not create a new one. Apply the work described in the prompt body
+(either reviewer findings the orchestrator scoped, or a direct fix
+instruction). Skip nits and style-only items unless explicitly called
+out. Run the repo'\''s test or type-check command if one is obvious.
+Commit per AGENTS.md and push so the existing PR updates in place.'
 
-  say "cerebro: applying review fixes in $repo"
-  log_event "apply_review_started" "findings=$findings"
+  if [[ -n "$findings" ]]; then
+    say "cerebro: applying review fixes in $repo"
+    log_event "apply_review_started" "findings=$findings"
+  else
+    say "cerebro: applying inline fix in $repo"
+    log_event "apply_review_started" "prompt=inline"
+  fi
 
   local opts=(-p --permission-mode auto
               --allowedTools "Read Edit Write Bash Grep Glob"
@@ -1193,9 +1222,13 @@ per AGENTS.md and push so the existing PR updates in place.'
 
   local rc
   ( cd "$repo" && \
-    { printf 'Apply the following review findings on the current branch. Commit and push so the existing PR updates.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<findings>\n' "$notes"
-      cat "$findings"
-      printf '\n</findings>\n'
+    { if [[ -n "$findings" ]]; then
+        printf 'Apply the following review findings on the current branch. Commit and push so the existing PR updates.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<findings>\n' "$notes"
+        cat "$findings"
+        printf '\n</findings>\n'
+      else
+        printf 'Apply the following fix on the current branch. Commit and push so the existing PR updates.\n\n<task>\n%s\n</task>\n' "$prompt_text"
+      fi
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -1216,18 +1249,44 @@ cmd_doc_write() {
   build_timeout_cmd
 
   local repo="${1:-}"; shift || true
-  local plan="${1:-}"; shift || true
+  local plan=""
+  local prompt_text=""
   local notes=""
+  if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+    plan="$1"; shift
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --notes) shift; notes="${1:-}"; shift || true ;;
+      --prompt) shift; prompt_text="${1:-}"; shift || true ;;
+      --notes)  shift; notes="${1:-}";       shift || true ;;
       *) die "doc-write: unknown arg: $1" ;;
     esac
   done
-  [[ -n "$repo" && -n "$plan" ]] || die "usage: cerebro doc-write <repo-abs-path> <plan-path> [--notes \"...\"]"
+  [[ -n "$repo" ]] \
+    || die "usage: cerebro doc-write <repo-abs-path> (<plan-path> [--notes \"...\"] | --prompt \"<text>\")"
   [[ "$repo" = /* ]] || die "doc-write: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "doc-write: repo not a directory: $repo"
-  [[ -r "$plan" ]] || die "doc-write: cannot read plan: $plan"
+  if [[ -n "$plan" && -n "$prompt_text" ]]; then
+    die "doc-write: pass either <plan-path> or --prompt, not both"
+  fi
+  if [[ -z "$plan" && -z "$prompt_text" ]]; then
+    die "doc-write: requires <plan-path> or --prompt \"<text>\""
+  fi
+  if [[ -n "$prompt_text" && -n "$notes" ]]; then
+    die "doc-write: --notes is only meaningful with a plan file; bake the context into --prompt instead"
+  fi
+  if [[ -n "$plan" ]]; then
+    [[ -r "$plan" ]] || die "doc-write: cannot read plan: $plan"
+  fi
+
+  local plan_body source_desc
+  if [[ -n "$plan" ]]; then
+    plan_body="$(cat "$plan")"
+    source_desc="plan=$plan"
+  else
+    plan_body="$prompt_text"
+    source_desc="prompt=inline"
+  fi
 
   local child_log="$CEREBRO_SESSION_DIR/children/doc-write-$(ts_compact).jsonl"
 
@@ -1242,7 +1301,7 @@ behaviour. Do not invent features the diff does not contain. Commit
 per AGENTS.md and push so the open PR updates.'
 
   say "cerebro: updating docs in $repo"
-  log_event "doc_write_started" "plan=$plan"
+  log_event "doc_write_started" "$source_desc"
 
   local opts=(-p --permission-mode auto
               --allowedTools "Read Edit Write Bash Grep Glob"
@@ -1252,9 +1311,7 @@ per AGENTS.md and push so the open PR updates.'
 
   local rc
   ( cd "$repo" && \
-    { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n' "$notes"
-      cat "$plan"
-      printf '\n</plan>\n'
+    { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n%s\n</plan>\n' "$notes" "$plan_body"
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -1729,7 +1786,6 @@ main() {
     --resume) shift; cmd_resume "${1:-}" ;;
     list) shift; cmd_list "$@" ;;
     plan) shift; cmd_plan "$@" ;;
-    note) shift; cmd_note "$@" ;;
     plans) shift; cmd_plans "$@" ;;
     execute) shift; cmd_execute "$@" ;;
     review) shift; cmd_review "$@" ;;

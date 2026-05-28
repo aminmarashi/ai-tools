@@ -383,30 +383,6 @@ gh_happy 51 "gh pr view --json with -q containing commas/parens/spaces" \
   "pr view 64 --json baseRefName,headRefName,commits -q .baseRefName, .headRefName, (.commits | length)" \
   pr view 64 --json baseRefName,headRefName,commits -q ".baseRefName, .headRefName, (.commits | length)"
 
-# --- 52. cerebro note writes to sessions/<id>/plans/ ---
-note_path="$("$CEREBRO_BIN" note 'fix: drop stray semicolon in foo.js' --out fix-foo 2>/dev/null)"
-if [[ -f "$note_path" && "$note_path" == *"plans/fix-foo.md" ]] \
-   && grep -q 'fix: drop stray semicolon' "$note_path"; then
-  printf 'PASS  52  cerebro note writes plan file\n'; pass=$((pass + 1))
-else
-  printf 'FAIL  52  cerebro note [path=%s]\n' "$note_path"
-  fail=$((fail + 1)); failures+=("52 note :: path=$note_path")
-fi
-
-# --- 53. cerebro note refuses overwrite ---
-STDERR_CONTAINS="refusing to overwrite" \
-run_case 53 "cerebro note --out fix-foo (collision)" 1 \
-  -- "$CEREBRO_BIN" note 'second body' --out fix-foo
-
-# --- 54. cerebro note auto-names without --out ---
-auto_path="$("$CEREBRO_BIN" note 'auto body' 2>/dev/null)"
-if [[ -f "$auto_path" && "$auto_path" == *"plans/note-1.md" ]]; then
-  printf 'PASS  54  cerebro note auto-names\n'; pass=$((pass + 1))
-else
-  printf 'FAIL  54  cerebro note auto-name [path=%s]\n' "$auto_path"
-  fail=$((fail + 1)); failures+=("54 note auto :: path=$auto_path")
-fi
-
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'
