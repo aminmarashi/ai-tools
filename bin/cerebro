@@ -26,9 +26,9 @@
 #   cerebro status
 #   cerebro git <repo> <git-subcmd> [args...]      # read-only git bridge
 #   cerebro gh <repo> <gh-subcmd> [args...]        # read-only gh bridge
-#   cerebro read <repo> <path> [--range N:M]       # read one file in repo
-#   cerebro grep <repo> <pattern> [opts]           # ripgrep inside repo
-#   cerebro ls <repo> [path]                       # list a dir inside repo
+#   cerebro read <repo> <path> [--range N:M] [--strict-missing]  # read one file
+#   cerebro grep <repo> <pattern> [opts] [--strict-missing]      # ripgrep in repo
+#   cerebro ls <repo> [path] [--strict-missing]                  # list a dir
 #
 # Required: claude, codex, jq, python3 on PATH. Child claudes additionally
 # need git and gh for execute / apply-review / doc-write to function.
@@ -65,6 +65,22 @@ err_path()   { printf 'cerebro: error: %s\n' "$*" >&2; exit 3; }
 err_subcmd() { printf 'cerebro: error: %s\n' "$*" >&2; exit 4; }
 err_flag()   { printf 'cerebro: error: %s\n' "$*" >&2; exit 5; }
 err_escape() { printf 'cerebro: error: %s\n' "$*" >&2; exit 6; }
+
+# Benign "target does not exist / wrong type" outcome for the read-only
+# EXPLORATION bridges (read/ls/grep). Default: print a machine-recognizable
+# marker to stdout and exit 0, so a missing probe target during a parallel
+# fan-out is a successful empty result, not a cascade-triggering failure.
+# With strict=1 (--strict-missing), restore the old behavior: stderr + exit 3.
+#   $1 = strict (0|1)   $2 = marker (stdout)   $3 = error message (stderr, strict)
+missing_target() {
+  local strict="$1" marker="$2" msg="$3"
+  if [[ "$strict" == "1" ]]; then
+    printf 'cerebro: error: %s\n' "$msg" >&2
+    exit 3
+  fi
+  printf '%s\n' "$marker"
+  exit 0
+}
 
 # True if $1 is among the remaining args.
 contains() {
@@ -143,12 +159,14 @@ PY
 }
 
 # Resolve $1 (an absolute path) for a bare-abs read/grep/ls invocation.
-# Echoes the realpathed result on stdout. Exits 3 for any reason the path
-# can't be safely read non-blockingly: must be absolute; must not resolve
-# under /dev /proc /sys (special filesystems / blocking devices); must be
-# a regular file or directory (no FIFO, socket, char/block device). The
-# in-repo escape guard in resolve_in_repo() does NOT apply -- this branch
-# deliberately reads outside any repo.
+# Echoes the realpathed result on stdout. Exit codes: 3 if not absolute
+# (internal misuse only); 6 if it resolves under /dev /proc /sys (special
+# filesystems / blocking devices) -- a security refusal callers MUST keep
+# hard; 7 for a benign missing path or wrong type (no regular file or
+# directory: FIFO, socket, char/block device) which callers may translate
+# into a successful empty result. The in-repo escape guard in
+# resolve_in_repo() does NOT apply -- this branch deliberately reads
+# outside any repo.
 resolve_bare_abs() {
   python3 - "$1" <<'PY'
 import os, stat, sys
@@ -160,16 +178,19 @@ try:
     r = os.path.realpath(p)
     st = os.stat(r)
 except OSError as e:
+    # Benign-eligible "missing" -- distinct sentinel so bridges can route
+    # only this case through missing_target (security stays hard).
     sys.stderr.write(f"cerebro: error: cannot stat {p}: {e}\n")
-    sys.exit(3)
+    sys.exit(7)
 for special in ("/dev/", "/proc/", "/sys/"):
     if r == special.rstrip("/") or r.startswith(special):
         sys.stderr.write(f"cerebro: error: refusing to read special path: {r}\n")
-        sys.exit(3)
+        sys.exit(6)
 m = st.st_mode
 if not (stat.S_ISREG(m) or stat.S_ISDIR(m)):
+    # Benign-eligible "wrong type".
     sys.stderr.write(f"cerebro: error: not a regular file or directory: {r}\n")
-    sys.exit(3)
+    sys.exit(7)
 print(r)
 PY
 }
@@ -487,8 +508,9 @@ behalf, by calling them through your Bash tool (which is restricted to
     List the plan files in the current session with timestamps.
 
   cerebro execute <repo-abs-path> (<plan-path> | --prompt "<text>")
-    Spawn a full-edit child claude with cwd=<repo>. It branches,
-    implements the work, commits, pushes, and opens a PR via gh. The
+    Spawn a full-edit child claude with cwd=<repo>. It fetches the base
+    branch, branches from the up-to-date base, implements the work,
+    commits, pushes, and opens a PR via gh. The
     default form takes a <plan-path> from `cerebro plan`; use it
     AFTER the user has read the plan and told you to proceed. The
     `--prompt "<text>"` form skips the plan file and hands <text>
@@ -591,8 +613,8 @@ behalf, by calling them through your Bash tool (which is restricted to
     "what's on the PR", "what did the CI run say", "is gh
     authenticated".
 
-  cerebro read <repo-abs-path> <path> [--range N:M]
-  cerebro read <abs-file-path> [--range N:M]
+  cerebro read <repo-abs-path> <path> [--range N:M] [--strict-missing]
+  cerebro read <abs-file-path> [--range N:M] [--strict-missing]
     Read one file. The legacy two-positional form resolves <path>
     inside <repo>; symlinks or `..` that escape the repo are rejected.
     The single-positional form accepts an absolute path: cerebro tries
@@ -602,26 +624,39 @@ behalf, by calling them through your Bash tool (which is restricted to
     or directory. --range is 1-indexed inclusive; either side may be
     blank for open-ended. Accepted forms: --range N:M | --range N-M
     (digit-only sides) | --range N..M | --range N M | --range N |
-    --range :M | --from N --to M.
+    --range :M | --from N --to M. By default a missing or wrong-type
+    in-bounds target is NOT an error: it prints `(not found: <path>)`
+    to stdout and exits 0. --strict-missing restores the old exit 3.
 
-  cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]
+  cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB] [--strict-missing]
   cerebro grep <abs-dir-path> <pattern> [...same flags...]
     Ripgrep inside a user repo, or against any absolute directory.
     Hard caps: 200 matches per file, 400 columns per line. Common
     --type aliases (rs, tsx, jsx, yml, rb, kt) are mapped to their
     canonical rg type name; unknown values pass through unchanged.
+    By default zero matches prints `(no matches)` to stdout and exits
+    0, and a missing/wrong-type search path prints `(not found: ...)`
+    and exits 0. --strict-missing restores rg-native semantics (exit 1
+    for zero matches, exit 3 for a missing path).
 
-  cerebro ls <repo-abs-path> [path]
-  cerebro ls <abs-dir-path>
+  cerebro ls <repo-abs-path> [path] [--strict-missing]
+  cerebro ls <abs-dir-path> [--strict-missing]
     List a directory inside a user repo, or any absolute directory.
     Trailing `/` marks subdirs. Bare-abs ls refuses /dev/*, /proc/*,
-    /sys/*.
+    /sys/*. By default a missing or wrong-type target prints
+    `(not found: <path>)` to stdout and exits 0; --strict-missing
+    restores the old exit 3.
 
-  Exit codes for the bridges above: 2 usage, 3 bad repo/path,
-  4 subcommand not on the allow-list, 5 denied flag,
-  6 path escapes the repo. git/gh/rg's own non-zero exits are propagated
-  as-is. Treat denied/usage failures as programmer error and adapt; do
-  not retry the same denied call.
+  Exit codes for the bridges above: 2 usage, 4 subcommand not on the
+  allow-list (git/gh), 5 denied flag (git/gh), 6 path escapes the repo
+  or refused special path (/dev /proc /sys). For read/ls/grep, a benign
+  in-bounds miss is NOT an error: the bridge prints `(not found: <path>)`
+  (or `(no matches)` for grep) to stdout and exits 0. Pass
+  --strict-missing to make a missing/wrong-type target exit 3 instead.
+  git/gh's own non-zero exits propagate as-is; rg exit >=2 (e.g. bad
+  regex) propagates, rg exit 1 (zero matches) is treated as success.
+  Treat denied/usage failures as programmer error and adapt; do not
+  retry the same denied call.
 
   cerebro recall <query>
     Search across all cerebro sessions' transcripts and child logs.
@@ -1065,7 +1100,10 @@ cmd_execute() {
   sys_prompt='You are executing an implementation plan in a git repository.
 Read AGENTS.md at the repo root first (or the bootstrap content in the
 prompt body, if AGENTS.md is missing) and follow it for branch naming,
-commit format, and project-wide guardrails. Create a new feature branch
+commit format, and project-wide guardrails. Before you branch, fetch the
+base branch from the remote (e.g. `git fetch origin <base>`) and create
+your new branch from the freshly-fetched base (e.g. `origin/main`) so you
+always work on the most up-to-date version. Create a new feature branch
 per AGENTS.md conventions. Implement the plan. Run the tests, type
 checks, or linters that the repo conventions imply. Commit per
 AGENTS.md, push the branch, and open a pull request via the `gh` CLI.
@@ -1100,7 +1138,7 @@ attempt to authenticate. Stop after the PR is open.'
 
   local rc
   ( cd "$repo" && \
-    { printf 'Execute the following plan in this repository. Branch, implement, commit, push, and open a PR via gh.\n\n'
+    { printf 'Execute the following plan in this repository. Fetch the base branch first, branch from the freshly-fetched base, implement, commit, push, and open a PR via gh.\n\n'
       printf 'Before implementing the plan, ensure the repo has AGENTS.md and CLAUDE.md at the root:\n'
       printf '  * If AGENTS.md is missing, create it from <bootstrap-agents-md> below as a SEPARATE first commit (e.g. "chore: add AGENTS.md") before doing the plan work.\n'
       printf '  * If CLAUDE.md is missing, create it from <bootstrap-claude-md> in the same first commit.\n'
@@ -1500,11 +1538,22 @@ cmd_status() {
 
 cmd_ls() {
   require_session
-  local repo="${1:-}"; shift || true
-  local path="${1:-}"; shift || true
+  local strict=0 repo="" path="" got=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --strict-missing) strict=1 ;;
+      --*) err_usage "ls: unknown arg: $1; canonical: cerebro ls <repo-abs-path> [path] | cerebro ls <abs-dir> [--strict-missing]" ;;
+      *)
+        if [[ $got -eq 0 ]]; then repo="$1"; got=1
+        elif [[ $got -eq 1 ]]; then path="$1"; got=2
+        else err_usage "ls: too many positionals: $1; canonical: cerebro ls <repo-abs-path> [path]"
+        fi ;;
+    esac
+    shift
+  done
   [[ -n "$repo" ]] || err_usage "usage: cerebro ls <repo-abs-path> [path] | cerebro ls <abs-dir>"
 
-  local target
+  local target rc
   if root="$(canonical_worktree_root "$repo" 2>/dev/null)"; then
     repo="$root"
     target="$repo"
@@ -1512,13 +1561,15 @@ cmd_ls() {
       target="$(resolve_in_repo "$repo" "$path")" || exit $?
     fi
   elif [[ "$repo" = /* && -z "$path" ]]; then
-    target="$(resolve_bare_abs "$repo")" || exit $?
+    target="$(resolve_bare_abs "$repo")" || { rc=$?; [[ $rc -eq 7 ]] && missing_target "$strict" "(not found: $repo)" "ls: not found: $repo"; exit $rc; }
+  elif [[ "$repo" != /* ]]; then
+    # Relative repo arg is a shape error, not a missing target.
+    err_usage "ls: repo path must be absolute: $repo; canonical: cerebro ls <repo-abs-path> [path] | cerebro ls <abs-dir>"
   else
-    # Re-run the worktree resolution so the user sees the canonical error.
-    canonical_worktree_root "$repo" >/dev/null
-    exit $?
+    # Absolute path that isn't a worktree: benign "nothing here".
+    missing_target "$strict" "(not found: $repo)" "ls: repo not a git worktree: $repo"
   fi
-  [[ -d "$target" ]] || err_path "ls: not a directory: ${path:-$repo}; canonical: cerebro ls <repo> [path] | cerebro ls <abs-dir>"
+  [[ -d "$target" ]] || missing_target "$strict" "(not found: ${path:-$repo})" "ls: not a directory: ${path:-$repo}"
 
   log_event "ls" "$target"
   python3 - "$target" <<'PY'
@@ -1544,9 +1595,10 @@ cmd_read() {
   if [[ $# -gt 0 && "${1:-}" != --* ]]; then
     arg2="$1"; shift
   fi
-  local range="" from="" to=""
+  local range="" from="" to="" strict=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --strict-missing) strict=1; shift ;;
       --range)
         shift
         local rv="${1:-}"
@@ -1614,7 +1666,7 @@ cmd_read() {
 
   [[ -n "$arg1" ]] || err_usage "usage: cerebro read <repo-abs-path> <path> [--range N:M] | cerebro read <abs-path> [--range N:M]"
 
-  local repo="" path="" resolved=""
+  local repo="" path="" resolved="" rc
   if [[ -n "$arg2" ]]; then
     # Two positionals supplied. Try the legacy `<repo> <path>` form first.
     if root="$(canonical_worktree_root "$arg1" 2>/dev/null)"; then
@@ -1630,12 +1682,14 @@ cmd_read() {
         resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
       else
         # Fall through to bare-abs reading the file itself.
-        resolved="$(resolve_bare_abs "$arg1")" || exit $?
+        resolved="$(resolve_bare_abs "$arg1")" || { rc=$?; [[ $rc -eq 7 ]] && missing_target "$strict" "(not found: ${path:-$arg1})" "read: not found: ${path:-$arg1}"; exit $rc; }
       fi
+    elif [[ "$arg1" != /* ]]; then
+      # Relative repo arg is a shape error, not a missing target.
+      err_usage "read: repo path must be absolute: $arg1; canonical: cerebro read <repo-abs-path> <path> | cerebro read <abs-path>"
     else
-      # Re-run worktree resolution to surface the canonical error.
-      canonical_worktree_root "$arg1" >/dev/null
-      exit $?
+      # Absolute path that isn't a worktree: benign "nothing here".
+      missing_target "$strict" "(not found: $arg1)" "read: repo not a git worktree: $arg1"
     fi
   else
     # Single positional. If it's absolute and a regular file, try repo
@@ -1647,17 +1701,17 @@ cmd_read() {
           warn "read: inferred repo=$repo from abs path"
           resolved="$(resolve_in_repo "$repo" "$path")" || exit $?
         else
-          resolved="$(resolve_bare_abs "$arg1")" || exit $?
+          resolved="$(resolve_bare_abs "$arg1")" || { rc=$?; [[ $rc -eq 7 ]] && missing_target "$strict" "(not found: ${path:-$arg1})" "read: not found: ${path:-$arg1}"; exit $rc; }
         fi
       else
-        resolved="$(resolve_bare_abs "$arg1")" || exit $?
+        resolved="$(resolve_bare_abs "$arg1")" || { rc=$?; [[ $rc -eq 7 ]] && missing_target "$strict" "(not found: ${path:-$arg1})" "read: not found: ${path:-$arg1}"; exit $rc; }
       fi
     else
       err_usage "usage: cerebro read <repo-abs-path> <path> [--range N:M] | cerebro read <abs-path> [--range N:M]"
     fi
   fi
 
-  [[ -f "$resolved" ]] || err_path "read: not a regular file: ${path:-$arg1}; canonical: cerebro read <repo> <path> | cerebro read <abs-path>"
+  [[ -f "$resolved" ]] || missing_target "$strict" "(not found: ${path:-$arg1})" "read: not a regular file: ${path:-$arg1}"
 
   log_event "read" "$resolved"
 
@@ -1691,9 +1745,10 @@ cmd_grep() {
     || err_usage "usage: cerebro grep <repo-abs-path> <pattern> [--glob G]... [--type T]... [--fixed-strings] [-i] [--path SUB]; canonical: cerebro grep <repo> <pattern> | cerebro grep <abs-dir> <pattern>"
   command -v rg >/dev/null 2>&1 || die "grep: ripgrep (rg) not installed"
 
-  local rg_args=() sub=""
+  local rg_args=() sub="" strict=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --strict-missing)   strict=1 ;;
       --glob)             shift; rg_args+=(--glob "${1:-}") ;;
       --type)
         shift
@@ -1709,7 +1764,7 @@ cmd_grep() {
     shift || true
   done
 
-  local target=""
+  local target="" rc
   if root="$(canonical_worktree_root "$repo" 2>/dev/null)"; then
     target="$root"
     repo="$root"
@@ -1717,23 +1772,36 @@ cmd_grep() {
       target="$(resolve_in_repo "$repo" "$sub")" || exit $?
     fi
   elif [[ "$repo" = /* ]]; then
-    target="$(resolve_bare_abs "$repo")" || exit $?
+    target="$(resolve_bare_abs "$repo")" || { rc=$?; [[ $rc -eq 7 ]] && missing_target "$strict" "(not found: $repo)" "grep: not found: $repo"; exit $rc; }
     if [[ -n "$sub" ]]; then
-      target="$(resolve_bare_abs "$target/$sub")" || exit $?
+      target="$(resolve_bare_abs "$target/$sub")" || { rc=$?; [[ $rc -eq 7 ]] && missing_target "$strict" "(not found: ${sub:-$repo})" "grep: not found: $sub"; exit $rc; }
     fi
   else
-    canonical_worktree_root "$repo" >/dev/null
-    exit $?
+    # Relative repo arg is a shape error, not a missing target.
+    err_usage "grep: repo path must be absolute: $repo; canonical: cerebro grep <repo-abs-path> <pattern> | cerebro grep <abs-dir> <pattern>"
   fi
+
+  # An in-repo --path sub is resolved without stat'ing, so a missing one
+  # would reach rg as exit 2; treat the benign miss here instead.
+  [[ -e "$target" ]] || missing_target "$strict" "(not found: ${sub:-$repo})" "grep: not found: ${sub:-$repo}"
 
   log_event "grep" "$target $pattern"
   # `${arr[@]+"${arr[@]}"}` is the bash-3.2-safe form: on macOS's bash,
   # expanding an empty `${arr[@]}` under `set -u` is treated as unbound
   # and aborts. The +alt expansion produces nothing when the array is
   # empty and the normal quoted expansion otherwise.
-  exec rg --no-heading --line-number --color never \
-          --max-count 200 --max-columns 400 \
-          ${rg_args[@]+"${rg_args[@]}"} -- "$pattern" "$target"
+  rg --no-heading --line-number --color never \
+     --max-count 200 --max-columns 400 \
+     ${rg_args[@]+"${rg_args[@]}"} -- "$pattern" "$target"
+  rc=$?
+  if [[ "$strict" == "1" ]]; then
+    exit "$rc"                      # native rg semantics: 1 = no matches
+  fi
+  case "$rc" in
+    0) exit 0 ;;                    # matches found
+    1) printf '(no matches)\n'; exit 0 ;;   # benign zero-match
+    *) exit "$rc" ;;                # >=2: genuine rg error (bad regex, etc.) stays hard
+  esac
 }
 
 # ----- subcommand: cerebro git <repo> <subcmd> [args...] -------------------

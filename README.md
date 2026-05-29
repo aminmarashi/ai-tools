@@ -242,6 +242,21 @@ child; `git` and `gh` are needed for those bridges, and `rg` (ripgrep)
 is recommended for `cerebro grep`. Child claudes additionally need
 `git` and `gh` for `execute` / `apply-review` / `doc-write` to function.
 
+For the read-only exploration bridges (`cerebro read`, `cerebro ls`,
+`cerebro grep`), a benign in-bounds "target not found / wrong type"
+(and, for `grep`, zero matches) is treated as a successful empty
+result rather than an error: the bridge prints a `(not found: <path>)`
+(or `(no matches)`) marker line to stdout and exits 0. This keeps a
+missing probe target during the orchestrator's parallel fan-out from
+cancelling sibling tool calls in the same batch. Pass `--strict-missing`
+to restore the old hard behavior (exit 3 for a missing/wrong-type
+target; rg-native exit 1 for zero matches). Path-escape and
+special-path refusals (`/dev`, `/proc`, `/sys`) remain hard errors
+(exit 6), and the `cerebro git` / `cerebro gh` bridges are unchanged.
+The authoritative exit-code contract lives in the embedded
+`cerebro_system_prompt()` heredoc, which regenerates
+`~/.cerebro/system-prompt.md` on next launch.
+
 Env: `CEREBRO_HOME`, `CEREBRO_MODEL`, `CEREBRO_REVIEW_MODEL`,
 `CEREBRO_TIMEOUT`, `CEREBRO_CODEX_CMD`, `CEREBRO_DEBUG`.
 

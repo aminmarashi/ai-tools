@@ -41,11 +41,13 @@ failures=()
 
 # run_case <id> <description> <expected-rc> -- <cmd...>
 # Optional: STDERR_CONTAINS=<substring> env to assert a substring of stderr.
+# Optional: STDOUT_CONTAINS=<substring> env to assert a substring of stdout.
 run_case() {
   local id="$1" desc="$2" expected="$3"
   shift 3
   [[ "$1" == "--" ]] && shift
   local needle="${STDERR_CONTAINS:-}"
+  local out_needle="${STDOUT_CONTAINS:-}"
   local out err rc
   out="$("$@" 2>"$WORKDIR/stderr")"
   rc=$?
@@ -58,6 +60,9 @@ run_case() {
   if [[ -n "$needle" && "$err" != *"$needle"* ]]; then
     note="${note:+$note; }stderr missing '$needle': $err"
   fi
+  if [[ -n "$out_needle" && "$out" != *"$out_needle"* ]]; then
+    note="${note:+$note; }stdout missing '$out_needle': $out"
+  fi
 
   if [[ -z "$note" ]]; then
     printf 'PASS  %s  %s\n' "$id" "$desc"
@@ -67,7 +72,7 @@ run_case() {
     fail=$((fail + 1))
     failures+=("$id $desc :: $note")
   fi
-  unset STDERR_CONTAINS
+  unset STDERR_CONTAINS STDOUT_CONTAINS
 }
 
 # --- 1. git happy paths ---
@@ -132,37 +137,52 @@ run_case 14 "read a.txt happy" 0 -- "$CEREBRO_BIN" read "$REPO" a.txt
 STDERR_CONTAINS="path escapes repo" \
 run_case 15 "read ../etc/passwd denied" 6 -- "$CEREBRO_BIN" read "$REPO" ../etc/passwd
 
-# --- 16. read non-file ---
-STDERR_CONTAINS="not a regular file" \
-run_case 16 "read . (directory) denied" 3 -- "$CEREBRO_BIN" read "$REPO" .
+# --- 16. read non-file: benign by default (marker + exit 0) ---
+STDOUT_CONTAINS="(not found:" \
+run_case 16 "read . (directory) benign miss" 0 -- "$CEREBRO_BIN" read "$REPO" .
 
-# --- 17. grep happy (no match -> rg returns 1; accept 0 or 1) ---
+# --- 16b. read non-file --strict-missing restores exit 3 ---
+STDERR_CONTAINS="not a regular file" \
+run_case 16b "read . (directory) --strict-missing" 3 -- "$CEREBRO_BIN" read "$REPO" . --strict-missing
+
+# --- 16c. read missing in-repo file: benign by default ---
+STDOUT_CONTAINS="(not found:" \
+run_case 16c "read no/such/file.txt benign miss" 0 -- "$CEREBRO_BIN" read "$REPO" no/such/file.txt
+
+# --- 16d. read missing in-repo file --strict-missing ---
+STDERR_CONTAINS="not a regular file" \
+run_case 16d "read no/such/file.txt --strict-missing" 3 -- "$CEREBRO_BIN" read "$REPO" no/such/file.txt --strict-missing
+
+# --- 17. grep zero matches: benign by default ('(no matches)' + exit 0) ---
 if command -v rg >/dev/null 2>&1; then
-  "$CEREBRO_BIN" grep "$REPO" 'something' >/dev/null 2>&1
-  rc=$?
-  if [[ $rc -eq 0 || $rc -eq 1 ]]; then
-    printf 'PASS  17  grep happy (rc=%d)\n' "$rc"
-    pass=$((pass + 1))
-  else
-    printf 'FAIL  17  grep happy [rc=%d expected 0 or 1]\n' "$rc"
-    fail=$((fail + 1))
-    failures+=("17 grep happy :: rc=$rc")
-  fi
+  STDOUT_CONTAINS="(no matches)" \
+  run_case 17 "grep zero-match benign" 0 -- "$CEREBRO_BIN" grep "$REPO" 'something'
 else
-  printf 'SKIP  17  grep happy (rg not installed)\n'
+  printf 'SKIP  17  grep zero-match (rg not installed)\n'
 fi
 
 # --- 17b. grep with NO flag args (regression for nounset + empty rg_args) ---
 if command -v rg >/dev/null 2>&1; then
-  "$CEREBRO_BIN" grep "$REPO" 'no-such-literal' >/dev/null 2>&1
+  STDOUT_CONTAINS="(no matches)" \
+  run_case 17b "grep no-flag-args zero-match benign" 0 -- "$CEREBRO_BIN" grep "$REPO" 'no-such-literal'
+fi
+
+# --- 17c. grep zero matches --strict-missing restores rg-native exit 1 ---
+if command -v rg >/dev/null 2>&1; then
+  run_case 17c "grep zero-match --strict-missing (rg exit 1)" 1 -- "$CEREBRO_BIN" grep "$REPO" 'something' --strict-missing
+fi
+
+# --- 17d. grep bad regex: genuine rg error stays hard (rc >= 2) ---
+if command -v rg >/dev/null 2>&1; then
+  "$CEREBRO_BIN" grep "$REPO" '(' >/dev/null 2>&1
   rc=$?
-  if [[ $rc -eq 0 || $rc -eq 1 ]]; then
-    printf 'PASS  17b  grep no-flag-args (rc=%d)\n' "$rc"
+  if [[ $rc -ge 2 ]]; then
+    printf 'PASS  17d  grep bad-regex stays hard (rc=%d)\n' "$rc"
     pass=$((pass + 1))
   else
-    printf 'FAIL  17b  grep no-flag-args [rc=%d expected 0 or 1]\n' "$rc"
+    printf 'FAIL  17d  grep bad-regex [rc=%d expected >=2]\n' "$rc"
     fail=$((fail + 1))
-    failures+=("17b grep no-flag-args :: rc=$rc")
+    failures+=("17d grep bad-regex :: rc=$rc")
   fi
 fi
 
@@ -186,13 +206,33 @@ fi
 STDERR_CONTAINS="path escapes repo" \
 run_case 20 "ls ../.. escape denied" 6 -- "$CEREBRO_BIN" ls "$REPO" ../..
 
+# --- 20b. ls missing in-repo dir: benign by default ---
+STDOUT_CONTAINS="(not found:" \
+run_case 20b "ls no/such/dir benign miss" 0 -- "$CEREBRO_BIN" ls "$REPO" no/such/dir
+
+# --- 20c. ls missing in-repo dir --strict-missing ---
+STDERR_CONTAINS="not a directory" \
+run_case 20c "ls no/such/dir --strict-missing" 3 -- "$CEREBRO_BIN" ls "$REPO" no/such/dir --strict-missing
+
+# --- 20d. ls bare-abs missing path: benign by default (exit-7 routing) ---
+STDOUT_CONTAINS="(not found:" \
+run_case 20d "ls bare-abs missing benign" 0 -- "$CEREBRO_BIN" ls "$WORKDIR/does-not-exist"
+
+# --- 20e. ls bare-abs missing path --strict-missing ---
+STDERR_CONTAINS="not found" \
+run_case 20e "ls bare-abs missing --strict-missing" 3 -- "$CEREBRO_BIN" ls "$WORKDIR/does-not-exist" --strict-missing
+
 # --- 21. unknown top-level subcommand ---
 STDERR_CONTAINS="unknown subcommand" \
 run_case 21 "cerebro doesnotexist" 1 -- "$CEREBRO_BIN" doesnotexist
 
-# --- 22. read outside repo refused (not a git worktree) ---
+# --- 22. read outside repo (not a git worktree): benign by default ---
+STDOUT_CONTAINS="(not found:" \
+run_case 22 "read /etc passwd (not a worktree) benign" 0 -- "$CEREBRO_BIN" read /etc passwd
+
+# --- 22b. read /etc passwd --strict-missing restores exit 3 ---
 STDERR_CONTAINS="not a git worktree" \
-run_case 22 "read /etc passwd (not a worktree)" 3 -- "$CEREBRO_BIN" read /etc passwd
+run_case 22b "read /etc passwd --strict-missing" 3 -- "$CEREBRO_BIN" read /etc passwd --strict-missing
 
 # --- 23. grep bare-abs: pattern required (no worktree, but pattern missing) ---
 STDERR_CONTAINS="usage" \
@@ -634,17 +674,21 @@ fi
 # --- 85. read bare-abs file with --range ---
 run_case 85 "read bare-abs --range" 0 -- "$CEREBRO_BIN" read "$WORKDIR/outside.txt" --range 1:1
 
-# --- 86. read bare-abs special path denied ---
+# --- 86. read bare-abs special path: security refusal stays hard (exit 6) ---
 STDERR_CONTAINS="special path" \
-run_case 86 "read /dev/null denied" 3 -- "$CEREBRO_BIN" read /dev/null
+run_case 86 "read /dev/null denied (security)" 6 -- "$CEREBRO_BIN" read /dev/null
 
-# --- 87. read bare-abs another special path denied ---
+# --- 87. read bare-abs another special path: security refusal stays hard ---
 STDERR_CONTAINS="special path" \
-run_case 87 "read /dev/tty denied (under /dev/)" 3 -- "$CEREBRO_BIN" read /dev/tty
+run_case 87 "read /dev/tty denied (under /dev/)" 6 -- "$CEREBRO_BIN" read /dev/tty
 
-# --- 88. read bare-abs nonexistent ---
-STDERR_CONTAINS="cannot stat" \
-run_case 88 "read nonexistent bare-abs" 3 -- "$CEREBRO_BIN" read /no/such/path/xyz
+# --- 88. read bare-abs nonexistent: benign by default (exit-7 routing) ---
+STDOUT_CONTAINS="(not found:" \
+run_case 88 "read nonexistent bare-abs benign" 0 -- "$CEREBRO_BIN" read /no/such/path/xyz
+
+# --- 88b. read bare-abs nonexistent --strict-missing restores exit 3 ---
+STDERR_CONTAINS="not found" \
+run_case 88b "read nonexistent bare-abs --strict-missing" 3 -- "$CEREBRO_BIN" read /no/such/path/xyz --strict-missing
 
 # --- 89. grep bare-abs happy (sandbox dir) ---
 if command -v rg >/dev/null 2>&1; then
@@ -678,9 +722,9 @@ else
   failures+=("91 ls bare-abs :: rc=$rc out=$out")
 fi
 
-# --- 92. ls bare-abs special path denied ---
+# --- 92. ls bare-abs special path: security refusal stays hard (exit 6) ---
 STDERR_CONTAINS="special path" \
-run_case 92 "ls /dev denied" 3 -- "$CEREBRO_BIN" ls /dev
+run_case 92 "ls /dev denied (security)" 6 -- "$CEREBRO_BIN" ls /dev
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
