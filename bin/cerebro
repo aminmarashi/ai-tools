@@ -134,6 +134,16 @@ canonical_worktree_root() {
   printf '%s\n' "$root"
 }
 
+# Echo the per-repo state key (sha1 of canonical worktree root, 16 hex).
+# Returns non-zero (and prints nothing) when $1 is not a git worktree, so
+# callers can treat a non-repo argument as "no key".
+repo_state_key() {
+  local canonical
+  canonical="$(git --no-optional-locks -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [[ -n "$canonical" ]] || return 1
+  python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])' "$canonical"
+}
+
 # Walk upward from an absolute path looking for an enclosing git worktree
 # (a directory containing a `.git` file or directory). Echoes the worktree
 # root on stdout if found; returns non-zero (and prints nothing) otherwise.
@@ -231,8 +241,9 @@ Notes:
   * Interactive-only. cerebro refuses to run under a non-terminal parent
     (pipes, scripts, cron). Sub-agents launched by the orchestrator are
     exempt via $CEREBRO_SESSION_ID.
-  * No concurrency control. Multiple sessions against the same repo are
-    allowed; sequence your own mutating work.
+  * Concurrency. cerebro has no concurrency control: it will not stop
+    you from running two mutating ops against the same repo at once,
+    within or across sessions. Sequence your own mutating work.
   * No chat/PR/repo-specific flags are ever passed to `claude` or
     `codex`. The orchestrator addresses repos by absolute path as the
     first positional arg to its sub-agent tools.
@@ -298,6 +309,17 @@ mint_uuid() {
 
 ts_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 ts_compact() { date -u +%Y%m%dT%H%M%SZ; }
+
+# Build a collision-resistant child-log path under the session's children/
+# dir. We allow concurrent mutating runs (no per-repo lock), so two
+# same-session invocations can start within the same second; a bare
+# <subcmd>-<ts> name would let them share one file and produce truncated or
+# interleaved logs. Keep the human-readable <subcmd>-<ts> prefix but append
+# the PID plus a random token so each invocation gets a distinct file.
+child_log_path() {
+  local subcmd="$1"
+  printf '%s\n' "$CEREBRO_SESSION_DIR/children/${subcmd}-$(ts_compact)-$$-${RANDOM}.jsonl"
+}
 
 # Append a structured event to the active session's transcript.
 log_event() {
@@ -495,6 +517,25 @@ behalf, by calling them through your Bash tool (which is restricted to
    an enforced read-only allow-list -- they are guaranteed non-mutating.
    Only spawn a planning sub-agent (`cerebro plan`) when you need
    synthesis across many files, not for individual lookups.
+7. NEVER pass a findings path or --notes to `cerebro apply-review`
+   that you have not just READ in THIS turn. The findings path is
+   ONLY ever the exact path echoed on stdout by the most recent
+   `cerebro review` (also shown by `cerebro status` as "last
+   review"). Do NOT reconstruct `codex-<timestamp>.md` filenames
+   from memory -- you will guess wrong and read a nonexistent file.
+   --notes MUST quote the specific findings from the file you just
+   read; never write notes from an assumption about what the review
+   probably found. If you have not yet read the findings file this
+   turn, READ it before you call apply-review. (As a backstop,
+   `cerebro apply-review` invoked with no findings path and no
+   --prompt defaults to the last review's findings for this
+   repo+branch -- but you should still read it before applying.)
+8. Run exactly ONE mutating subcommand (`execute`, `apply-review`,
+   or `doc-write`) per repo at a time, and NEVER launch the same
+   review/execute/apply-review both in the background and the
+   foreground. Wait for the prior mutating run to finish -- watch
+   for its task notification / completion -- before starting the
+   next one. cerebro does not enforce this; sequence your own work.
 
 # Available sub-commands
 
@@ -543,7 +584,12 @@ behalf, by calling them through your Bash tool (which is restricted to
     files the plan didn't touch, broader tech-debt suggestions) must
     be NAMED to the user in your chat summary but NOT forwarded as
     --notes. If a finding's relevance to the original task is
-    ambiguous, ASK the user before acting on it. The `--prompt
+    ambiguous, ASK the user before acting on it.
+    The <findings-path> is ALWAYS the path echoed by your most
+    recent `cerebro review` -- never a name you reconstruct. If you
+    omit it (and don't pass --prompt), apply-review uses the last
+    review's findings for this repo+branch automatically.
+    The `--prompt
     "<text>"` form skips the findings file and hands <text> straight
     to the child as the fix instruction -- use it only when the user
     has explicitly asked to skip review (see rule 3), e.g. for a
@@ -676,18 +722,23 @@ For a single feature:
      to the user; ask them to read it.
   3. Wait for the user to say "go" / "execute it" / etc.
   4. `cerebro execute <repo> <plan-path>`. Narrate progress briefly.
-  5. `cerebro review <repo>`. Read the findings. Bucket them: (a)
-     clearly within the plan's scope -- act on; (b) clearly out of
-     scope (refactors / nits in untouched files / broader tech debt)
-     -- name to the user, do NOT forward; (c) ambiguous -- ASK the
-     user before deciding. Summarise the buckets and your reasoning.
-  6. If any in-scope findings warrant action: `cerebro apply-review
-     <repo> <findings> --notes "..."` containing only the in-scope
-     items. Then call `cerebro review <repo>` again WITHOUT --base --
-     it will automatically diff against the previously-reviewed
-     commit so codex only sees what you just changed. Loop until
-     codex is quiet or the remaining findings are deliberate
-     non-issues.
+  5. `cerebro review <repo>`. Follow this order, every time:
+       a. Run the review. CAPTURE the findings path it echoes on
+          stdout -- that exact string, not a name you compose.
+       b. READ that exact file with your Read tool.
+       c. Bucket the findings you just read: (i) clearly in the
+          plan's scope -- act on; (ii) clearly out of scope
+          (refactors / nits in untouched files / broader tech
+          debt) -- name to the user, do NOT forward; (iii)
+          ambiguous -- ASK the user. Summarise the buckets.
+  6. Only THEN, if in-scope findings warrant action: `cerebro
+     apply-review <repo> <findings-path> --notes "..."` where
+     <findings-path> is the path from step 5a and --notes quotes
+     the in-scope items from the file you read in step 5b. Do not
+     run apply-review and review at the same time, and do not start
+     a second apply-review until the first finishes. Then re-run
+     `cerebro review <repo>` WITHOUT --base (it auto-diffs against
+     the previously-reviewed commit) and loop until codex is quiet.
   7. Optionally `cerebro doc-write <repo> <plan>` to update docs.
 
 When deciding between a bridge and a planning child: if the answer fits
@@ -1094,7 +1145,7 @@ cmd_execute() {
     source_desc="prompt=inline"
   fi
 
-  local child_log="$CEREBRO_SESSION_DIR/children/execute-$(ts_compact).jsonl"
+  local child_log; child_log="$(child_log_path execute)"
 
   local sys_prompt
   sys_prompt='You are executing an implementation plan in a git repository.
@@ -1188,7 +1239,8 @@ cmd_review() {
   canonical_repo="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" \
     || die "review: not a git worktree: $repo"
   local repo_key
-  repo_key="$(python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:16])' "$canonical_repo")"
+  repo_key="$(repo_state_key "$repo")" \
+    || die "review: not a git worktree: $repo"
   local state_dir="$CEREBRO_SESSION_DIR/review-state"
   local state_file="$state_dir/$repo_key.json"
 
@@ -1300,7 +1352,8 @@ cmd_review() {
     mkdir -p "$state_dir"
     jq -n --arg repo "$canonical_repo" --arg branch "$current_branch" \
           --arg sha "$current_sha" --arg ts "$(ts_iso)" \
-          '{repo:$repo, branch:$branch, last_reviewed_sha:$sha, ts:$ts}' \
+          --arg findings "$out_path" \
+          '{repo:$repo, branch:$branch, last_reviewed_sha:$sha, last_findings:$findings, ts:$ts}' \
           > "$state_file" 2>/dev/null || true
   fi
 
@@ -1318,20 +1371,53 @@ cmd_apply_review() {
   local findings=""
   local prompt_text=""
   local notes=""
+  local saw_prompt=0
   if [[ $# -gt 0 && "${1:-}" != --* ]]; then
     findings="$1"; shift
   fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --prompt) shift; prompt_text="${1:-}"; shift || true ;;
-      --notes)  shift; notes="${1:-}";       shift || true ;;
+      --prompt) saw_prompt=1; shift; prompt_text="${1:-}"; shift || true ;;
+      --notes)  shift; notes="${1:-}";                     shift || true ;;
       *) die "apply-review: unknown arg: $1" ;;
     esac
   done
+  # An explicitly-passed --prompt must carry a non-empty operand. Without
+  # this guard, `--prompt` with no value (or `--prompt ""`) leaves
+  # prompt_text empty and would slip into the default-findings fallback
+  # below, silently running a mutating apply-review the caller never asked
+  # for. Treat it as a usage error instead.
+  if (( saw_prompt )) && [[ -z "$prompt_text" ]]; then
+    die "apply-review: --prompt requires a non-empty value"
+  fi
   [[ -n "$repo" ]] \
     || die "usage: cerebro apply-review <repo-abs-path> (<findings-path> [--notes \"...\"] | --prompt \"<text>\")"
   [[ "$repo" = /* ]] || die "apply-review: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "apply-review: repo not a directory: $repo"
+
+  # Default findings: when neither a findings path nor --prompt is given,
+  # fall back to the last review's findings for this repo+branch so the
+  # orchestrator cannot pass a guessed/stale name. Gate on saw_prompt too:
+  # a genuinely-omitted --prompt may default, an explicitly-passed one
+  # (already validated non-empty above) never silently falls back.
+  if [[ -z "$findings" && -z "$prompt_text" ]] && (( ! saw_prompt )); then
+    local rk sf
+    rk="$(repo_state_key "$repo" 2>/dev/null)" || true
+    sf="$CEREBRO_SESSION_DIR/review-state/$rk.json"
+    local cur_branch
+    cur_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if [[ -n "$rk" && -r "$sf" ]]; then
+      local lf lb
+      lf="$(jq -r '.last_findings // empty' "$sf" 2>/dev/null)"
+      lb="$(jq -r '.branch // empty'        "$sf" 2>/dev/null)"
+      if [[ -n "$lf" && "$lb" == "$cur_branch" && -s "$lf" ]]; then
+        findings="$lf"
+        say "cerebro: apply-review defaulting to last review findings: $findings"
+      fi
+    fi
+    [[ -n "$findings" ]] || die "apply-review: no findings path given and no prior review for this repo+branch in this session; run 'cerebro review $repo' first, or pass --prompt \"<text>\""
+  fi
+
   if [[ -n "$findings" && -n "$prompt_text" ]]; then
     die "apply-review: pass either <findings-path> or --prompt, not both"
   fi
@@ -1342,10 +1428,35 @@ cmd_apply_review() {
     die "apply-review: --notes is only meaningful with a findings file; bake the context into --prompt instead"
   fi
   if [[ -n "$findings" ]]; then
-    [[ -r "$findings" ]] || die "apply-review: cannot read findings: $findings"
+    # Existence + staleness check. die (exit 1) on a bad path, naming the
+    # correct last-review path when we know it; warn (non-fatal) when the
+    # caller passed a valid-but-older findings file.
+    local rk sf lf="" lb="" cur_branch
+    rk="$(repo_state_key "$repo" 2>/dev/null)" || true
+    sf="$CEREBRO_SESSION_DIR/review-state/$rk.json"
+    cur_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    # Only treat .last_findings as "latest for this repo+branch" when the
+    # stored branch matches the current branch -- same guard as the
+    # default-findings path. Otherwise a post-branch-switch state file would
+    # name another branch's findings as this branch's latest.
+    if [[ -n "$rk" && -r "$sf" ]]; then
+      lb="$(jq -r '.branch // empty' "$sf" 2>/dev/null)"
+      if [[ -n "$lb" && "$lb" == "$cur_branch" ]]; then
+        lf="$(jq -r '.last_findings // empty' "$sf" 2>/dev/null)"
+      fi
+    fi
+    if [[ ! -r "$findings" || ! -s "$findings" ]]; then
+      if [[ -n "$lf" && -s "$lf" ]]; then
+        die "apply-review: findings not readable/empty: $findings (the last review for this repo+branch is: $lf)"
+      fi
+      die "apply-review: findings not readable/empty: $findings"
+    fi
+    if [[ -n "$lf" && "$lf" != "$findings" ]]; then
+      warn "apply-review: '$findings' is not the latest review for this repo+branch (latest: $lf)"
+    fi
   fi
 
-  local child_log="$CEREBRO_SESSION_DIR/children/apply-review-$(ts_compact).jsonl"
+  local child_log; child_log="$(child_log_path apply-review)"
 
   local sys_prompt
   sys_prompt='You are doing follow-up work on the current branch of a git
@@ -1440,7 +1551,7 @@ cmd_doc_write() {
     source_desc="prompt=inline"
   fi
 
-  local child_log="$CEREBRO_SESSION_DIR/children/doc-write-$(ts_compact).jsonl"
+  local child_log; child_log="$(child_log_path doc-write)"
 
   local sys_prompt
   sys_prompt='You are updating the user-facing documentation in a git repository

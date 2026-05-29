@@ -726,6 +726,197 @@ fi
 STDERR_CONTAINS="special path" \
 run_case 92 "ls /dev denied (security)" 6 -- "$CEREBRO_BIN" ls /dev
 
+# ========================================================================
+# apply-review default-findings and staleness validation.
+# These validation paths fire BEFORE any child claude spawn, so the
+# error cases need no claude. The happy cases install a `claude` PATH stub
+# (mirroring the gh stub above) that consumes stdin and emits one success
+# stream-json event, so apply-review completes.
+# ========================================================================
+
+SESS_DIR="$CEREBRO_HOME/sessions/$CEREBRO_SESSION_ID"
+RSTATE="$SESS_DIR/review-state"
+CHILDREN="$SESS_DIR/children"
+# Per-repo key the same way cerebro computes it: sha1 of the canonical
+# worktree root, first 16 hex.
+RKEY="$(git -C "$REPO" rev-parse --show-toplevel \
+        | python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.stdin.read().strip().encode()).hexdigest()[:16])')"
+BRANCH="$(git -C "$REPO" rev-parse --abbrev-ref HEAD)"
+
+# claude stub: read the piped prompt, emit one success result event, exit 0.
+CLAUDE_STUB_DIR="$WORKDIR/claude-stub"
+mkdir -p "$CLAUDE_STUB_DIR"
+cat > "$CLAUDE_STUB_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exit 0
+EOF
+chmod +x "$CLAUDE_STUB_DIR/claude"
+STUB_OK=0; [[ -x "$CLAUDE_STUB_DIR/claude" ]] && STUB_OK=1
+STUB_PATH="$CLAUDE_STUB_DIR:$PATH"
+
+seed_review_state() {  # $1 = last_findings path
+  mkdir -p "$RSTATE"
+  jq -n --arg repo "$(git -C "$REPO" rev-parse --show-toplevel)" \
+        --arg branch "$BRANCH" --arg sha "$(git -C "$REPO" rev-parse HEAD)" \
+        --arg findings "$1" --arg ts "2026-01-01T00:00:00Z" \
+        '{repo:$repo, branch:$branch, last_reviewed_sha:$sha, last_findings:$findings, ts:$ts}' \
+        > "$RSTATE/$RKEY.json"
+}
+
+# --- 93. apply-review with no findings defaults to last review's findings ---
+if (( STUB_OK )); then
+  printf 'review findings here\n' > "$CHILDREN/codex-TEST.md"
+  seed_review_state "$CHILDREN/codex-TEST.md"
+  STDERR_CONTAINS="defaulting to last review findings" \
+  run_case 93 "apply-review defaults to last review findings" 0 -- \
+    env PATH="$STUB_PATH" "$CEREBRO_BIN" apply-review "$REPO"
+else
+  printf 'SKIP  93  apply-review default findings (claude stub unavailable)\n'
+fi
+
+# --- 94. apply-review, no findings + no prior review -> clear error ---
+rm -f "$RSTATE/$RKEY.json"
+STDERR_CONTAINS="no prior review for this repo+branch" \
+run_case 94 "apply-review no findings, no prior review errors" 1 -- \
+  "$CEREBRO_BIN" apply-review "$REPO"
+
+# --- 95. nonexistent explicit findings names the correct last-review path ---
+seed_review_state "$CHILDREN/codex-TEST.md"
+STDERR_CONTAINS="the last review for this repo+branch is:" \
+run_case 95 "apply-review bad explicit findings names latest" 1 -- \
+  "$CEREBRO_BIN" apply-review "$REPO" /no/such/findings.md
+
+# --- 96. stale (older) findings warns non-fatally but still applies ---
+if (( STUB_OK )); then
+  printf 'older findings\n' > "$WORKDIR/older.md"
+  seed_review_state "$CHILDREN/codex-TEST.md"   # newest != older.md
+  STDERR_CONTAINS="not the latest review" \
+  run_case 96 "apply-review stale findings warns, applies" 0 -- \
+    env PATH="$STUB_PATH" "$CEREBRO_BIN" apply-review "$REPO" "$WORKDIR/older.md"
+else
+  printf 'SKIP  96  apply-review stale findings (claude stub unavailable)\n'
+fi
+
+# --- 99. regression: --notes with --prompt still rejected ---
+STDERR_CONTAINS="only meaningful with a findings file" \
+run_case 99 "apply-review --notes + --prompt still errors" 1 -- \
+  "$CEREBRO_BIN" apply-review "$REPO" --prompt "x" --notes "y"
+
+# --- 100. --prompt with NO operand is a usage error, never a findings fallback.
+# Seed a valid last review so a buggy fallback WOULD succeed; the guard must
+# still reject the empty --prompt rather than silently apply those findings.
+printf 'seeded findings\n' > "$CHILDREN/codex-TEST.md"
+seed_review_state "$CHILDREN/codex-TEST.md"
+STDERR_CONTAINS="--prompt requires a non-empty value" \
+run_case 100 "apply-review --prompt (no value) errors, no findings fallback" 1 -- \
+  "$CEREBRO_BIN" apply-review "$REPO" --prompt
+
+# --- 100b. --prompt "" (explicit empty operand) is likewise a usage error. ---
+seed_review_state "$CHILDREN/codex-TEST.md"
+STDERR_CONTAINS="--prompt requires a non-empty value" \
+run_case 100b "apply-review --prompt '' errors, no findings fallback" 1 -- \
+  "$CEREBRO_BIN" apply-review "$REPO" --prompt ""
+
+# --- 102. explicit-findings staleness check must NOT cross branches. ---
+# Seed review state on the current branch naming codex-TEST.md, then switch
+# to a new branch and apply a DIFFERENT (older) findings file. The stored
+# state belongs to the other branch, so cerebro must not name codex-TEST.md
+# as "latest for this repo+branch".
+if (( STUB_OK )); then
+  printf 'older findings\n' > "$WORKDIR/older2.md"
+  seed_review_state "$CHILDREN/codex-TEST.md"   # state recorded for $BRANCH
+  git -C "$REPO" checkout -q -b other-branch
+  out="$(env PATH="$STUB_PATH" "$CEREBRO_BIN" apply-review "$REPO" "$WORKDIR/older2.md" 2>"$WORKDIR/stderr")"
+  rc=$?
+  err="$(cat "$WORKDIR/stderr")"
+  git -C "$REPO" checkout -q "$BRANCH"
+  if [[ $rc -eq 0 && "$err" != *"not the latest review"* && "$err" != *"codex-TEST.md"* ]]; then
+    printf 'PASS  102  staleness naming does not cross branches\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  102  staleness check crossed branches [rc=%d err=%s]\n' "$rc" "$err"
+    fail=$((fail + 1))
+    failures+=("102 branch-cross staleness :: rc=$rc err=$err")
+  fi
+else
+  printf 'SKIP  102  apply-review branch-switch staleness (claude stub unavailable)\n'
+fi
+
+# ========================================================================
+# 103. Concurrent mutating runs must write to DISTINCT child-log files.
+# After dropping the per-repo lock, two same-session mutating ops can start
+# within the same second. A bare <subcmd>-<ts> child-log name would let both
+# tee into ONE file -> truncated/interleaved logs and an ambiguous echoed
+# path. The child-log name is now collision-resistant (PID + random token),
+# so each run gets its own file. We launch two apply-review ops concurrently
+# (a stub that sleeps to force overlapping writes, tagging each emitted line
+# with a per-run token), then assert the two echoed paths differ and that
+# neither log shows the other run's token (no interleave/truncation).
+# ========================================================================
+if (( STUB_OK )); then
+  CONC_STUB_DIR="$WORKDIR/conc-stub"
+  mkdir -p "$CONC_STUB_DIR"
+  cat > "$CONC_STUB_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+# Echo back the per-run token carried in the prompt, many times over, so a
+# shared child log would visibly interleave the two runs' output.
+body="$(cat)"
+tok="$(printf '%s\n' "$body" | grep -o 'TOKEN=[A-Z]*' | head -1)"
+tok="${tok#TOKEN=}"
+sleep 0.4   # widen the window so both runs write concurrently
+for i in $(seq 1 300); do
+  printf '{"type":"assistant","tok":"%s","i":%d}\n' "$tok" "$i"
+done
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exit 0
+EOF
+  chmod +x "$CONC_STUB_DIR/claude"
+  CONC_PATH="$CONC_STUB_DIR:$PATH"
+
+  env PATH="$CONC_PATH" "$CEREBRO_BIN" apply-review "$REPO" \
+    --prompt "do work TOKEN=AAAA" >"$WORKDIR/conc1.out" 2>/dev/null &
+  c1=$!
+  env PATH="$CONC_PATH" "$CEREBRO_BIN" apply-review "$REPO" \
+    --prompt "do work TOKEN=BBBB" >"$WORKDIR/conc2.out" 2>/dev/null &
+  c2=$!
+  wait "$c1"; r1=$?
+  wait "$c2"; r2=$?
+
+  # The echoed child-log path is the final stdout line of each run.
+  clog1="$(tail -1 "$WORKDIR/conc1.out")"
+  clog2="$(tail -1 "$WORKDIR/conc2.out")"
+
+  conc_ok=1; conc_why=""
+  if (( r1 != 0 || r2 != 0 )); then
+    conc_ok=0; conc_why="nonzero rc (r1=$r1 r2=$r2)"
+  fi
+  if [[ -z "$clog1" || -z "$clog2" || "$clog1" == "$clog2" ]]; then
+    conc_ok=0; conc_why="${conc_why:+$conc_why; }child logs not distinct: '$clog1' vs '$clog2'"
+  fi
+  if [[ ! -f "$clog1" || ! -f "$clog2" ]]; then
+    conc_ok=0; conc_why="${conc_why:+$conc_why; }child log file(s) missing"
+  else
+    a1="$(grep -c 'AAAA' "$clog1")"; b1="$(grep -c 'BBBB' "$clog1")"
+    a2="$(grep -c 'AAAA' "$clog2")"; b2="$(grep -c 'BBBB' "$clog2")"
+    if (( a1 != 300 || b1 != 0 || b2 != 300 || a2 != 0 )); then
+      conc_ok=0
+      conc_why="${conc_why:+$conc_why; }interleave/truncation (A1=$a1 B1=$b1 A2=$a2 B2=$b2)"
+    fi
+  fi
+
+  if (( conc_ok )); then
+    printf 'PASS  103  concurrent mutating runs use distinct child logs\n'
+    pass=$((pass + 1))
+  else
+    printf 'FAIL  103  concurrent mutating runs collided [%s]\n' "$conc_why"
+    fail=$((fail + 1))
+    failures+=("103 concurrent child-log collision :: $conc_why")
+  fi
+else
+  printf 'SKIP  103  concurrent child-log distinctness (claude stub unavailable)\n'
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'

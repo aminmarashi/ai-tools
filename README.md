@@ -187,6 +187,10 @@ review`, the orchestrator forwards only findings clearly within the
 plan's scope to `cerebro apply-review`. Out-of-scope improvements
 (unrelated refactors, nits in untouched files) are named to you but
 not acted on; ambiguous findings prompt a clarifying question first.
+`cerebro apply-review` with no findings path (and no `--prompt`)
+defaults to the last review's findings file for the current
+repo+branch; an explicit path that doesn't exist is rejected with the
+correct last-review path named.
 
 **Incremental re-reviews.** After an `apply-review`, the next
 `cerebro review` defaults to diffing against the SHA that was HEAD at
@@ -199,9 +203,10 @@ wider review.
 parent (pipes, scripts, cron). Sub-agents are exempt via the
 `CEREBRO_SESSION_ID` environment variable that the orchestrator inherits.
 
-**No concurrency control.** Multiple sessions against the same repo
-are allowed; sequence your own mutating work — this is a power tool,
-not a guard rail.
+**Concurrency.** cerebro has no concurrency control. It will not stop
+you from running two mutating subcommands (`execute`, `apply-review`,
+`doc-write`) against the same repo at the same time, whether within a
+single session or across sessions — sequence your own mutating work.
 
 **No chat/PR/repo-specific flags are ever passed to `claude` or
 `codex`.** The orchestrator addresses repos by absolute path as the
@@ -224,7 +229,7 @@ Session state lives under `$CEREBRO_HOME` (default `~/.cerebro/`):
     transcript.jsonl                 # user prompts + cerebro milestone events
     plans/                           # plan markdown files
     children/                        # stream-json logs of every sub-agent
-    review-state/                    # per-repo last-reviewed SHA, for incremental re-review
+    review-state/                    # per-repo last-reviewed SHA + last findings path
 ```
 
 The `UserPromptSubmit` hook routes each user message to the matching
