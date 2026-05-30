@@ -1306,7 +1306,11 @@ cmd_review() {
   merge_base="$(git -C "$repo" merge-base HEAD "$base_ref" 2>/dev/null)" \
     || die "review: failed to determine merge base against '$base_ref'"
 
-  local out_path="$CEREBRO_SESSION_DIR/children/codex-$(ts_compact).md"
+  # Uniquify the findings filename like child_log_path does. ts_compact() is
+  # second-resolution, so two parallel reviews started in the same second
+  # would otherwise clobber each other's findings. Append the repo basename
+  # (human-readable) plus PID and a random token for collision resistance.
+  local out_path="$CEREBRO_SESSION_DIR/children/codex-$(ts_compact)-$(basename "$repo")-$$-${RANDOM}.md"
   local err_path="${out_path%.md}.err"
 
   say "cerebro: reviewing $repo against $base_description (merge-base $merge_base)"
