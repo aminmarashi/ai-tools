@@ -1169,7 +1169,7 @@ attempt to authenticate. Stop after the PR is open.'
   log_event "execute_started" "$source_desc repo=$repo"
 
   local opts=(-p --permission-mode auto
-              --allowedTools "Read Edit Write Bash Grep Glob"
+              --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
@@ -1478,7 +1478,7 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
   fi
 
   local opts=(-p --permission-mode auto
-              --allowedTools "Read Edit Write Bash Grep Glob"
+              --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
@@ -1567,7 +1567,7 @@ per AGENTS.md and push so the open PR updates.'
   log_event "doc_write_started" "$source_desc"
 
   local opts=(-p --permission-mode auto
-              --allowedTools "Read Edit Write Bash Grep Glob"
+              --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
