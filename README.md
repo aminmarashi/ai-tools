@@ -265,6 +265,8 @@ The authoritative exit-code contract lives in the embedded
 Env: `CEREBRO_HOME`, `CEREBRO_MODEL`, `CEREBRO_REVIEW_MODEL`,
 `CEREBRO_TIMEOUT`, `CEREBRO_CODEX_CMD`, `CEREBRO_DEBUG`.
 
+`CEREBRO_TIMEOUT` is the wall-clock cap (seconds) on each child agent call. It defaults to `0` (no cap) so long-running children — Playwright login/browser driving, waiting on the build pipeline — are never killed. Set it to a positive integer to re-enable a cap.
+
 ## Adding a tool
 
 1. Drop the script into `bin/` and `chmod +x` it.

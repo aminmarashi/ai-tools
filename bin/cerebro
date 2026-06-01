@@ -37,7 +37,8 @@
 #   CEREBRO_HOME          base dir (default: $HOME/.cerebro)
 #   CEREBRO_MODEL         model alias for child `claude -p` (default: unset)
 #   CEREBRO_REVIEW_MODEL  model alias for `codex exec` (default: unset)
-#   CEREBRO_TIMEOUT       seconds for child agent calls (default: 3600)
+#   CEREBRO_TIMEOUT       seconds for child agent calls; 0/empty/none/
+#                         unlimited = no cap (default: 0, no cap)
 #   CEREBRO_CODEX_CMD     codex executable (default: codex)
 #   CEREBRO_DEBUG         if 1, verbose logs and leave temp files
 
@@ -46,7 +47,7 @@ set -uo pipefail
 CEREBRO_HOME="${CEREBRO_HOME:-$HOME/.cerebro}"
 CEREBRO_MODEL="${CEREBRO_MODEL:-}"
 CEREBRO_REVIEW_MODEL="${CEREBRO_REVIEW_MODEL:-}"
-CEREBRO_TIMEOUT="${CEREBRO_TIMEOUT:-3600}"
+CEREBRO_TIMEOUT="${CEREBRO_TIMEOUT:-0}"   # 0/empty/none/unlimited = no cap
 CEREBRO_CODEX_CMD="${CEREBRO_CODEX_CMD:-codex}"
 CEREBRO_DEBUG="${CEREBRO_DEBUG:-0}"
 
@@ -333,7 +334,16 @@ log_event() {
 }
 
 # Timeout fallback chain (copied from bin/tai).
+# CEREBRO_TIMEOUT unset/empty/0/none/unlimited => no cap: run the child
+# directly (TIMEOUT_CMD=(env)), so the perl alarm path can never fire.
+# Only a positive integer arms timeout/gtimeout/perl.
 build_timeout_cmd() {
+  case "${CEREBRO_TIMEOUT:-0}" in
+    ''|0|none|unlimited|NONE|UNLIMITED)
+      TIMEOUT_CMD=(env)
+      return 0
+      ;;
+  esac
   if command -v timeout >/dev/null 2>&1; then
     TIMEOUT_CMD=(timeout "$CEREBRO_TIMEOUT")
   elif command -v gtimeout >/dev/null 2>&1; then
