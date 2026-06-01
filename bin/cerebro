@@ -817,6 +817,12 @@ metadata to commit messages or trailers.
   Infrastructure-as-Code (Terraform / CloudFormation / Pulumi / Helm /
   Kubernetes manifests), CI workflow changes, and deployment
   configuration.
+- **Never backfill, add a fallback mechanism, or introduce
+  backwards-compatibility shims unless the user explicitly asks.** When
+  changing behavior, replace the old path outright rather than keeping
+  it alongside the new one. Do not add compatibility layers, legacy
+  aliases, deprecation wrappers, version-conditional branches, or silent
+  default fallbacks on your own initiative.
 AGENTS
 }
 
