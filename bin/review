@@ -1,0 +1,529 @@
+#!/usr/bin/env bash
+# review - Generate a code-review prompt for the current branch and hand it to
+# claude, which inspects the diff and reports prioritized, actionable findings.
+#
+# Retro-fitted to this repo's house style: like diff2plan and plan2pdf it drives
+# `claude -p` with stream-json output, narrates each tool call on stderr behind
+# a braille spinner, wraps the call in a timeout, and is tuned entirely through
+# REVIEW_* environment variables. GitHub is the forge: pull-request lookups and
+# inline review comments go through the `gh` CLI (run `gh auth login` once).
+#
+# Usage:
+#   review [--base <ref>] [--comment] [--print] [--model <m>] [--effort <e>] \
+#          [<branch-or-pull-request>]
+#   review --help
+#
+# Examples:
+#   review                         # review current branch vs main -> stdout
+#   review --base feat/parent      # diff against another branch (stacked PRs)
+#   review 123                     # check out PR #123, then review it
+#   review https://github.com/o/r/pull/123
+#   review feature/child           # fetch that remote branch, switch, review
+#   review --comment               # review current branch's PR, post inline
+#                                  # findings back to it via gh
+#
+# Run review from inside the repository whose changes you want reviewed.
+#
+# Required: claude, git. Optional (PR features / --comment): gh.
+#
+# Env:
+#   REVIEW_MODEL          model alias for `claude` (default: sonnet)
+#   REVIEW_EFFORT         --effort value           (default: high)
+#   REVIEW_TIMEOUT        seconds to wait on the model (default: 1800)
+#   REVIEW_BASE           default base ref to diff against (default: main)
+#   REVIEW_ALLOWED_TOOLS  override claude --allowedTools list
+#                         (default: Read Grep Glob Bash)
+#   REVIEW_DEBUG          if 1, leave the temp dir in place
+
+set -uo pipefail
+
+MODEL="${REVIEW_MODEL:-sonnet}"
+EFFORT="${REVIEW_EFFORT:-high}"
+CALL_TIMEOUT="${REVIEW_TIMEOUT:-1800}"
+DEFAULT_BASE="${REVIEW_BASE:-main}"
+DEBUG="${REVIEW_DEBUG:-0}"
+ALLOWED_TOOLS_STR="${REVIEW_ALLOWED_TOOLS:-Read Grep Glob Bash}"
+
+requested_base="$DEFAULT_BASE"
+explicit_base="false"
+requested_target=""
+mode="run"        # run | print
+comment_on_pr="false"
+requested_model=""
+requested_effort=""
+
+usage() {
+  cat <<EOF
+usage: review [--base <ref>] [--comment] [--print] [--model <m>] [--effort <e>] [<branch-or-pull-request>]
+
+Generate a code-review prompt for the current branch and hand it to claude.
+claude inspects \`git diff <merge-base>\` itself (Read, Grep, Glob, Bash) and
+reports prioritized, actionable findings on stdout. Mirrors the house style of
+diff2plan / plan2pdf: stream-json tool-call narration, a spinner, a timeout
+wrapper, and REVIEW_* environment overrides.
+
+GitHub is the forge. Pull-request checkouts and --comment posting go through the
+\`gh\` CLI (run \`gh auth login\` once). A plain base branch review needs only
+claude and git.
+
+Options:
+  --base <ref>     Diff against this branch, commit, or PR base instead of
+                   '$DEFAULT_BASE'. Useful for stacked pull requests.
+  --comment        Ask claude to post substantive findings back to the target
+                   pull request as inline review comments, via gh.
+  --print          Print the generated prompt instead of invoking claude.
+  --model <m>      Override the claude model (default: $MODEL).
+  --effort <e>     Override the reasoning effort (default: $EFFORT).
+  -h, --help       Show this help.
+
+Arguments:
+  <branch-or-pull-request>
+                   A remote branch name, a PR number (123 or #123), or a PR URL.
+                   A branch is fetched and checked out to match the remote
+                   exactly; a PR is checked out with \`gh pr checkout\`. Both
+                   require a clean working tree.
+
+Examples:
+  review                                   # current branch vs $DEFAULT_BASE
+  review --base feat/parent                # stacked PR against a parent branch
+  review 123                               # check out PR #123, then review
+  review https://github.com/o/r/pull/123
+  review feature/child                     # fetch + switch to a remote branch
+  review --comment                         # review the branch's PR and comment
+
+Env: REVIEW_MODEL, REVIEW_EFFORT, REVIEW_TIMEOUT, REVIEW_BASE,
+REVIEW_ALLOWED_TOOLS, REVIEW_DEBUG.
+EOF
+}
+
+fail() { echo "review: $1" >&2; exit 1; }
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || fail "requires '$1' on PATH${2:+. $2}"
+}
+
+# ---- generic git helpers (forge-agnostic) ---------------------------------
+
+resolve_base_ref() {
+  candidate=$1
+  [ -n "$candidate" ] || fail "--base requires a branch, commit, or PR base"
+  if git show-ref --verify --quiet "refs/remotes/origin/$candidate"; then
+    base_ref="origin/$candidate"
+  elif git show-ref --verify --quiet "refs/heads/$candidate"; then
+    base_ref="$candidate"
+  elif git rev-parse --verify --quiet "$candidate^{commit}" >/dev/null 2>&1; then
+    base_ref="$candidate"
+  else
+    fail "could not resolve base reference '$candidate'"
+  fi
+}
+
+ensure_clean_worktree() {
+  if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    fail "working tree has uncommitted changes. Commit or stash them before reviewing another branch or pull request."
+  fi
+}
+
+find_matching_remote_for_branch() {
+  branch_name=$1
+  configured_remote=$(git config --get "branch.$branch_name.remote" 2>/dev/null || true)
+  fallback_remote=""
+  multiple_matches="false"
+  matched_remote=""
+
+  if [ -n "$configured_remote" ] && [ "$configured_remote" != "." ]; then
+    if git ls-remote --exit-code --heads "$configured_remote" "$branch_name" >/dev/null 2>&1; then
+      matched_remote=$configured_remote
+      return
+    fi
+  fi
+
+  for remote_name in $(git remote); do
+    if git ls-remote --exit-code --heads "$remote_name" "$branch_name" >/dev/null 2>&1; then
+      if [ "$remote_name" = "origin" ]; then
+        matched_remote=$remote_name
+        return
+      fi
+      if [ -z "$fallback_remote" ]; then
+        fallback_remote=$remote_name
+      else
+        multiple_matches="true"
+      fi
+    fi
+  done
+
+  if [ -n "$fallback_remote" ] && [ "$multiple_matches" != "true" ]; then
+    matched_remote=$fallback_remote
+    return
+  fi
+  if [ -n "$fallback_remote" ] && [ "$multiple_matches" = "true" ]; then
+    fail "branch '$branch_name' exists on multiple remotes. Configure its upstream remote locally or use a PR URL instead."
+  fi
+  fail "no remote branch named '$branch_name' was found. Push the branch first or use a PR URL."
+}
+
+fetch_exact_remote_branch() {
+  remote_name=$1
+  branch_name=$2
+  git fetch --quiet "$remote_name" "$branch_name" \
+    || fail "failed to fetch branch '$branch_name' from remote '$remote_name'."
+  fetched_branch_sha=$(git rev-parse FETCH_HEAD)
+  fetched_branch_track_ref=""
+  if git show-ref --verify --quiet "refs/remotes/$remote_name/$branch_name"; then
+    fetched_branch_track_ref="$remote_name/$branch_name"
+  fi
+}
+
+switch_to_exact_branch() {
+  target_branch=$1
+  target_sha=$2
+  target_track_ref=$3
+
+  ensure_clean_worktree
+  current_branch=$(git rev-parse --abbrev-ref HEAD)
+
+  if git show-ref --verify --quiet "refs/heads/$target_branch"; then
+    local_branch_sha=$(git rev-parse "refs/heads/$target_branch")
+    if [ "$local_branch_sha" != "$target_sha" ]; then
+      if ! git merge-base --is-ancestor "$local_branch_sha" "$target_sha" >/dev/null 2>&1; then
+        fail "local branch '$target_branch' is not fast-forwardable to the fetched commit (local $local_branch_sha, expected $target_sha). Update or delete the local branch and rerun."
+      fi
+      if [ "$current_branch" = "$target_branch" ]; then
+        git merge --ff-only --quiet "$target_sha" \
+          || fail "failed to fast-forward branch '$target_branch' to '$target_sha'."
+      else
+        git update-ref "refs/heads/$target_branch" "$target_sha" "$local_branch_sha" \
+          || fail "failed to fast-forward local branch '$target_branch' to '$target_sha'."
+      fi
+    fi
+    if [ "$current_branch" != "$target_branch" ]; then
+      git switch --quiet "$target_branch" 2>/dev/null \
+        || git checkout --quiet "$target_branch" \
+        || fail "failed to switch to local branch '$target_branch'."
+    fi
+  else
+    if [ -n "$target_track_ref" ]; then
+      git switch --quiet -c "$target_branch" --track "$target_track_ref" 2>/dev/null \
+        || git checkout --quiet -b "$target_branch" --track "$target_track_ref" \
+        || fail "failed to create branch '$target_branch' from '$target_track_ref'."
+    else
+      git switch --quiet -c "$target_branch" "$target_sha" 2>/dev/null \
+        || git checkout --quiet -b "$target_branch" "$target_sha" \
+        || fail "failed to create branch '$target_branch' from commit '$target_sha'."
+    fi
+  fi
+
+  current_sha=$(git rev-parse HEAD)
+  [ "$current_sha" = "$target_sha" ] \
+    || fail "switched to '$target_branch' but it does not match the fetched remote branch exactly (local $current_sha, expected $target_sha)."
+}
+
+# ---- GitHub (gh) helpers --------------------------------------------------
+
+is_pull_request_ref() {
+  case "$1" in
+    \#[0-9]*) return 0 ;;
+    [0-9]*)
+      case "$1" in *[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
+    http://*/pull/*|https://*/pull/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_gh() {
+  require_command gh "Install it with Homebrew: brew install gh, then run 'gh auth login'."
+  gh auth status >/dev/null 2>&1 \
+    || fail "gh is not authenticated. Run 'gh auth login' and try again."
+}
+
+load_pull_request_context() {
+  # $1: PR selector understood by gh (number, #number, URL) or empty for the
+  # PR of the current branch. Populates pr_number / pr_url / pr_title /
+  # pr_head_branch / pr_head_sha / pr_base_branch. Uses gh's built-in --jq
+  # (gojq) so there is no external jq/python dependency for PR metadata.
+  selector=${1:-}
+  selector=${selector#\#}
+
+  if ! pr_line=$(gh pr view ${selector:+"$selector"} \
+      --json number,url,title,headRefName,headRefOid,baseRefName \
+      --jq '[.number,.url,.title,.headRefName,.headRefOid,.baseRefName] | @tsv' 2>/dev/null); then
+    if [ -n "$selector" ]; then
+      fail "failed to load pull request '$selector'. Check the number/URL and your gh auth."
+    fi
+    fail "no pull request found for the current branch. Open the PR, or pass a branch/PR explicitly."
+  fi
+
+  IFS=$(printf '\t') read -r pr_number pr_url pr_title pr_head_branch pr_head_sha pr_base_branch <<EOF
+$pr_line
+EOF
+  pr_context_loaded="true"
+}
+
+# ---- argument parsing -----------------------------------------------------
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --print) mode="print" ;;
+    --comment) comment_on_pr="true" ;;
+    --base)
+      shift; [ "$#" -gt 0 ] || fail "--base requires a ref"
+      requested_base=$1; explicit_base="true" ;;
+    --base=*)
+      requested_base=${1#--base=}; explicit_base="true"
+      [ -n "$requested_base" ] || fail "--base requires a ref" ;;
+    --model)
+      shift; [ "$#" -gt 0 ] || fail "--model requires a model name"
+      requested_model=$1 ;;
+    --model=*)
+      requested_model=${1#--model=}
+      [ -n "$requested_model" ] || fail "--model requires a model name" ;;
+    --effort)
+      shift; [ "$#" -gt 0 ] || fail "--effort requires a level"
+      requested_effort=$1 ;;
+    --effort=*)
+      requested_effort=${1#--effort=}
+      [ -n "$requested_effort" ] || fail "--effort requires a level" ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; fail "unknown option: $1" ;;
+    *)
+      [ -z "$requested_target" ] || { usage >&2; exit 1; }
+      requested_target=$1 ;;
+  esac
+  shift
+done
+
+[ -n "$requested_model" ] && MODEL=$requested_model
+[ -n "$requested_effort" ] && EFFORT=$requested_effort
+
+require_command claude "Install the Claude Code CLI or rerun with --print."
+require_command git
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || fail "not inside a git working tree"
+
+# ---- check out the requested target, if any -------------------------------
+
+pr_context_loaded="false"
+
+if [ -n "$requested_target" ]; then
+  ensure_clean_worktree
+  if is_pull_request_ref "$requested_target"; then
+    ensure_gh
+    gh pr checkout "${requested_target#\#}" \
+      || fail "failed to check out pull request '$requested_target'."
+    load_pull_request_context "$requested_target"
+  else
+    find_matching_remote_for_branch "$requested_target"
+    fetch_exact_remote_branch "$matched_remote" "$requested_target"
+    switch_to_exact_branch "$requested_target" "$fetched_branch_sha" "$fetched_branch_track_ref"
+  fi
+fi
+
+# --comment needs a PR even when no target was given (use the current branch's).
+if [ "$comment_on_pr" = "true" ] && [ "$pr_context_loaded" != "true" ]; then
+  ensure_gh
+  load_pull_request_context ""
+fi
+
+# ---- resolve the base and merge-base --------------------------------------
+
+resolve_base_ref "$requested_base"
+if [ "$explicit_base" = "true" ]; then
+  base_description="base reference '$requested_base'"
+else
+  base_description="base branch '$DEFAULT_BASE'"
+fi
+[ "$base_ref" = "$requested_base" ] \
+  || base_description="$base_description (resolved locally as '$base_ref')"
+
+merge_base=$(git merge-base HEAD "$base_ref") \
+  || fail "failed to determine merge base against '$base_ref'"
+
+# ---- build the review prompt ----------------------------------------------
+
+prompt=$(printf 'Review the code changes on the current branch against the %s. The merge base commit for this comparison is %s. Run `git diff %s` to inspect every change included since that merge base, and read the surrounding code (Read, Grep, Glob) to understand each hunk in context before judging it.\n\nReport prioritized, actionable findings: correctness bugs, security issues, broken edge cases, and concrete reuse/simplification opportunities. Lead with the highest-severity issues. For each finding, name the file and line and explain the problem and a fix. Skip style nits, speculative concerns, and praise. If the change is clean, say so briefly rather than inventing problems.' \
+  "$base_description" "$merge_base" "$merge_base")
+
+if [ "$pr_context_loaded" = "true" ]; then
+  prompt=$(printf '%s\n\nThis review targets GitHub pull request %s (#%s, title: %s, head branch: %s, base branch: %s).' \
+    "$prompt" "$pr_url" "$pr_number" "$pr_title" "$pr_head_branch" "$pr_base_branch")
+fi
+
+if [ "$comment_on_pr" = "true" ]; then
+  [ "$pr_context_loaded" = "true" ] \
+    || fail "--comment needs a pull request; none was found for this branch."
+  prompt=$(printf '%s\n\n%s' "$prompt" \
+"Post each substantive finding back to the pull request as an inline review comment on the most relevant changed line, using the gh CLI (already authenticated). Only post real, actionable issues tied to this change; skip nits, speculation, and duplicate threads. If nothing is worth posting, post nothing.
+
+Inline review comment on a changed line:
+  gh api --method POST repos/{owner}/{repo}/pulls/$pr_number/comments \\
+    -f body='<comment>' \\
+    -f commit_id='$pr_head_sha' \\
+    -f path='<file path>' \\
+    -F line=<line number on the new side> \\
+    -f side=RIGHT
+Use side=LEFT with the old-side line number for comments on removed lines. gh
+fills {owner}/{repo} from the current repository. If GitHub rejects the
+position, inspect the diff and retry with a valid changed line rather than
+immediately falling back. If a finding does not map to a changed line, post one
+concise general comment instead:
+  gh pr comment $pr_number --body '<comment>'
+
+After commenting, also print your prioritized findings as your final reply so
+they show up here.")
+fi
+
+if [ "$mode" = "print" ]; then
+  printf '%s\n' "$prompt"
+  exit 0
+fi
+
+# ---- run claude with stream-json narration (house harness) ----------------
+
+WORKDIR=$(mktemp -d -t review.XXXXXX) || fail "mktemp failed"
+cleanup_files() {
+  if [ "$DEBUG" = "1" ]; then
+    echo "review: leaving temp dir at $WORKDIR" >&2
+  else
+    rm -rf "$WORKDIR"
+  fi
+}
+
+SPIN_PID=""
+[ -t 2 ] && SPIN_TTY=1 || SPIN_TTY=0
+start_spinner() {
+  [ "$SPIN_TTY" = "1" ] || return 0
+  [ -n "$SPIN_PID" ] && return 0
+  local msg="${1:-thinking}"
+  local started; started=$(date +%s)
+  (
+    frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    i=0
+    while :; do
+      f="${frames[$((i % ${#frames[@]}))]}"
+      elapsed=$(( $(date +%s) - started ))
+      printf '\r\033[2K%s %s [%ds]' "$f" "$msg" "$elapsed" >&2
+      i=$((i+1))
+      sleep 0.1
+    done
+  ) &
+  SPIN_PID=$!
+}
+stop_spinner() {
+  [ -z "$SPIN_PID" ] && return 0
+  kill "$SPIN_PID" 2>/dev/null
+  wait "$SPIN_PID" 2>/dev/null
+  SPIN_PID=""
+  [ "$SPIN_TTY" = "1" ] && printf '\r\033[2K' >&2
+}
+cleanup() { stop_spinner; cleanup_files; }
+trap cleanup EXIT INT TERM
+
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(timeout "$CALL_TIMEOUT")
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD=(gtimeout "$CALL_TIMEOUT")
+elif command -v perl >/dev/null 2>&1; then
+  TIMEOUT_CMD=(perl -e 'alarm shift; exec @ARGV' "$CALL_TIMEOUT")
+else
+  TIMEOUT_CMD=(env)
+fi
+
+SYSTEM='You are a senior engineer performing a focused code review. You have full read access to the repository and may run git via Bash to inspect the diff and history. Investigate the changed code in its surrounding context before judging it: a hunk that looks wrong in isolation is often correct given its callers, and vice versa.
+
+Prioritize ruthlessly. Surface correctness bugs, security holes, data-loss and concurrency hazards, and broken edge cases first; then concrete reuse, simplification, and efficiency opportunities in the changed code. Each finding names a file and line, states the problem plainly, and proposes a fix. Do not pad the review with style nits, restated diffs, speculative "could in theory" concerns, or praise. If the change is genuinely clean, say so in a sentence rather than manufacturing issues. Match the length of the review to the size and risk of the change.'
+
+ERR_FILE="$WORKDIR/claude.err"
+OUT_FILE="$WORKDIR/review.md"
+
+CLAUDE_OPTS=(
+  -p
+  --model "$MODEL"
+  --effort "$EFFORT"
+  --permission-mode auto
+  --append-system-prompt "$SYSTEM"
+  --allowedTools "$ALLOWED_TOOLS_STR"
+  --output-format stream-json
+  --verbose
+)
+
+INFO="model=$MODEL effort=$EFFORT base=$base_ref merge-base=${merge_base:0:12}"
+echo "review: reviewing against $base_description ($INFO); each line below is a tool call claude makes while reviewing" >&2
+start_spinner "reviewing with $MODEL"
+
+PARSER="$WORKDIR/parser.py"
+cat > "$PARSER" <<'PY'
+import json, sys
+
+out_path = sys.argv[1]
+result_text = None
+result_subtype = None
+saw_any_event = False
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    saw_any_event = True
+    t = ev.get('type')
+    if t == 'assistant':
+        for item in ev.get('message', {}).get('content', []) or []:
+            if item.get('type') == 'tool_use':
+                name = item.get('name', '?')
+                inp = item.get('input', {}) or {}
+                target = (
+                    inp.get('description') or inp.get('file_path') or
+                    inp.get('pattern') or inp.get('path') or
+                    inp.get('query') or inp.get('command') or ''
+                )
+                if isinstance(target, list):
+                    target = ' '.join(map(str, target))
+                target = str(target).replace('\n', ' ').strip()
+                if len(target) > 100:
+                    target = target[:100] + '…'
+                clr = '\r\033[2K' if sys.stderr.isatty() else ''
+                sys.stderr.write(f'{clr}  {name}: {target}\n')
+                sys.stderr.flush()
+    elif t == 'result':
+        result_subtype = ev.get('subtype')
+        result_text = ev.get('result')
+
+if not saw_any_event:
+    sys.stderr.write('\nreview: claude produced no events on stdout\n')
+    sys.exit(2)
+if result_text is None:
+    sys.stderr.write(f'\nreview: claude did not emit a result event (subtype={result_subtype})\n')
+    sys.exit(3)
+if result_subtype and result_subtype != 'success':
+    sys.stderr.write(f'\nreview: claude reported result subtype={result_subtype}\n')
+    sys.exit(4)
+with open(out_path, 'w') as f:
+    f.write(result_text)
+PY
+
+printf '%s' "$prompt" \
+  | "${TIMEOUT_CMD[@]}" claude "${CLAUDE_OPTS[@]}" 2> "$ERR_FILE" \
+  | python3 "$PARSER" "$OUT_FILE"
+RC=$?
+stop_spinner
+
+if [ "$RC" != "0" ]; then
+  echo "review: claude/parser pipeline failed (rc=$RC)" >&2
+  if [ -s "$ERR_FILE" ]; then
+    echo "review: claude stderr:" >&2
+    head -c 4000 "$ERR_FILE" >&2
+    echo >&2
+  fi
+  exit 1
+fi
+
+if [ ! -s "$OUT_FILE" ]; then
+  echo "review: claude returned no findings text" >&2
+  [ -s "$ERR_FILE" ] && head -c 4000 "$ERR_FILE" >&2
+  exit 1
+fi
+
+cat "$OUT_FILE"

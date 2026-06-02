@@ -145,6 +145,51 @@ Requirements: `claude`, `git`, `python3`.
 Env: `DIFF2PLAN_MODEL`, `DIFF2PLAN_EFFORT`, `DIFF2PLAN_TIMEOUT`,
 `DIFF2PLAN_ALLOWED_TOOLS`, `DIFF2PLAN_DEBUG`.
 
+### `review`
+
+Generate a code-review prompt for the current branch and hand it to
+`claude`, which inspects the diff itself and reports prioritized,
+actionable findings. It follows the same house harness as `diff2plan`
+and `plan2pdf`: `claude -p` with stream-json output, one stderr line per
+tool call behind a braille spinner, a timeout wrapper, and `REVIEW_*`
+environment overrides. GitHub is the forge — pull-request checkouts and
+`--comment` posting go through the `gh` CLI.
+
+```bash
+review                         # review current branch vs main -> stdout
+review --base feat/parent      # diff against a parent branch (stacked PRs)
+review 123                     # check out PR #123, then review it
+review https://github.com/o/r/pull/123
+review feature/child           # fetch that remote branch, switch, review
+review --comment               # review the branch's PR, post inline findings
+review --print                 # print the review prompt without invoking claude
+```
+
+Run `review` from inside the repository whose changes you want
+reviewed. By default it compares the current branch against `main`
+using the merge base and writes findings to stdout. A positional
+argument selects what to review: a remote branch name is fetched and
+checked out to match the remote exactly, while a PR number (`123` /
+`#123`) or PR URL is checked out with `gh pr checkout`. Both require a
+clean working tree.
+
+`claude` runs with read access plus `Bash` (auto permission mode) so it
+can run `git diff <merge-base>` and inspect the surrounding code before
+judging each hunk. With `--comment`, it posts substantive findings back
+to the target pull request as inline review comments via `gh api`
+(`gh` fills `{owner}/{repo}` from the current repo), falling back to a
+general PR comment when a finding does not map to a changed line; the
+prioritized findings are still printed to stdout afterward.
+
+Requirements: `claude`, `git`. Pull-request features and `--comment`
+also need `gh` (run `gh auth login` once). `python3` is used to parse
+claude's stream-json, same as `diff2plan`.
+
+Env: `REVIEW_MODEL` (default `sonnet`), `REVIEW_EFFORT` (default
+`high`), `REVIEW_TIMEOUT` (default `1800`), `REVIEW_BASE` (default
+`main`), `REVIEW_ALLOWED_TOOLS` (default `Read Grep Glob Bash`),
+`REVIEW_DEBUG`.
+
 ### `cerebro`
 
 Meta-harness for the plan → execute → review loop. Typing `cerebro` in
