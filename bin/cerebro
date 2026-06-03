@@ -24,6 +24,9 @@
 #   cerebro doc-write <repo> (<plan-path> [--notes "..."] | --prompt "<text>")
 #   cerebro recall <query>
 #   cerebro status
+#   cerebro learnings                              # show learned + pending prefs
+#   cerebro learn-note "<observation>"             # record a preference signal
+#   cerebro learn-set "<consolidated learnings>"   # promote to active learnings
 #   cerebro git <repo> <git-subcmd> [args...]      # read-only git bridge
 #   cerebro gh <repo> <gh-subcmd> [args...]        # read-only gh bridge
 #   cerebro read <repo> <path> [--range N:M] [--strict-missing]  # read one file
@@ -741,7 +744,81 @@ behalf, by calling them through your Bash tool (which is restricted to
 
   cerebro status
     Print the current session state -- plans on file, last child
-    invocation, last review.
+    invocation, last review, and a learnings summary.
+
+  cerebro learnings
+    Print the active learned preferences and a count of pending
+    signals. The active set is ALSO injected into your system prompt
+    under "# Learned preferences" -- this subcommand just lets you (or
+    the user) inspect it on demand.
+
+  cerebro learn-note "<observation>"
+    Append ONE preference signal to the global pending journal
+    (pending-learnings.md). Use it the moment the user reveals a
+    general preference, directly ("always keep diffs small", "stop
+    over-engineering") or indirectly (e.g. they repeatedly ask you to
+    simplify, reject a heavy solution, or trim a review down to the
+    essential fix). Write a single concrete sentence; don't editorialise.
+    This only records evidence -- it does NOT change your behaviour yet.
+
+  cerebro learn-set "<consolidated learnings>"
+    REPLACE the active learnings (learnings.md) with a small,
+    consolidated set you compose after reviewing clear, repeated
+    evidence in the pending journal. The whole text is injected into
+    your system prompt, so keep it to a few short, GENERAL bullets
+    (cap ~1600 chars; the call is rejected if you exceed it). Before
+    calling, Read the current learnings.md and pending-learnings.md so
+    you merge rather than clobber. See "# Learning the user's
+    preferences" below for when to promote vs. ask.
+
+# Learning the user's preferences
+
+You maintain a small, durable record of how THIS user likes work done,
+so future sessions start already tuned to them. Two global files under
+your home hold it:
+
+  * pending-learnings.md -- an append-only journal of raw signals.
+  * learnings.md         -- the small, consolidated set of confirmed
+                            preferences, injected into your system
+                            prompt under "# Learned preferences".
+
+You have no Write/Edit tool, so both are reached only through
+`cerebro learn-note` and `cerebro learn-set`. You CAN Read both files
+directly (they live in your home).
+
+How to run the learning loop:
+
+  1. NOTICE. Whenever the user reveals a general working preference --
+     directly ("I prefer X", "always Y", "never Z") or indirectly
+     (the same correction recurring: repeatedly asking to simplify,
+     rejecting over-engineered solutions, wanting smaller diffs, a
+     consistent commit/branch/test habit) -- call `cerebro learn-note`
+     with one concrete sentence capturing it. Record the signal; do
+     not change behaviour off a single data point.
+
+  2. CONFIRM. A preference is ready to promote when the evidence is
+     CLEAR: one explicit, unambiguous directive ("from now on, always
+     ...") OR the same indirect signal seen on two or more independent
+     occasions. Before promoting, Read pending-learnings.md and the
+     current learnings.md.
+
+  3. PROMOTE. Compose an updated, consolidated learnings list (merge
+     the new preference in, dedupe, keep each bullet short and
+     general) and write it with `cerebro learn-set`. Keep the whole
+     file tiny -- it rides in your system prompt. Prefer rewriting a
+     vague bullet over piling on near-duplicates. Tell the user in one
+     line what you learned.
+
+  4. WHEN UNSURE, ASK. If you cannot tell whether a signal is a
+     durable general preference or a one-off for this task, whether it
+     contradicts an existing learning, or how to phrase it -- ASK the
+     user a single clarifying question before calling `learn-set`.
+     Recording a pending note is always safe; changing the active
+     learnings on weak evidence is not.
+
+Keep learnings about HOW the user likes work done (style, scope,
+caution level, simplicity), not project-specific facts -- those belong
+in recall/transcripts, not in your system prompt.
 
 # The loop
 
@@ -964,6 +1041,29 @@ if result_path:
 
 # ----- subcommand: cerebro (launch new session) ----------------------------
 
+# Global preference files (span every session under $CEREBRO_HOME).
+learnings_file()         { printf '%s\n' "$CEREBRO_HOME/learnings.md"; }
+pending_learnings_file() { printf '%s\n' "$CEREBRO_HOME/pending-learnings.md"; }
+
+# Build the orchestrator's full system prompt: the static catalog plus, when
+# present, the user's learned preferences. learnings.md is kept small (capped
+# by cmd_learn_set) so it fits in the system message; a whitespace-only file
+# is treated as empty. Echoed on stdout.
+orchestrator_append_prompt() {
+  local base; base="$(cat "$CEREBRO_HOME/system-prompt.md")"
+  local lf body=""
+  lf="$(learnings_file)"
+  if [[ -s "$lf" ]]; then
+    body="$(cat "$lf")"
+    [[ -n "${body//[[:space:]]/}" ]] || body=""
+  fi
+  if [[ -n "$body" ]]; then
+    printf '%s\n\n# Learned preferences\n\nDurable preferences cerebro has learned from this user across past sessions. Honor them by default in every plan, execute, review, and apply-review decision unless the user overrides in the moment.\n\n%s\n' "$base" "$body"
+  else
+    printf '%s\n' "$base"
+  fi
+}
+
 cmd_launch() {
   require_interactive
   require_deps
@@ -987,7 +1087,7 @@ cmd_launch() {
   cd "$CEREBRO_HOME" || die "cd to $CEREBRO_HOME failed"
   exec claude \
     --session-id "$sid" \
-    --append-system-prompt "$(cat "$CEREBRO_HOME/system-prompt.md")" \
+    --append-system-prompt "$(orchestrator_append_prompt)" \
     --allowedTools "Bash(cerebro:*) Read Grep Glob"
 }
 
@@ -1019,12 +1119,12 @@ cmd_resume() {
   if [[ -n "$id" ]]; then
     exec claude \
       --resume "$id" \
-      --append-system-prompt "$(cat "$CEREBRO_HOME/system-prompt.md")" \
+      --append-system-prompt "$(orchestrator_append_prompt)" \
       --allowedTools "Bash(cerebro:*) Read Grep Glob"
   else
     exec claude \
       --resume \
-      --append-system-prompt "$(cat "$CEREBRO_HOME/system-prompt.md")" \
+      --append-system-prompt "$(orchestrator_append_prompt)" \
       --allowedTools "Bash(cerebro:*) Read Grep Glob"
   fi
 }
@@ -1700,6 +1800,83 @@ cmd_status() {
     echo "last review: $last_review"
   else
     echo "last review: (none)"
+  fi
+  echo
+  local lf pf
+  lf="$(learnings_file)"; pf="$(pending_learnings_file)"
+  if [[ -s "$lf" ]]; then
+    echo "learnings: active ($lf)"
+  else
+    echo "learnings: (none)"
+  fi
+  if [[ -s "$pf" ]]; then
+    local pc; pc="$(grep -c '^- \[' "$pf" 2>/dev/null || true)"
+    echo "pending preference signals: ${pc:-0} ($pf)"
+  fi
+}
+
+# ----- subcommands: learning the user's preferences ------------------------
+# learnings.md (active) and pending-learnings.md (a single append-only signal
+# journal) are GLOBAL under $CEREBRO_HOME, so general preferences persist
+# across every session and repo. The orchestrator has no write tools, so these
+# subcommands are its only way to record what it observes and promote it.
+
+# Max chars in the active learnings.md. It is injected verbatim into the
+# orchestrator's system prompt, so it must stay system-message-sized.
+CEREBRO_LEARN_CAP="${CEREBRO_LEARN_CAP:-1600}"
+
+# cerebro learn-note "<observation>"
+# Append one preference signal (direct or indirect) to the pending journal.
+cmd_learn_note() {
+  require_session
+  local text="${*:-}"
+  [[ -n "${text//[[:space:]]/}" ]] || die "usage: cerebro learn-note \"<observation>\""
+  local f; f="$(pending_learnings_file)"
+  if [[ ! -f "$f" ]]; then
+    printf '# Pending learnings\n\nObserved preference signals awaiting confirmation -- one signal per line.\nPromote a signal to active learnings (cerebro learn-set) only once the\nevidence here is clear and repeated; when unsure, ask the user first.\n\n' > "$f"
+  fi
+  printf -- '- [%s] %s\n' "$(ts_iso)" "$text" >> "$f"
+  log_event "learn_note" "$text"
+  say "cerebro: recorded a pending preference signal ($f)"
+}
+
+# cerebro learn-set "<consolidated learnings>"
+# Replace the active learnings with a consolidated set the orchestrator
+# composed after reviewing clear evidence in the pending journal. Capped so it
+# stays small enough for the system message.
+cmd_learn_set() {
+  require_session
+  local text="${*:-}"
+  [[ -n "${text//[[:space:]]/}" ]] || die "usage: cerebro learn-set \"<consolidated learnings>\""
+  local n=${#text}
+  if (( n > CEREBRO_LEARN_CAP )); then
+    die "learn-set: too large (${n} chars > ${CEREBRO_LEARN_CAP}). Active learnings are injected into the orchestrator system prompt -- consolidate to a few short, general bullets."
+  fi
+  local f; f="$(learnings_file)"
+  printf '%s\n' "$text" > "$f"
+  log_event "learn_set" "chars=$n"
+  say "cerebro: updated active learnings ($f, ${n} chars)"
+}
+
+# cerebro learnings
+# Show the active learnings plus a count of pending signals.
+cmd_learnings() {
+  require_session
+  local active pending
+  active="$(learnings_file)"; pending="$(pending_learnings_file)"
+  echo "active learnings: $active"
+  if [[ -s "$active" ]]; then
+    sed 's/^/  /' "$active"
+  else
+    echo "  (none yet)"
+  fi
+  echo
+  echo "pending signals:  $pending"
+  if [[ -s "$pending" ]]; then
+    local c; c="$(grep -c '^- \[' "$pending" 2>/dev/null || true)"
+    echo "  (${c:-0} signal(s) recorded; Read the file to review the evidence)"
+  else
+    echo "  (none yet)"
   fi
 }
 
@@ -2483,6 +2660,9 @@ main() {
     doc-write) shift; cmd_doc_write "$@" ;;
     recall) shift; cmd_recall "$@" ;;
     status) shift; cmd_status "$@" ;;
+    learnings)  shift; cmd_learnings "$@" ;;
+    learn-note) shift; cmd_learn_note "$@" ;;
+    learn-set)  shift; cmd_learn_set "$@" ;;
     git)    shift; cmd_git "$@" ;;
     gh)     shift; cmd_gh "$@" ;;
     read)   shift; cmd_read "$@" ;;

@@ -917,6 +917,62 @@ else
   printf 'SKIP  103  concurrent child-log distinctness (claude stub unavailable)\n'
 fi
 
+# ========================================================================
+# 104-110. Preference learning: learn-note (pending journal), learn-set
+# (active learnings, size-capped), and learnings (inspection). These files
+# are global under $CEREBRO_HOME and persist across sessions.
+# ========================================================================
+LEARN_ACTIVE="$CEREBRO_HOME/learnings.md"
+LEARN_PENDING="$CEREBRO_HOME/pending-learnings.md"
+
+# --- 104. learnings on a clean home reports none ---
+STDOUT_CONTAINS="(none yet)" \
+run_case 104 "learnings empty reports none" 0 -- "$CEREBRO_BIN" learnings
+
+# --- 105. learn-note appends to the pending journal ---
+run_case 105 "learn-note records a signal" 0 -- \
+  "$CEREBRO_BIN" learn-note "user repeatedly asks to simplify"
+if [[ -s "$LEARN_PENDING" ]] && grep -q "user repeatedly asks to simplify" "$LEARN_PENDING"; then
+  printf 'PASS  105b  learn-note wrote pending journal\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  105b  learn-note did not write pending journal\n'; fail=$((fail + 1))
+  failures+=("105b learn-note pending journal missing entry")
+fi
+
+# --- 106. learn-note with blank text errors ---
+STDERR_CONTAINS="usage: cerebro learn-note" \
+run_case 106 "learn-note blank errors" 1 -- "$CEREBRO_BIN" learn-note "   "
+
+# --- 107. learn-set writes the active learnings ---
+run_case 107 "learn-set writes active learnings" 0 -- \
+  "$CEREBRO_BIN" learn-set "- Keep diffs small; avoid over-engineering."
+if [[ -s "$LEARN_ACTIVE" ]] && grep -q "avoid over-engineering" "$LEARN_ACTIVE"; then
+  printf 'PASS  107b  learn-set wrote active learnings\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  107b  learn-set did not write active learnings\n'; fail=$((fail + 1))
+  failures+=("107b learn-set active learnings missing")
+fi
+
+# --- 108. learnings now shows the active set ---
+STDOUT_CONTAINS="avoid over-engineering" \
+run_case 108 "learnings shows active set" 0 -- "$CEREBRO_BIN" learnings
+
+# --- 109. learn-set rejects oversized payloads (system-message budget) ---
+BIG="$(head -c 1700 < /dev/zero | tr '\0' 'x')"
+STDERR_CONTAINS="too large" \
+run_case 109 "learn-set oversized rejected" 1 -- "$CEREBRO_BIN" learn-set "$BIG"
+# The prior (valid) active learnings must survive a rejected overwrite.
+if grep -q "avoid over-engineering" "$LEARN_ACTIVE"; then
+  printf 'PASS  109b  rejected learn-set left active learnings intact\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  109b  rejected learn-set clobbered active learnings\n'; fail=$((fail + 1))
+  failures+=("109b oversized learn-set clobbered active learnings")
+fi
+
+# --- 110. learn-set with blank text errors ---
+STDERR_CONTAINS="usage: cerebro learn-set" \
+run_case 110 "learn-set blank errors" 1 -- "$CEREBRO_BIN" learn-set ""
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'

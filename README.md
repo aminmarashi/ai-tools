@@ -209,8 +209,9 @@ cerebro list                  # list sessions, newest first
 
 You talk only to the orchestrator. It decides when to call `cerebro
 plan`, `cerebro execute`, `cerebro review`, `cerebro apply-review`,
-`cerebro doc-write`, `cerebro recall`, or `cerebro status` based on
-the conversation. A typical feature loop: describe the change → the
+`cerebro doc-write`, `cerebro recall`, `cerebro status`, or the
+preference-learning subcommands (`cerebro learnings`, `learn-note`,
+`learn-set`) based on the conversation. A typical feature loop: describe the change → the
 orchestrator drafts a plan and tells you where it landed → you read
 the plan and say "go" → orchestrator executes it on a feature branch,
 pushes, opens a PR via `gh` → orchestrator runs codex against the
@@ -236,6 +237,21 @@ not acted on; ambiguous findings prompt a clarifying question first.
 defaults to the last review's findings file for the current
 repo+branch; an explicit path that doesn't exist is rejected with the
 correct last-review path named.
+
+**Learned preferences.** cerebro builds a small, durable record of how
+you like work done, so future sessions start already tuned to you. When
+you reveal a general preference — directly ("always keep diffs small")
+or indirectly (you keep asking it to simplify, or reject
+over-engineered solutions) — the orchestrator logs a signal with
+`cerebro learn-note` into a global `pending-learnings.md`. Once the
+evidence is clear (one explicit directive, or the same signal seen on
+two or more occasions) it consolidates the confirmed preferences into a
+small `learnings.md` via `cerebro learn-set`; when a signal is
+ambiguous it asks you first. `learnings.md` is injected into the
+orchestrator's system prompt on every launch/resume, capped (~1600
+chars) so it stays system-message-sized. Both files are global under
+`~/.cerebro/` and persist across sessions and repos; `cerebro
+learnings` prints the active set plus a pending-signal count.
 
 **Incremental re-reviews.** After an `apply-review`, the next
 `cerebro review` defaults to diffing against the SHA that was HEAD at
@@ -265,6 +281,8 @@ Session state lives under `$CEREBRO_HOME` (default `~/.cerebro/`):
 ~/.cerebro/
   hook.sh                            # UserPromptSubmit hook, routes by session id
   system-prompt.md                   # orchestrator system prompt
+  learnings.md                       # confirmed user preferences (injected into the prompt)
+  pending-learnings.md               # append-only journal of preference signals
   .claude/settings.local.json        # registers the hook
   templates/
     AGENTS.md                        # default dropped into repos that lack one
