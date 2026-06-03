@@ -599,13 +599,22 @@ behalf, by calling them through your Bash tool (which is restricted to
                        (<findings-path> [--notes "..."] | --prompt "<text>")
     Spawn a full-edit child claude with cwd=<repo> to apply fixes on
     the current branch. The default form takes a <findings-path> from
-    `cerebro review`. SCOPE: include in --notes only findings that
-    are clearly within the scope of the plan being worked on.
-    Out-of-scope improvements (unrelated refactors, style nits in
-    files the plan didn't touch, broader tech-debt suggestions) must
-    be NAMED to the user in your chat summary but NOT forwarded as
-    --notes. If a finding's relevance to the original task is
-    ambiguous, ASK the user before acting on it.
+    `cerebro review`. SCOPE: include in --notes only findings that are
+    BOTH clearly within the scope of the plan being worked on AND
+    genuinely important -- real bugs, regressions, security issues,
+    data-loss or correctness problems, missing tests for the new
+    behaviour. Do NOT forward minor or speculative suggestions, and do
+    NOT forward anything that would over-engineer the code
+    (gold-plating, defensive handling for cases that cannot occur,
+    premature abstraction, or a broad rewrite where a small fix would
+    do). Keep the applied change as small as the fix actually
+    requires. Out-of-scope improvements (unrelated refactors, style
+    nits in files the plan didn't touch, broader tech-debt
+    suggestions) must be NAMED to the user in your chat summary but
+    NOT forwarded as --notes. If you are genuinely unsure whether a
+    finding is important enough to apply, or whether its fix would
+    over-engineer the code, ASK the user before acting on it rather
+    than applying it on your own.
     The <findings-path> is ALWAYS the path echoed by your most
     recent `cerebro review` -- never a name you reconstruct. If you
     omit it (and don't pass --prompt), apply-review uses the last
@@ -747,17 +756,35 @@ For a single feature:
        a. Run the review. CAPTURE the findings path it echoes on
           stdout -- that exact string, not a name you compose.
        b. READ that exact file with your Read tool.
-       c. Bucket the findings you just read: (i) clearly in the
-          plan's scope -- act on; (ii) clearly out of scope
-          (refactors / nits in untouched files / broader tech
-          debt) -- name to the user, do NOT forward; (iii)
-          ambiguous -- ASK the user. Summarise the buckets.
-  6. Only THEN, if in-scope findings warrant action: `cerebro
-     apply-review <repo> <findings-path> --notes "..."` where
-     <findings-path> is the path from step 5a and --notes quotes
-     the in-scope items from the file you read in step 5b. Do not
-     run apply-review and review at the same time, and do not start
-     a second apply-review until the first finishes. Then re-run
+       c. Bucket the findings you just read by TWO gates -- scope
+          and importance:
+            (i)   in the plan's scope AND genuinely important (a
+                  real bug, regression, security hole, data-loss or
+                  correctness problem, or a missing test for the new
+                  behaviour) -- act on;
+            (ii)  clearly out of scope (refactors / nits in
+                  untouched files / broader tech debt) -- name to
+                  the user, do NOT forward;
+            (iii) in scope but minor, speculative, or
+                  over-engineering (gold-plating, defensive code for
+                  cases that cannot occur, premature abstraction, a
+                  broad rewrite where a small fix would do) -- name
+                  to the user, do NOT apply on your own;
+            (iv)  anything you are genuinely unsure about (is it
+                  important enough? would the fix over-engineer the
+                  code?) -- ASK the user before applying.
+          Summarise the buckets.
+  6. Only THEN, and only for bucket (i): `cerebro apply-review
+     <repo> <findings-path> --notes "..."` where <findings-path>
+     is the path from step 5a and --notes quotes the important,
+     in-scope items from the file you read in step 5b. Do NOT
+     forward minor, speculative, or over-engineering findings, and
+     when you are genuinely unsure whether a finding is important
+     enough or whether its fix would over-engineer the code, ASK
+     the user first rather than applying it. Keep the applied
+     change as small as the fix actually requires. Do not run
+     apply-review and review at the same time, and do not start a
+     second apply-review until the first finishes. Then re-run
      `cerebro review <repo>` WITHOUT --base (it auto-diffs against
      the previously-reviewed commit) and loop until codex is quiet.
   7. Optionally `cerebro doc-write <repo> <plan>` to update docs.
@@ -1347,7 +1374,7 @@ cmd_review() {
   # codex the merge base directly so it runs the right `git diff` itself
   # instead of guessing or pre-loading a huge patch into context.
   local codex_prompt
-  codex_prompt="Review the code changes against the $base_description. The merge base commit for this comparison is $merge_base. Run \`git diff $merge_base\` to inspect the changes included since that merge base. Provide prioritized, actionable findings: bugs, regressions, security issues, missing tests, and correctness problems. Skip style nits and speculative concerns. For each finding, give a one-line title, the file or area affected, and a sentence explaining the concern and a suggested fix. Output Markdown only; no preamble."
+  codex_prompt="Review the code changes against the $base_description. The merge base commit for this comparison is $merge_base. Run \`git diff $merge_base\` to inspect the changes included since that merge base. Provide prioritized, actionable findings: bugs, regressions, security issues, missing tests, and correctness problems. Skip style nits, speculative concerns, and over-engineering suggestions (gold-plating, defensive code for cases that cannot occur, premature abstraction, or broad rewrites where a small fix would do); prefer the smallest change that resolves a real problem. For each finding, give a one-line title, the file or area affected, and a sentence explaining the concern and a suggested fix. Output Markdown only; no preamble."
 
   local codex_opts=(exec --sandbox read-only --skip-git-repo-check --cd "$repo")
   [[ -n "$CEREBRO_REVIEW_MODEL" ]] && codex_opts+=(--model "$CEREBRO_REVIEW_MODEL")
