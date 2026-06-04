@@ -521,15 +521,25 @@ behalf, by calling them through your Bash tool (which is restricted to
 5. Before asking the user any question they might already have
    answered in a prior cerebro session, run `cerebro recall
    "<keywords>"` first -- repo name, project, feature, file, the
-   substantive noun in the question. If recall returns a clear prior
-   answer that is very likely to apply in the current situation,
-   USE IT without asking; briefly tell the user you are reusing it
-   ("you said last time X -- using that unless you correct me") so
-   they can override. Only ask the user when recall returns nothing,
-   the prior answer is ambiguous, or you have specific reason to
-   doubt it still holds (state has changed, the user contradicted it
-   later, it was about a different feature, time has passed and the
-   answer is the kind that drifts). When in doubt, ask.
+   substantive noun in the question. recall is a LITERAL search: the
+   whole query must appear verbatim, so a kitchen-sink phrase like
+   "repo-x orchestrator game designer" usually matches
+   nothing. Start with the ONE most distinctive term (a unique repo
+   or project name, an identifier) and broaden from there; recall
+   auto-broadens a multi-word query to "any term" on a miss and tells
+   you when it did, but you should still re-run with a narrower,
+   better term rather than trusting a single empty hit. Treat the
+   first empty result as "search again differently," not "no prior
+   context." If recall returns a clear prior answer that is very
+   likely to apply, USE IT without asking; briefly tell the user you
+   are reusing it ("you said last time X -- using that unless you
+   correct me") so they can override. Only ask the user, or proceed,
+   once you have actually exhausted recall. When the question is
+   about what the code does or how it is built, an empty recall is
+   NOT licence to answer from assumption -- inspect the actual repo
+   with the read-only bridge subcommands (`cerebro grep`, `cerebro
+   read`, `cerebro ls`, `cerebro git`) before you answer. When in
+   doubt, ask.
 6. You operate on the cerebro home (your cwd). Plans live under
    `sessions/<id>/plans/`, child agent logs under `sessions/<id>/children/`,
    and codex findings under the same children dir. Use Read / Grep /
@@ -740,7 +750,10 @@ behalf, by calling them through your Bash tool (which is restricted to
   cerebro recall <query>
     Search across all cerebro sessions' transcripts and child logs.
     Use this when the user references prior work ("did we already do
-    the rename in the orders service?").
+    the rename in the orders service?"). The query is matched
+    LITERALLY first; on a miss with a multi-word query it auto-
+    broadens to "any term" (case-insensitive, first 100 hits) and
+    prints a note saying so. Prefer one distinctive term per call.
 
   cerebro status
     Print the current session state -- plans on file, last child
@@ -1753,22 +1766,56 @@ cmd_recall() {
   local query="${*:-}"
   [[ -n "$query" ]] || die "usage: cerebro recall <query>"
 
-  local grep_cmd
-  if command -v rg >/dev/null 2>&1; then
-    grep_cmd=(rg --no-heading --line-number --color never --fixed-strings -- "$query")
-  else
-    grep_cmd=(grep -RnF --color=never -- "$query")
-  fi
-
   local files
   files=$(find "$CEREBRO_HOME/sessions" -type f \( -name 'transcript.jsonl' -o -name '*.jsonl' \) 2>/dev/null)
   if [[ -z "$files" ]]; then
     echo "cerebro: nothing to recall (no session logs yet)"
     return 0
   fi
-  # Pass files as args so rg/grep can name them in output.
+
+  local have_rg=0
+  command -v rg >/dev/null 2>&1 && have_rg=1
+
+  # Pass 1: literal match of the whole query (the precise hit).
+  local out
+  if (( have_rg )); then
+    # shellcheck disable=SC2086
+    out=$(rg --no-heading --line-number --color never --fixed-strings -- "$query" $files 2>/dev/null || true)
+  else
+    # shellcheck disable=SC2086
+    out=$(grep -RnF --color=never -- "$query" $files 2>/dev/null || true)
+  fi
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+
+  # Pass 2: broaden. The whole-phrase match found nothing, but a
+  # multi-word query treated literally rarely appears verbatim in a
+  # transcript. Re-search for ANY single term (case-insensitive) so a
+  # query like "repo-x orchestrator game designer" still
+  # surfaces the session that only ever said "repo-x".
+  local -a terms
+  read -ra terms <<<"$query"
+  (( ${#terms[@]} <= 1 )) && return 0
+
+  local -a args
+  if (( have_rg )); then
+    args=(rg --no-heading --line-number --color never --ignore-case --fixed-strings)
+  else
+    args=(grep -RnFi --color=never)
+  fi
+  local t
+  for t in "${terms[@]}"; do args+=(-e "$t"); done
+
   # shellcheck disable=SC2086
-  "${grep_cmd[@]}" $files 2>/dev/null || true
+  out=$("${args[@]}" -- $files 2>/dev/null | head -n 100 || true)
+  [[ -z "$out" ]] && return 0
+
+  echo "cerebro recall: no verbatim match for \"$query\";" \
+       "broadened to ANY of these terms (first 100 hits): ${terms[*]}"
+  echo "---"
+  printf '%s\n' "$out"
 }
 
 # ----- subcommand: cerebro status ------------------------------------------
