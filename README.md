@@ -218,6 +218,18 @@ pushes, opens a PR via `gh` → orchestrator runs codex against the
 diff, summarises the findings, and applies the ones that matter → loop
 until codex is quiet → optionally `doc-write` at the end.
 
+**Blast-radius audit.** When a change is high blast radius — it touches
+many files, a shared module, a public API, a data model or migration,
+auth/security paths, or it's a multi-plan suite — the orchestrator does
+not hand you the plan the moment it's drafted. It first *audits* the plan
+against the actual code (via the read-only `cerebro grep`/`read`/`git`
+bridges): it checks that every named target really exists and that none
+were missed, and that the plan hasn't crept in scope, over-engineered, or
+misread the requirement. If it finds any of those, it revises the plan
+(`cerebro plan --out <same-name>`) and re-checks, then proposes only a
+plan that survived the audit. The audit precedes your approval; it never
+replaces it. Localized, low-blast-radius changes skip the gate.
+
 **Large specifications (multi-plan suites).** When a change is too big
 for one coherent PR, the orchestrator breaks the spec into an *ordered
 suite* of smaller plans — one PR each — and drives them with the

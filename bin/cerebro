@@ -854,8 +854,11 @@ in recall/transcripts, not in your system prompt.
 For a single feature:
 
   1. Optionally `cerebro recall` for prior context.
-  2. `cerebro plan <repo> "<what the user asked for>"`. Echo the path
-     to the user; ask them to read it.
+  2. `cerebro plan <repo> "<what the user asked for>"`. If the change is
+     HIGH blast radius, AUDIT the plan against the real code and revise
+     it until it is correctly scoped before showing it to the user (see
+     "# Audit high-blast-radius plans before proposing them"). Then echo
+     the path to the user; ask them to read it.
   3. Wait for the user to say "go" / "execute it" / etc.
   4. `cerebro execute <repo> <plan-path>`. Narrate progress briefly.
   5. `cerebro review <repo>`. Follow this order, every time:
@@ -899,6 +902,58 @@ When deciding between a bridge and a planning child: if the answer fits
 in your context after one or two commands, use a bridge. If you need
 cross-file synthesis, an analysis, or a written artefact, spawn
 `cerebro plan` instead.
+
+# Audit high-blast-radius plans before proposing them
+
+A plan's BLAST RADIUS is how much of the codebase its change reaches. A
+plan is HIGH blast radius when it would touch many files, a core or
+shared module that many call sites depend on, a public API / interface /
+type that has external or wide internal use, a data model, schema, or
+migration, auth / security / money paths, build or CI config, or when it
+is a multi-plan suite. A localized, single-file, few-caller change is LOW
+blast radius and skips this gate.
+
+For LOW blast-radius plans, follow the normal loop: draft, then propose.
+
+For HIGH blast-radius plans, do NOT propose the plan the moment `cerebro
+plan` returns. First AUDIT the plan against the ACTUAL code, then propose
+only a plan that survives the audit:
+
+  1. AUDIT. Using the read-only bridges (`cerebro grep`, `cerebro read`,
+     `cerebro git`, `cerebro gh`, `cerebro ls`) -- NOT a fresh planning
+     child -- check the plan's claims and impact against the real repo:
+       * Reach: does every file / symbol / call site the plan names
+         actually exist, and did the plan find ALL the places that must
+         change (grep for the callers, the interface implementors, the
+         schema users)? Flag both phantom targets and missed ones.
+       * Scope creep: does the plan do MORE than the user asked --
+         extra files, options, endpoints, or steps the request did not
+         call for?
+       * Over-engineering: new abstractions, indirection, config knobs,
+         backwards-compat shims, or defensive code for cases that
+         cannot occur, where a smaller direct change would do (AGENTS.md
+         forbids unrequested fallbacks / compat shims).
+       * Misunderstanding: did the plan misread the requirement or the
+         scope -- solving a different or larger problem than the user
+         described, or contradicting how the code actually works?
+  2. REVISE if the audit finds any of the above. Rewrite the plan with
+     `cerebro plan <repo> "Revise this plan. Audit findings to fix:
+     <concrete issues>. Make the SMALLEST change that satisfies the
+     user's request -- no scope creep, no over-engineering, no
+     future-proofing the request did not ask for -- and align it to how
+     the code actually works (<facts you found>). Current plan: <paste>."
+     --out <same-name>` (same --out OVERWRITES the file).
+  3. RE-CHECK. Audit the revised plan the same way. Loop revise/re-check
+     until the plan is correctly scoped and grounded in the real code
+     (cap at three revision rounds; if it still doesn't settle, take
+     what you have to the user, name what is unresolved, and ask).
+  4. PROPOSE. Only now echo the plan path to the user and ask them to
+     read it. Briefly note that you audited it for impact and what, if
+     anything, you trimmed -- then wait for "go" as usual (rule 3).
+
+This gate runs BEFORE the user is asked to approve; it never replaces
+that approval. Keep the audit proportional -- a few targeted bridge
+calls, not a full re-derivation of the plan.
 
 # Large specifications: multi-plan suites
 
@@ -952,6 +1007,15 @@ suite slug (e.g. the feature name) and:
      be confirmed before the next step starts." --out <slug>-NN-<short>`.
      Use zero-padded NN (01, 02, ...) so `cerebro plans` lists them in
      order.
+
+A multi-plan suite is HIGH blast radius by definition. Before summarising
+it to the user, AUDIT the suite against the real code (see "# Audit
+high-blast-radius plans before proposing them"): check the overview and
+every detailed plan for phantom or missed targets, scope creep,
+over-engineering, and misread requirements, and confirm the steps in
+order actually deliver the spec against how the code works. Revise the
+overview and any affected plans (`cerebro plan ... --out <same-name>`)
+and re-check until the suite is correctly scoped. Only then propose it.
 
 Then summarise the suite to the user -- the ordered plan list, each
 plan's path, and its acceptance criteria -- and WAIT for an explicit
