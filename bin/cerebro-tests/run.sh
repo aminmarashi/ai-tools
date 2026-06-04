@@ -973,6 +973,32 @@ fi
 STDERR_CONTAINS="usage: cerebro learn-set" \
 run_case 110 "learn-set blank errors" 1 -- "$CEREBRO_BIN" learn-set ""
 
+# --- 111. execute: unknown arg still rejected (stacked-branch flags added) ---
+STDERR_CONTAINS="unknown arg" \
+run_case 111 "execute unknown arg rejected" 1 -- "$CEREBRO_BIN" execute "$REPO" --frob
+
+# --- 112. execute: --base/--branch without a plan or --prompt still errors ---
+# Confirms the new flags parse but don't bypass the plan/prompt requirement,
+# and fire before any child claude is spawned.
+STDERR_CONTAINS="requires <plan-path> or --prompt" \
+run_case 112 "execute --base/--branch needs plan or prompt" 1 -- \
+  "$CEREBRO_BIN" execute "$REPO" --base feat/step-1 --branch feat/step-2
+
+# --- 113. review: --criteria-file missing path fails fast (before codex) ---
+STDERR_CONTAINS="cannot read --criteria-file" \
+run_case 113 "review --criteria-file missing path" 1 -- \
+  "$CEREBRO_BIN" review "$REPO" --criteria-file "$WORKDIR/no-such-plan.md"
+
+# --- 113b. review: --criteria-file empty file also fails fast ---
+: > "$WORKDIR/empty-plan.md"
+STDERR_CONTAINS="cannot read --criteria-file" \
+run_case 113b "review --criteria-file empty file" 1 -- \
+  "$CEREBRO_BIN" review "$REPO" --criteria-file "$WORKDIR/empty-plan.md"
+
+# --- 114. review: unknown arg rejected ---
+STDERR_CONTAINS="unknown arg" \
+run_case 114 "review unknown arg rejected" 1 -- "$CEREBRO_BIN" review "$REPO" --frob
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'

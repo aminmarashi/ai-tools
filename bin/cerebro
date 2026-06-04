@@ -18,8 +18,8 @@
 # never types these; they exist for the chat to drive:
 #   cerebro plan <repo> "<desc>" [--out <name>]
 #   cerebro plans
-#   cerebro execute <repo> (<plan-path> | --prompt "<text>")
-#   cerebro review <repo> [--base <ref>]
+#   cerebro execute <repo> (<plan-path> | --prompt "<text>") [--base <branch>] [--branch <name>]
+#   cerebro review <repo> [--base <ref>] [--criteria-file <plan-path>]
 #   cerebro apply-review <repo> (<findings-path> [--notes "..."] | --prompt "<text>")
 #   cerebro doc-write <repo> (<plan-path> [--notes "..."] | --prompt "<text>")
 #   cerebro recall <query>
@@ -583,6 +583,7 @@ behalf, by calling them through your Bash tool (which is restricted to
     List the plan files in the current session with timestamps.
 
   cerebro execute <repo-abs-path> (<plan-path> | --prompt "<text>")
+                  [--base <branch>] [--branch <name>]
     Spawn a full-edit child claude with cwd=<repo>. It fetches the base
     branch, branches from the up-to-date base, implements the work,
     commits, pushes, and opens a PR via gh. The
@@ -591,13 +592,21 @@ behalf, by calling them through your Bash tool (which is restricted to
     `--prompt "<text>"` form skips the plan file and hands <text>
     straight to the child as the task to do -- use it only when the
     user has explicitly asked to skip planning (see rule 3).
+    --base <branch> and --branch <name> drive STACKED PRs (used by the
+    multi-plan suite workflow below): --base pins the branch this PR
+    forks from and targets (so plan 2 stacks on plan 1's branch instead
+    of main), and --branch pins the new branch's exact name so you know
+    it deterministically and can pass it as the next plan's --base. Omit
+    both for a normal standalone PR off the repo's default base. If the
+    plan file ends with an acceptance-criteria checkpoint, the child
+    implements to meet it and self-verifies before opening the PR.
     AGENTS.md bootstrap: if the repo lacks AGENTS.md / CLAUDE.md at
     the root, execute auto-adds them from the user-editable templates
     at $CEREBRO_HOME/templates/ as a separate first commit before the
     plan work. Existing AGENTS.md / CLAUDE.md are never modified. You
     don't have to mention this explicitly to the user unless they ask.
 
-  cerebro review <repo-abs-path> [--base <ref>]
+  cerebro review <repo-abs-path> [--base <ref>] [--criteria-file <plan-path>]
     Run codex (non-mutating) against the current branch diff vs <ref>.
     Default base resolution: if a previous `cerebro review` ran in
     this session on the same repo + branch, the base defaults to the
@@ -607,6 +616,13 @@ behalf, by calling them through your Bash tool (which is restricted to
     origin/HEAD, then `main`. Pass --base explicitly only when you
     deliberately want to widen the scope (e.g., the user asks for a
     full re-review). The findings file path is echoed on stdout.
+    --criteria-file <plan-path> turns the review into a CHECKPOINT
+    gate: codex additionally checks the diff against every acceptance
+    criterion in that plan and ends the findings file with a single
+    line `ACCEPTANCE CRITERIA: MET` or `ACCEPTANCE CRITERIA: NOT MET`.
+    Pass the plan you just executed so the multi-plan suite workflow
+    can decide whether to advance to the next plan. Read the findings
+    file (as always) to see the per-criterion verdicts and the bugs.
 
   cerebro apply-review <repo-abs-path>
                        (<findings-path> [--notes "..."] | --prompt "<text>")
@@ -883,6 +899,119 @@ When deciding between a bridge and a planning child: if the answer fits
 in your context after one or two commands, use a bridge. If you need
 cross-file synthesis, an analysis, or a written artefact, spawn
 `cerebro plan` instead.
+
+# Large specifications: multi-plan suites
+
+When the user asks for a large change or a specification too big for one
+coherent PR, do NOT cram it into a single plan. Break it into an ORDERED
+SUITE of smaller plans, each of which becomes ONE pull request, stacked
+so that executing them all in order implements the specification FULLY
+and CORRECTLY. You orchestrate the whole suite yourself using the
+existing subcommands -- there is no special "suite" command. YOU are the
+persistent mind that keeps the suite coherent across plans; hold the
+plan list, their order, the branch chain, and per-checkpoint attempt
+counts in your working context and narrate progress as you go.
+
+## 1. Decompose (then WAIT for go)
+
+Decomposition is just `cerebro plan` called more than once. Pick a short
+suite slug (e.g. the feature name) and:
+
+  a. Draft an OVERVIEW: `cerebro plan <repo> "Decompose this
+     specification into an ORDERED set of PR-sized implementation steps.
+     For each step give a one-line summary and its dependencies on
+     earlier steps, argue why the steps in order fully and correctly
+     satisfy the spec, and keep each step independently reviewable.
+     <spec...>" --out <slug>-00-overview`. Read it.
+  b. Draft one DETAILED plan per step, in order, threading the overview
+     and the spec as context so the boundaries stay coherent:
+     `cerebro plan <repo> "Detailed plan for step N of the overview
+     below. <overview + spec + what earlier steps already deliver>. END
+     the plan with a section titled exactly '## Acceptance criteria
+     (checkpoint)' -- a checklist of concrete, independently VERIFIABLE
+     conditions (commands to run, behaviours to observe, files/functions
+     that must exist and work) that define DONE for this step and must
+     be confirmed before the next step starts." --out <slug>-NN-<short>`.
+     Use zero-padded NN (01, 02, ...) so `cerebro plans` lists them in
+     order.
+
+Then summarise the suite to the user -- the ordered plan list, each
+plan's path, and its acceptance criteria -- and WAIT for an explicit
+"go" before executing anything (rule 3 applies to the whole suite). The
+user approves the decomposition ONCE.
+
+## 2. Execute the suite autonomously (stacked PRs)
+
+After "go", execute the plans IN ORDER without pausing between them
+(pause only to escalate per step 4). The PRs STACK: the first branches
+off the repo's default base (main); every later plan branches off the
+PREVIOUS plan's branch and targets it as the PR base. Drive this with
+the execute flags, naming branches yourself so you always know the next
+plan's base:
+
+  * Plan 1: `cerebro execute <repo> <slug>-01-... --branch <feat/slug-01>`
+    (no --base: forks from main).
+  * Plan N (N>1): `cerebro execute <repo> <slug>-NN-...
+    --base <feat/slug-(N-1)> --branch <feat/slug-NN>`.
+
+Choose conventional branch names (feat/..., per AGENTS.md). Run exactly
+one mutating subcommand at a time (rule 8); finish a plan's checkpoint
+before starting the next plan's execute.
+
+## 3. Verify each checkpoint with codex
+
+After each plan's `cerebro execute`, gate advancement on the acceptance
+criteria via codex:
+
+  `cerebro review <repo> --criteria-file <the-plan-you-just-ran>`
+
+Because the PR's base is the previous plan's branch, the review's
+default base resolves to that branch, so codex sees only THIS plan's
+diff. READ the findings file. The checkpoint PASSES only when both hold:
+the final line says `ACCEPTANCE CRITERIA: MET`, AND there are no
+in-scope, genuinely-important findings (apply the same scope/importance
+gates as the normal loop). Only then advance to the next plan, using
+this plan's branch as the next --base.
+
+## 4. When a checkpoint fails: bounded revise-and-retry, then escalate
+
+If the checkpoint does not pass, make corrective attempts -- but no more
+than THREE attempts on any single checkpoint. Pick the right kind of
+correction each time:
+
+  * Implementation is buggy but the plan's approach is SOUND -> scope
+    the real, in-scope findings and run `cerebro apply-review` on the
+    same branch, then re-review with --criteria-file. (Small fix.)
+  * The PLAN ITSELF is wrong -- the criteria are unreachable as written,
+    or the approach can't satisfy the spec -> REPLAN: rewrite the
+    failing plan to route around the failure with
+    `cerebro plan <repo> "Revise this plan to fix the following failure
+    so it cannot recur: <what failed>. Current plan: <paste>. Overview
+    and sibling plans: <paste>. Preserve causality with the plans that
+    already shipped (do not contradict them) and keep the acceptance
+    criteria verifiable." --out <slug>-NN-<short>` (same --out
+    OVERWRITES the file). If the failure changes what later steps must
+    do, also revise the affected DOWNSTREAM plans and their criteria the
+    same way, and update <slug>-00-overview, so the suite stays
+    coherent. Plans that have ALREADY shipped are fixed history -- don't
+    rewrite them; absorb the difference into the current or later plans.
+    Then re-implement the revised plan on the SAME branch with
+    `cerebro apply-review <repo> --prompt "<the revised plan / the delta
+    to apply>"` (you are already on that branch) and re-review.
+
+Count every apply-review/replan round as one attempt. If the checkpoint
+still fails after the third attempt, STOP and ask the user: summarise
+what failed, the criteria that won't pass, what you tried, and the
+revision you propose next. Do not loop indefinitely.
+
+## 5. Finish
+
+When the last checkpoint passes, summarise the full PR stack to the user
+(each PR, its base, what it delivers, that its criteria were met) so
+they can review and merge the stack in order. Optionally `cerebro
+doc-write` at the end. If the user merges and asks you to continue,
+remember the stack base may shift -- re-derive bases from the open PRs
+with `cerebro gh <repo> pr list` if unsure.
 
 # Shortcuts
 
@@ -1279,6 +1408,8 @@ cmd_execute() {
   local repo="${1:-}"; shift || true
   local plan_path=""
   local prompt_text=""
+  local base_branch=""
+  local new_branch=""
   # Second positional, if present and not a flag, is the plan path.
   if [[ $# -gt 0 && "${1:-}" != --* ]]; then
     plan_path="$1"; shift
@@ -1286,11 +1417,13 @@ cmd_execute() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --prompt) shift; prompt_text="${1:-}"; shift || true ;;
+      --base)   shift; base_branch="${1:-}"; shift || true ;;
+      --branch) shift; new_branch="${1:-}";  shift || true ;;
       *) die "execute: unknown arg: $1" ;;
     esac
   done
   [[ -n "$repo" ]] \
-    || die "usage: cerebro execute <repo-abs-path> (<plan-path> | --prompt \"<text>\")"
+    || die "usage: cerebro execute <repo-abs-path> (<plan-path> | --prompt \"<text>\") [--base <branch>] [--branch <name>]"
   [[ "$repo" = /* ]] || die "execute: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "execute: repo not a directory: $repo"
   if [[ -n "$plan_path" && -n "$prompt_text" ]]; then
@@ -1322,18 +1455,42 @@ commit format, and project-wide guardrails. Before you branch, fetch the
 base branch from the remote (e.g. `git fetch origin <base>`) and create
 your new branch from the freshly-fetched base (e.g. `origin/main`) so you
 always work on the most up-to-date version. Create a new feature branch
-per AGENTS.md conventions. Implement the plan. Run the tests, type
-checks, or linters that the repo conventions imply. Commit per
+per AGENTS.md conventions. Implement the plan. If the plan includes an
+"Acceptance criteria" / checkpoint section, treat those criteria as the
+definition of done: implement so every criterion is fully and correctly
+met, and verify them yourself (run the relevant tests/commands and
+observe the behaviours they name) before you open the PR. Run the tests,
+type checks, or linters that the repo conventions imply. Commit per
 AGENTS.md, push the branch, and open a pull request via the `gh` CLI.
 If `gh` is not authenticated, push the branch and tell the user; do not
 attempt to authenticate. Stop after the PR is open.'
 
-  if [[ -n "$plan_path" ]]; then
-    say "cerebro: executing $plan_path in $repo"
-  else
-    say "cerebro: executing inline prompt in $repo"
+  # Stacked-branch support. --base pins the branch this PR forks from and
+  # targets (so a suite of plans can stack: plan 1 off main, plan 2 off
+  # plan 1's branch, ...); --branch pins the new branch's name so the
+  # orchestrator deterministically knows it for the next plan's --base.
+  # When neither is given the child keeps its default behaviour (fetch the
+  # repo's base branch, branch from it, open the PR against the default base).
+  local branch_instr=""
+  if [[ -n "$base_branch" || -n "$new_branch" ]]; then
+    branch_instr='STACKED-BRANCH MODE -- this overrides the default fetch/branch/PR-base behaviour:'
+    if [[ -n "$base_branch" ]]; then
+      branch_instr+=$'\n'"  * Fetch '$base_branch' from origin (git fetch origin $base_branch) and create your new branch from origin/$base_branch -- NOT from origin/main or any other default base."
+    fi
+    if [[ -n "$new_branch" ]]; then
+      branch_instr+=$'\n'"  * Name the new branch EXACTLY '$new_branch' (it already follows the repo's conventions; do not invent a different name)."
+    fi
+    if [[ -n "$base_branch" ]]; then
+      branch_instr+=$'\n'"  * Open the pull request with its base set to '$base_branch' (gh pr create --base $base_branch) so this PR stacks on top of it."
+    fi
   fi
-  log_event "execute_started" "$source_desc repo=$repo"
+
+  if [[ -n "$plan_path" ]]; then
+    say "cerebro: executing $plan_path in $repo${base_branch:+ (base=$base_branch)}${new_branch:+ (branch=$new_branch)}"
+  else
+    say "cerebro: executing inline prompt in $repo${base_branch:+ (base=$base_branch)}${new_branch:+ (branch=$new_branch)}"
+  fi
+  log_event "execute_started" "$source_desc repo=$repo base=${base_branch:-default} branch=${new_branch:-auto}"
 
   local opts=(-p --permission-mode bypassPermissions
               --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
@@ -1364,6 +1521,7 @@ attempt to authenticate. Stop after the PR is open.'
       printf 'Then read AGENTS.md (existing or just-written) and follow its branch/commit rules for the rest of this run.\n\n'
       printf '<bootstrap-agents-md>\n%s\n</bootstrap-agents-md>\n\n' "$agents_template"
       printf '<bootstrap-claude-md>\n%s\n</bootstrap-claude-md>\n\n' "$claude_template"
+      [[ -n "$branch_instr" ]] && printf '%s\n\n' "$branch_instr"
       printf '<plan>\n%s\n</plan>\n' "$plan_body"
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
@@ -1388,15 +1546,27 @@ cmd_review() {
   local repo="${1:-}"; shift || true
   local base=""
   local explicit_base="false"
+  local criteria_file=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --base) shift; base="${1:-}"; explicit_base="true"; shift || true ;;
+      --criteria-file) shift; criteria_file="${1:-}"; shift || true ;;
       *) die "review: unknown arg: $1" ;;
     esac
   done
-  [[ -n "$repo" ]] || die "usage: cerebro review <repo-abs-path> [--base <ref>]"
+  [[ -n "$repo" ]] || die "usage: cerebro review <repo-abs-path> [--base <ref>] [--criteria-file <plan-path>]"
   [[ "$repo" = /* ]] || die "review: repo path must be absolute: $repo"
   [[ -d "$repo" ]] || die "review: repo not a directory: $repo"
+
+  # --criteria-file points at the plan whose acceptance criteria codex must
+  # check the change against. Validate it up front (before any git/codex
+  # work) so a typo fails fast rather than after a full review.
+  local criteria_block=""
+  if [[ -n "$criteria_file" ]]; then
+    [[ -r "$criteria_file" && -s "$criteria_file" ]] \
+      || die "review: cannot read --criteria-file (or it is empty): $criteria_file"
+    criteria_block="$(cat "$criteria_file")"
+  fi
 
   # Canonical worktree root keys the per-repo review-state file so
   # re-reviews diff against the previously-reviewed commit instead of
@@ -1488,6 +1658,17 @@ cmd_review() {
   # instead of guessing or pre-loading a huge patch into context.
   local codex_prompt
   codex_prompt="Review the code changes against the $base_description. The merge base commit for this comparison is $merge_base. Run \`git diff $merge_base\` to inspect the changes included since that merge base. Provide prioritized, actionable findings: bugs, regressions, security issues, missing tests, and correctness problems. Skip style nits, speculative concerns, and over-engineering suggestions (gold-plating, defensive code for cases that cannot occur, premature abstraction, or broad rewrites where a small fix would do); prefer the smallest change that resolves a real problem. For each finding, give a one-line title, the file or area affected, and a sentence explaining the concern and a suggested fix. Output Markdown only; no preamble."
+
+  # When the orchestrator supplies the plan via --criteria-file, make codex
+  # also act as the checkpoint gate: verify the change against EACH
+  # acceptance criterion and end with a single machine-readable verdict line
+  # the orchestrator keys its advance/retry decision on.
+  if [[ -n "$criteria_block" ]]; then
+    codex_prompt+=" This change is meant to implement the plan below, which ends with an acceptance-criteria checkpoint. After your findings, add a section headed '## Acceptance criteria' that checks the actual implemented diff against EACH criterion in the plan: list every criterion with a verdict of MET, PARTIAL, or NOT MET and a one-line justification grounded in the diff. Then output, as the VERY LAST line, exactly 'ACCEPTANCE CRITERIA: MET' if and only if every criterion is fully and correctly met, otherwise exactly 'ACCEPTANCE CRITERIA: NOT MET'. Do not soften a PARTIAL or unmet criterion into MET. The plan follows between the markers.
+<plan>
+$criteria_block
+</plan>"
+  fi
 
   local codex_opts=(exec --sandbox read-only --skip-git-repo-check --cd "$repo")
   [[ -n "$CEREBRO_REVIEW_MODEL" ]] && codex_opts+=(--model "$CEREBRO_REVIEW_MODEL")

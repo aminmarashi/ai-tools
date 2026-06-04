@@ -218,6 +218,27 @@ pushes, opens a PR via `gh` → orchestrator runs codex against the
 diff, summarises the findings, and applies the ones that matter → loop
 until codex is quiet → optionally `doc-write` at the end.
 
+**Large specifications (multi-plan suites).** When a change is too big
+for one coherent PR, the orchestrator breaks the spec into an *ordered
+suite* of smaller plans — one PR each — and drives them with the
+existing subcommands (no special command). It drafts an overview plus
+one detailed plan per step, each ending in an `## Acceptance criteria
+(checkpoint)` section, then summarises the suite and waits for a single
+"go". After approval it executes the plans in order as **stacked PRs**:
+the first branches off `main`, each later one off the previous plan's
+branch (`cerebro execute … --base <prev-branch> --branch <this-branch>`).
+Each PR is gated by a codex **checkpoint** — `cerebro review …
+--criteria-file <plan>` feeds the plan's acceptance criteria into the
+review, and codex ends its findings with `ACCEPTANCE CRITERIA: MET` or
+`NOT MET`. The orchestrator advances to the next plan only when the
+criteria are met and no in-scope finding remains. On a failing
+checkpoint it makes up to three bounded corrective attempts — a scoped
+`apply-review` when the implementation is buggy, or a *replan* (rewrite
+the failing plan, and any downstream plans/criteria, via `cerebro plan
+--out <same-name>`) when the plan's approach itself is wrong — then
+stops and asks you. It runs autonomously through the stack between the
+initial "go" and either the final PR or an escalation.
+
 **AGENTS.md bootstrap.** The first time `cerebro execute` runs against
 a repo that lacks `AGENTS.md` / `CLAUDE.md` at the root, it adds them
 from the templates at `~/.cerebro/templates/` as a separate first
