@@ -912,6 +912,18 @@ persistent mind that keeps the suite coherent across plans; hold the
 plan list, their order, the branch chain, and per-checkpoint attempt
 counts in your working context and narrate progress as you go.
 
+Work like a lazy senior engineer: keep it SIMPLE. The suite exists only
+to make a big change reviewable -- not as licence to gold-plate it. Use
+the FEWEST plans that deliver the spec, scope each plan to exactly what
+the spec asks for (no speculative steps, extra options, or
+future-proofing nobody requested), and never let the suite balloon
+beyond the request. Each plan must also read as a SELF-CONTAINED
+implementation plan, in its own terms: do NOT mention the suite, the
+other plans, step numbers, the decomposition, or the branch names inside
+a plan's body. Those are YOUR orchestration bookkeeping, not the plan's
+content; the overview/sibling context you thread into a plan prompt is
+there to set boundaries, not to be echoed back into the plan.
+
 ## 1. Decompose (then WAIT for go)
 
 Decomposition is just `cerebro plan` called more than once. Pick a short
@@ -926,7 +938,13 @@ suite slug (e.g. the feature name) and:
   b. Draft one DETAILED plan per step, in order, threading the overview
      and the spec as context so the boundaries stay coherent:
      `cerebro plan <repo> "Detailed plan for step N of the overview
-     below. <overview + spec + what earlier steps already deliver>. END
+     below. <overview + spec + what earlier steps already deliver>. Write
+     the plan as a STANDALONE deliverable in its own terms: the smallest
+     change that satisfies THIS step (no scope creep, no gold-plating, no
+     future-proofing the spec did not ask for), and do NOT mention the
+     other steps, the overview, the suite, the decomposition, or any
+     branch names in the plan body -- the threaded context is only there
+     to keep your boundaries right. END
      the plan with a section titled exactly '## Acceptance criteria
      (checkpoint)' -- a checklist of concrete, independently VERIFIABLE
      conditions (commands to run, behaviours to observe, files/functions
@@ -1344,7 +1362,11 @@ cmd_plan() {
 the codebase you have read access to and produce a Markdown plan that
 another engineer (or another claude session) can execute. Keep paths,
 function names, and file names concrete -- this is a working plan, not
-an offline-reading rewrite. Begin your reply with a Markdown H1 title.
+an offline-reading rewrite. Work like a lazy senior engineer: keep it
+SIMPLE. Plan the smallest change that satisfies the request -- no scope
+creep, no gold-plating, no future-proofing nobody asked for. The plan
+describes only the work itself; do not mention branches, PRs, or other
+orchestration mechanics. Begin your reply with a Markdown H1 title.
 Do not add a preamble before the title. Do not wrap your output in an
 outer code fence. Output ONLY the plan.'
 
