@@ -491,12 +491,16 @@ behalf, by calling them through your Bash tool (which is restricted to
    and review . If an order is genuinely ambiguous, ask one clarifying
    question before acting.
 
-1. You may use only these tools: Read, Grep, Glob, and Bash limited to
-   `cerebro <subcommand> ...` invocations. You have no Edit, Write,
-   NotebookEdit, or unrestricted Bash. You cannot run git, gh, codex,
-   or any editor directly. Every filesystem change, every git operation,
-   every PR action, and every codex review goes through `cerebro
-   <subcommand>`.
+1. You may use only these tools: Read, Grep, Glob, the web tools
+   (WebSearch, WebFetch, and the `mcp__playwright__*` browser tools),
+   and Bash limited to `cerebro <subcommand> ...` invocations. You have
+   full web access: search the web, fetch pages, inspect GitHub
+   repositories and codebases, read documentation, and drive a real
+   browser to view sites visually -- do whatever you need on the web to
+   inform your work. You have no Edit, Write, NotebookEdit, or
+   unrestricted Bash. You cannot run git, gh, codex, or any editor
+   directly. Every filesystem change, every git operation, every PR
+   action, and every codex review goes through `cerebro <subcommand>`.
 2. You do not ask the user for permission to run cerebro subcommands;
    running them is your job. Do narrate what you are doing in plain
    English ("I'll draft a plan now", "the reviewer flagged two
@@ -1312,7 +1316,7 @@ cmd_launch() {
   exec claude \
     --session-id "$sid" \
     --append-system-prompt "$(orchestrator_append_prompt)" \
-    --allowedTools "Bash(cerebro:*) Read Grep Glob"
+    --allowedTools "Bash(cerebro:*) Read Grep Glob WebSearch WebFetch mcp__playwright__*"
 }
 
 # ----- subcommand: cerebro --resume [<id>] ---------------------------------
@@ -1344,12 +1348,12 @@ cmd_resume() {
     exec claude \
       --resume "$id" \
       --append-system-prompt "$(orchestrator_append_prompt)" \
-      --allowedTools "Bash(cerebro:*) Read Grep Glob"
+      --allowedTools "Bash(cerebro:*) Read Grep Glob WebSearch WebFetch mcp__playwright__*"
   else
     exec claude \
       --resume \
       --append-system-prompt "$(orchestrator_append_prompt)" \
-      --allowedTools "Bash(cerebro:*) Read Grep Glob"
+      --allowedTools "Bash(cerebro:*) Read Grep Glob WebSearch WebFetch mcp__playwright__*"
   fi
 }
 
@@ -1437,7 +1441,7 @@ outer code fence. Output ONLY the plan.'
   say "cerebro: planning in $repo -> $out_path"
   log_event "plan_started" "$out_path"
 
-  local opts=(-p --permission-mode bypassPermissions --allowedTools "Read Grep Glob"
+  local opts=(-p --permission-mode bypassPermissions --allowedTools "Read Grep Glob WebSearch WebFetch mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
@@ -1579,7 +1583,7 @@ attempt to authenticate. Stop after the PR is open.'
   log_event "execute_started" "$source_desc repo=$repo base=${base_branch:-default} branch=${new_branch:-auto}"
 
   local opts=(-p --permission-mode bypassPermissions
-              --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
+              --allowedTools "Read Edit Write Bash Grep Glob WebSearch WebFetch mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
@@ -1916,7 +1920,7 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
   fi
 
   local opts=(-p --permission-mode bypassPermissions
-              --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
+              --allowedTools "Read Edit Write Bash Grep Glob WebSearch WebFetch mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
@@ -2005,7 +2009,7 @@ per AGENTS.md and push so the open PR updates.'
   log_event "doc_write_started" "$source_desc"
 
   local opts=(-p --permission-mode bypassPermissions
-              --allowedTools "Read Edit Write Bash Grep Glob mcp__playwright__*"
+              --allowedTools "Read Edit Write Bash Grep Glob WebSearch WebFetch mcp__playwright__*"
               --output-format stream-json --verbose
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
