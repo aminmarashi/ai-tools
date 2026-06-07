@@ -574,6 +574,20 @@ behalf, by calling them through your Bash tool (which is restricted to
    foreground. Wait for the prior mutating run to finish -- watch
    for its task notification / completion -- before starting the
    next one. cerebro does not enforce this; sequence your own work.
+9. Maintain the SESSION SPEC -- the requirements of record for the task
+   at hand. BEFORE you draft or execute any plan, capture what the user
+   actually asked for with `cerebro spec set "<the specification and
+   requirements>"`. Each time the user adds, removes, or changes a
+   requirement, call `spec set` again: the newest text REPLACES the
+   current spec, and cerebro first archives the prior version to history,
+   so nothing is ever lost. The current spec lives at
+   `sessions/<id>/spec.md` and the full history at
+   `sessions/<id>/spec-history.jsonl`; both are plain files you can Read
+   directly, so they SURVIVE context compression. When your context has
+   been compacted, or whenever you are unsure what the task requires,
+   RE-READ `cerebro spec` before acting. The spec -- not any individual
+   plan -- is the authority on WHAT must be delivered (see "# Adapting
+   plans mid-flight against the session spec").
 
 # Available sub-commands
 
@@ -775,9 +789,26 @@ behalf, by calling them through your Bash tool (which is restricted to
     broadens to "any term" (case-insensitive, first 100 hits) and
     prints a note saying so. Prefer one distinctive term per call.
 
+  cerebro spec [set "<specification and requirements>" | history]
+    The session spec -- the requirements of record for the task at hand.
+      * `cerebro spec` (no action): print the current spec followed by a
+        count of historical versions. Read this to re-ground yourself
+        after a context compaction, or whenever you are unsure whether an
+        in-flight adjustment still meets the requirements.
+      * `cerebro spec set "<text>"`: record the current specification and
+        requirements. The new text REPLACES the current spec; the prior
+        version is archived to the append-only spec history first, so the
+        full history is preserved. Call this BEFORE planning, and again
+        every time the user adds, removes, or changes a requirement.
+        Capture WHAT must be delivered and any constraints the user
+        stated -- not your plan for how to do it.
+      * `cerebro spec history`: print every recorded version, oldest
+        first, each with its timestamp -- the full evolution of the
+        task's requirements across the session.
+
   cerebro status
-    Print the current session state -- plans on file, last child
-    invocation, last review, and a learnings summary.
+    Print the current session state -- the session spec, plans on file,
+    last child invocation, last review, and a learnings summary.
 
   cerebro learnings
     Print the active learned preferences and a count of pending
@@ -857,6 +888,10 @@ in recall/transcripts, not in your system prompt.
 
 For a single feature:
 
+  0. Capture the requirements: `cerebro spec set "<what the user asked
+     for and any constraints>"` (and re-run it whenever the user changes
+     a requirement). This is the spec you measure every later adjustment
+     against (see "# Adapting plans mid-flight against the session spec").
   1. Optionally `cerebro recall` for prior context.
   2. `cerebro plan <repo> "<what the user asked for>"`. If the change is
      HIGH blast radius, AUDIT the plan against the real code and revise
@@ -906,6 +941,40 @@ When deciding between a bridge and a planning child: if the answer fits
 in your context after one or two commands, use a bridge. If you need
 cross-file synthesis, an analysis, or a written artefact, spawn
 `cerebro plan` instead.
+
+# Adapting plans mid-flight against the session spec
+
+A plan is a means; the SESSION SPEC (`cerebro spec`) is the end. Once the
+user has approved a plan and work is under way, you WILL sometimes find
+the plan was wrong, hit a wall, or learn something that makes the planned
+steps unworkable or suboptimal. When that happens you may ADAPT the plan
+and keep going WITHOUT pausing to ask the user -- PROVIDED the adjusted
+work still satisfies the session spec and the user's standing
+requirements. This autonomy is deliberate: re-prompting the user for
+every mid-course correction defeats the point. So:
+
+  * Re-read `cerebro spec` whenever you are unsure what the task
+    actually requires (and always after a context compaction).
+  * If the adjustment clearly still meets the spec, make it: narrate the
+    change in plain English, then revise the plan file so it stays the
+    source of truth (`cerebro plan <repo> "Revise this plan: <what
+    changed and why> ... Current plan: <paste>." --out <same-name>`
+    OVERWRITES it), and continue.
+
+STOP and ask the user when an adjustment would, or even MIGHT, diverge
+from the spec -- treat DOUBT as divergence. Diverging means any of:
+  * dropping, weakening, or deferring a requirement the spec states;
+  * changing user-visible behaviour, an interface, or an outcome the
+    user asked for;
+  * expanding scope beyond what the spec describes (new features,
+    options, or surface the user did not request);
+  * trading away something the spec implies the user cares about
+    (correctness, a deadline, security, data integrity, a contract).
+When you stop, summarise concisely: the wall you hit, the adjustment you
+propose, and exactly how it relates to the spec -- then wait for the
+user. Your autonomy covers HOW you satisfy the spec; it NEVER covers
+changing WHAT the spec asks for. When the user resolves it, capture any
+new or changed requirement with `cerebro spec set` before resuming.
 
 # Audit high-blast-radius plans before proposing them
 
@@ -984,6 +1053,11 @@ content; the overview/sibling context you thread into a plan prompt is
 there to set boundaries, not to be echoed back into the plan.
 
 ## 1. Decompose (then WAIT for go)
+
+First record the whole specification as the session spec with
+`cerebro spec set "<the full specification and requirements>"` -- this is
+the record of record the suite as a whole must satisfy, and what you
+measure any mid-flight plan adjustment against (rule 9). Then decompose.
 
 Decomposition is just `cerebro plan` called more than once. Pick a short
 suite slug (e.g. the feature name) and:
@@ -2096,6 +2170,17 @@ cmd_status() {
   echo "session: $CEREBRO_SESSION_ID"
   echo "dir:     $CEREBRO_SESSION_DIR"
   echo
+  local spec_f spec_h
+  spec_f="$CEREBRO_SESSION_DIR/spec.md"
+  spec_h="$CEREBRO_SESSION_DIR/spec-history.jsonl"
+  if [[ -s "$spec_f" ]]; then
+    local sv=0
+    [[ -f "$spec_h" ]] && sv="$(grep -c '' "$spec_h" 2>/dev/null || printf 0)"
+    echo "session spec: present ($spec_f; ${sv} version(s) in history)"
+  else
+    echo "session spec: (none)"
+  fi
+  echo
   echo "plans:"
   if [[ -d "$CEREBRO_SESSION_DIR/plans" ]] && \
      [[ -n "$(ls -A "$CEREBRO_SESSION_DIR/plans" 2>/dev/null)" ]]; then
@@ -2196,6 +2281,88 @@ cmd_learnings() {
   else
     echo "  (none yet)"
   fi
+}
+
+# ----- subcommands: the session spec (requirements of record) ---------------
+# spec.md holds the CURRENT authoritative specification + requirements for the
+# session; spec-history.jsonl is an append-only log of every version ever set
+# (one {ts,text} object per line, oldest first). The newest history entry
+# always equals spec.md. Both are per-session files the orchestrator can Read
+# directly, so the requirements survive a context compaction. The orchestrator
+# has no Write tool, so `spec set` is its only way to record them.
+
+spec_file()         { printf '%s\n' "$CEREBRO_SESSION_DIR/spec.md"; }
+spec_history_file() { printf '%s\n' "$CEREBRO_SESSION_DIR/spec-history.jsonl"; }
+
+# cerebro spec [set "<text>" | history]
+#   (no action)  -- print the current spec + a count of historical versions
+#   set "<text>" -- replace the current spec, archiving the new version to the
+#                   append-only history first so the full evolution is kept
+#   history      -- print every recorded version, oldest first, with timestamps
+cmd_spec() {
+  require_session
+  case "${1:-show}" in
+    set)     shift; spec_set "$@" ;;
+    history) shift; spec_history ;;
+    show)    spec_show ;;
+    *) die "usage: cerebro spec [set \"<specification and requirements>\" | history]" ;;
+  esac
+}
+
+spec_set() {
+  local text="${*:-}"
+  [[ -n "${text//[[:space:]]/}" ]] || die "usage: cerebro spec set \"<specification and requirements>\""
+  local sf hf ts
+  sf="$(spec_file)"; hf="$(spec_history_file)"
+  ts="$(ts_iso)"
+  jq -nc --arg ts "$ts" --arg text "$text" '{ts:$ts, text:$text}' \
+    >> "$hf" || die "spec set: cannot write history ($hf)"
+  printf '%s\n' "$text" > "$sf" || die "spec set: cannot write spec ($sf)"
+  log_event "spec_set" "chars=${#text}"
+  say "cerebro: recorded session spec ($sf, ${#text} chars; history: $hf)"
+}
+
+spec_show() {
+  local sf hf
+  sf="$(spec_file)"; hf="$(spec_history_file)"
+  if [[ -s "$sf" ]]; then
+    cat "$sf"
+    local n=0
+    [[ -f "$hf" ]] && n="$(grep -c '' "$hf" 2>/dev/null || printf 0)"
+    echo
+    echo "--- current session spec: $sf"
+    echo "--- history: ${n} version(s) recorded ($hf)"
+  else
+    echo "cerebro: no session spec recorded yet ($sf)"
+    echo "Record one with: cerebro spec set \"<specification and requirements>\""
+  fi
+}
+
+spec_history() {
+  local hf; hf="$(spec_history_file)"
+  if [[ ! -s "$hf" ]]; then
+    echo "cerebro: no session spec history yet ($hf)"
+    return 0
+  fi
+  python3 - "$hf" <<'PY'
+import json, sys
+path = sys.argv[1]
+n = 0
+with open(path) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        n += 1
+        print(f"=== version {n}  [{rec.get('ts', '?')}] ===")
+        print(rec.get("text", ""))
+        print()
+print(f"--- {n} version(s) total ---")
+PY
 }
 
 # ----- subcommand: cerebro ls <repo> [path] --------------------------------
@@ -2978,6 +3145,7 @@ main() {
     doc-write) shift; cmd_doc_write "$@" ;;
     recall) shift; cmd_recall "$@" ;;
     status) shift; cmd_status "$@" ;;
+    spec) shift; cmd_spec "$@" ;;
     learnings)  shift; cmd_learnings "$@" ;;
     learn-note) shift; cmd_learn_note "$@" ;;
     learn-set)  shift; cmd_learn_set "$@" ;;

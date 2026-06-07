@@ -999,6 +999,78 @@ run_case 113b "review --criteria-file empty file" 1 -- \
 STDERR_CONTAINS="unknown arg" \
 run_case 114 "review unknown arg rejected" 1 -- "$CEREBRO_BIN" review "$REPO" --frob
 
+# ========================================================================
+# 115-122. Session spec: the requirements of record. `spec set` replaces the
+# current spec and archives every version to an append-only history;
+# `spec` / `spec history` read them back. These are per-session files that
+# survive a context compaction.
+# ========================================================================
+SPEC_FILE="$CEREBRO_HOME/sessions/$CEREBRO_SESSION_ID/spec.md"
+SPEC_HIST="$CEREBRO_HOME/sessions/$CEREBRO_SESSION_ID/spec-history.jsonl"
+
+# --- 115. spec on a fresh session reports none ---
+STDOUT_CONTAINS="no session spec recorded yet" \
+run_case 115 "spec empty reports none" 0 -- "$CEREBRO_BIN" spec
+
+# --- 116. spec set records the current spec ---
+run_case 116 "spec set records spec" 0 -- \
+  "$CEREBRO_BIN" spec set "Build a widget that does X under constraint Y."
+if [[ -s "$SPEC_FILE" ]] && grep -q "constraint Y" "$SPEC_FILE"; then
+  printf 'PASS  116b  spec set wrote spec.md\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  116b  spec set did not write spec.md\n'; fail=$((fail + 1))
+  failures+=("116b spec set spec.md missing")
+fi
+if [[ -s "$SPEC_HIST" ]] && grep -q "constraint Y" "$SPEC_HIST"; then
+  printf 'PASS  116c  spec set appended to history\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  116c  spec set did not append to history\n'; fail=$((fail + 1))
+  failures+=("116c spec set history missing entry")
+fi
+
+# --- 117. spec prints the current spec ---
+STDOUT_CONTAINS="constraint Y" \
+run_case 117 "spec prints current spec" 0 -- "$CEREBRO_BIN" spec
+
+# --- 118. spec set again overrides current but keeps history ---
+run_case 118 "spec set overrides current" 0 -- \
+  "$CEREBRO_BIN" spec set "Revised: build a gadget that does Z."
+# Current spec is the newest text only...
+if grep -q "gadget that does Z" "$SPEC_FILE" && ! grep -q "constraint Y" "$SPEC_FILE"; then
+  printf 'PASS  118b  spec.md holds only the latest version\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  118b  spec.md did not override cleanly\n'; fail=$((fail + 1))
+  failures+=("118b spec.md override failed")
+fi
+# ...but history retains BOTH versions.
+hist_lines="$(grep -c '' "$SPEC_HIST" 2>/dev/null || printf 0)"
+if [[ "$hist_lines" -eq 2 ]] && grep -q "constraint Y" "$SPEC_HIST" && grep -q "gadget that does Z" "$SPEC_HIST"; then
+  printf 'PASS  118c  history retains all versions\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  118c  history lost a version (lines=%s)\n' "$hist_lines"; fail=$((fail + 1))
+  failures+=("118c spec history lost a version")
+fi
+
+# --- 119. spec footer reports the history count ---
+STDOUT_CONTAINS="2 version(s) recorded" \
+run_case 119 "spec reports history count" 0 -- "$CEREBRO_BIN" spec
+
+# --- 120. spec history prints every version oldest first ---
+STDOUT_CONTAINS="2 version(s) total" \
+run_case 120 "spec history prints all versions" 0 -- "$CEREBRO_BIN" spec history
+
+# --- 121. spec set with blank text errors ---
+STDERR_CONTAINS="usage: cerebro spec set" \
+run_case 121 "spec set blank errors" 1 -- "$CEREBRO_BIN" spec set "   "
+
+# --- 121b. spec with an unknown action errors ---
+STDERR_CONTAINS="usage: cerebro spec" \
+run_case 121b "spec unknown action errors" 1 -- "$CEREBRO_BIN" spec frobnicate
+
+# --- 122. status surfaces the recorded spec ---
+STDOUT_CONTAINS="session spec: present" \
+run_case 122 "status shows session spec" 0 -- "$CEREBRO_BIN" status
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'

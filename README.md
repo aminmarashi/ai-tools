@@ -209,7 +209,8 @@ cerebro list                  # list sessions, newest first
 
 You talk only to the orchestrator. It decides when to call `cerebro
 plan`, `cerebro execute`, `cerebro review`, `cerebro apply-review`,
-`cerebro doc-write`, `cerebro recall`, `cerebro status`, or the
+`cerebro doc-write`, `cerebro recall`, `cerebro status`, the session
+spec (`cerebro spec`, `spec set`, `spec history`), or the
 preference-learning subcommands (`cerebro learnings`, `learn-note`,
 `learn-set`) based on the conversation. A typical feature loop: describe the change → the
 orchestrator drafts a plan and tells you where it landed → you read
@@ -217,6 +218,28 @@ the plan and say "go" → orchestrator executes it on a feature branch,
 pushes, opens a PR via `gh` → orchestrator runs codex against the
 diff, summarises the findings, and applies the ones that matter → loop
 until codex is quiet → optionally `doc-write` at the end.
+
+**Session spec & mid-flight adaptation.** Before planning, the
+orchestrator records what you actually asked for — the specification and
+its requirements — as the session's *requirements of record* with
+`cerebro spec set`. Every time you add or change a requirement it sets
+the spec again: the newest text replaces the current spec, and the prior
+version is archived first, so the full history of how the requirements
+evolved is preserved (`cerebro spec` prints the current spec; `cerebro
+spec history` prints every version oldest-first). The spec lives as plain
+files under `sessions/<id>/` (`spec.md` + `spec-history.jsonl`), so it
+**survives context compaction** — the orchestrator re-reads it whenever
+it is unsure what the task requires. This is what makes autonomous
+course-correction safe: during execution, when a plan turns out wrong,
+hits a wall, or a better path appears, the orchestrator may **adjust the
+plan and keep going without re-prompting you — as long as the adjusted
+work still satisfies the session spec**. If a change would, or even
+*might*, diverge from the spec (dropping a requirement, changing
+asked-for behaviour, expanding scope, trading away something the spec
+implies you care about), it treats that doubt as divergence and **stops
+to ask you** — then captures the resolution back into the spec before
+resuming. Autonomy covers *how* the spec is satisfied, never *what* the
+spec asks for.
 
 **Blast-radius audit.** When a change is high blast radius — it touches
 many files, a shared module, a public API, a data model or migration,
@@ -323,6 +346,8 @@ Session state lives under `$CEREBRO_HOME` (default `~/.cerebro/`):
   sessions/<claude-session-uuid>/
     metadata.json
     transcript.jsonl                 # user prompts + cerebro milestone events
+    spec.md                          # current session spec (requirements of record)
+    spec-history.jsonl               # append-only history of every spec version
     plans/                           # plan markdown files
     children/                        # stream-json logs of every sub-agent
     review-state/                    # per-repo last-reviewed SHA + last findings path
