@@ -1206,21 +1206,79 @@ EOF
     printf 'FAIL  129  stale fallback failed [rc=%d id=%s]\n' "$frc" "$new_id"; fail=$((fail + 1))
     failures+=("129 stale fallback :: rc=$frc id=$new_id")
   fi
+
+  # --- 130. a resumed execute that DID work (emitted a session init) and then
+  # FAILED must NOT be re-run fresh -- re-running would duplicate/partly redo
+  # mutating work. The stub starts a session (init -> id_capture written) on
+  # every call and then fails; cerebro must invoke it exactly ONCE, surface the
+  # failure, and never log execute_resume_failed. ---
+  WORK_COUNT="$WORKDIR/realfail-count"
+  WORK_STUB_DIR="$WORKDIR/claude-realfail-stub"
+  mkdir -p "$WORK_STUB_DIR"
+  cat > "$WORK_STUB_DIR/claude" <<EOF
+#!/usr/bin/env bash
+cat >/dev/null
+printf 'x' >> "$WORK_COUNT"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"WORKED-9999"}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"git commit"}}]}}'
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true}'
+exit 1
+EOF
+  chmod +x "$WORK_STUB_DIR/claude"
+  WORK_STUB_PATH="$WORK_STUB_DIR:$PATH"
+
+  WSESS="realfail-session"; WDIR="$CEREBRO_HOME/sessions/$WSESS"
+  mkdir -p "$WDIR/children"; : > "$WDIR/transcript.jsonl"
+  # Seed a fresh stored id so resume is attempted.
+  WKEY="$(printf '%s\0execute\0feat/test' "$REPO" | shasum | cut -d' ' -f1 | cut -c1-16)"
+  jq -n --arg k "$WKEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '{($k): {id:"PRIOR-1234", provider:"claude", updated_at:$ts}}' \
+     > "$WDIR/child-sessions.json"
+  : > "$WORK_COUNT"
+  env PATH="$WORK_STUB_PATH" CEREBRO_SESSION_ID="$WSESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "go" --branch feat/test >/dev/null 2>&1
+  wrc=$?
+  invocations="$(wc -c < "$WORK_COUNT" | tr -d ' ')"
+  stored_id="$(jq -r --arg k "$WKEY" '.[$k].id' "$WDIR/child-sessions.json" 2>/dev/null)"
+  if [[ $wrc -ne 0 && "$invocations" -eq 1 && "$stored_id" == "PRIOR-1234" ]] \
+     && ! grep -q '"what":"execute_resume_failed"' "$WDIR/transcript.jsonl"; then
+    printf 'PASS  130  resumed execute with prior work does not re-run fresh\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  130  resumed real failure re-ran fresh [rc=%d invocations=%s id=%s]\n' \
+      "$wrc" "$invocations" "$stored_id"; fail=$((fail + 1))
+    failures+=("130 mutating resume re-run :: rc=$wrc invocations=$invocations id=$stored_id")
+  fi
 else
   printf 'SKIP  125  execute child-session capture (claude stub unavailable)\n'
   printf 'SKIP  125b execute resume=none log (claude stub unavailable)\n'
   printf 'SKIP  126  execute child-session resume (claude stub unavailable)\n'
   printf 'SKIP  129  execute stale fallback (claude stub unavailable)\n'
+  printf 'SKIP  130  execute mutating-resume no-rerun (claude stub unavailable)\n'
 fi
 
-# codex stub: print findings on stdout and a codex-style session header on
-# stderr, so review can capture and resume the codex conversation.
+# codex stub: emulate `codex exec --json` -- stream JSONL events on stdout
+# (carrying the resumable thread_id in `thread.started`) and write the findings
+# markdown to the -o file. We log argv so the resume test can assert that the
+# second review actually runs `codex exec resume <thread_id>`. The real codex
+# does NOT print a "session id:" line on stderr, so the capture must come from
+# the JSON stream.
 CODEX_STUB_DIR="$WORKDIR/codex-stub"
 mkdir -p "$CODEX_STUB_DIR"
-cat > "$CODEX_STUB_DIR/codex" <<'EOF'
+CODEX_ARGV_LOG="$WORKDIR/codex-argv.log"
+CX_TID="019ea5a7-e570-77d1-ac43-afd5da0f1caf"
+cat > "$CODEX_STUB_DIR/codex" <<EOF
 #!/usr/bin/env bash
-printf 'no issues found\n'
-printf 'session id: 019ea5a7-e570-77d1-ac43-afd5da0f1caf\n' >&2
+printf '%s\n' "\$*" >> "$CODEX_ARGV_LOG"
+out=""; prev=""
+for a in "\$@"; do
+  [[ "\$prev" == "-o" ]] && out="\$a"
+  prev="\$a"
+done
+printf '%s\n' '{"type":"thread.started","thread_id":"$CX_TID"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"no issues found"}}'
+printf '%s\n' '{"type":"turn.completed"}'
+[[ -n "\$out" ]] && printf 'no issues found\n' > "\$out"
 exit 0
 EOF
 chmod +x "$CODEX_STUB_DIR/codex"
@@ -1229,29 +1287,47 @@ if [[ -x "$CODEX_STUB_DIR/codex" ]]; then
   RSESS="review-session"; RDIR="$CEREBRO_HOME/sessions/$RSESS"
   mkdir -p "$RDIR/children"; : > "$RDIR/transcript.jsonl"
 
-  # --- 127. review captures the codex session id under a review key ---
+  # --- 127. review captures the codex thread_id (from --json) under a review key ---
+  : > "$CODEX_ARGV_LOG"
   env PATH="$CODEX_STUB_PATH" CEREBRO_SESSION_ID="$RSESS" CEREBRO_CODEX_CMD=codex \
     "$CEREBRO_BIN" review "$REPO" >/dev/null 2>&1
   cx_id="$(jq -r '.[] | select(.provider=="codex") | .id' "$RDIR/child-sessions.json" 2>/dev/null)"
-  if [[ "$cx_id" == "019ea5a7-e570-77d1-ac43-afd5da0f1caf" ]]; then
-    printf 'PASS  127  review records codex session id\n'; pass=$((pass + 1))
+  if [[ "$cx_id" == "$CX_TID" ]]; then
+    printf 'PASS  127  review records codex thread_id from --json\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  127  review did not record codex id [got=%s]\n' "$cx_id"; fail=$((fail + 1))
+    printf 'FAIL  127  review did not record codex thread_id [got=%s]\n' "$cx_id"; fail=$((fail + 1))
     failures+=("127 review capture :: got=$cx_id")
+  fi
+  # --- 127b. the first review invoked codex with --json (no stderr-id parse) ---
+  if grep -q -- '--json' "$CODEX_ARGV_LOG"; then
+    printf 'PASS  127b  first review runs codex with --json\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  127b  first review missing --json [argv=%s]\n' "$(cat "$CODEX_ARGV_LOG")"; fail=$((fail + 1))
+    failures+=("127b review --json missing")
   fi
 
   # --- 128. a second review resumes the stored codex session ---
+  : > "$CODEX_ARGV_LOG"
   env PATH="$CODEX_STUB_PATH" CEREBRO_SESSION_ID="$RSESS" CEREBRO_CODEX_CMD=codex \
     "$CEREBRO_BIN" review "$REPO" >/dev/null 2>&1
-  if grep -q 'resume=019ea5a7-e570-77d1-ac43-afd5da0f1caf' "$RDIR/transcript.jsonl"; then
+  if grep -q "resume=$CX_TID" "$RDIR/transcript.jsonl"; then
     printf 'PASS  128  second review resumes the stored codex session\n'; pass=$((pass + 1))
   else
     printf 'FAIL  128  second review did not resume codex session\n'; fail=$((fail + 1))
     failures+=("128 review resume not logged")
   fi
+  # --- 128b. re-review actually runs `codex exec resume <thread_id>` ---
+  if grep -q "resume $CX_TID" "$CODEX_ARGV_LOG"; then
+    printf 'PASS  128b  re-review runs codex exec resume <thread_id>\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  128b  re-review did not pass resume <thread_id> [argv=%s]\n' "$(cat "$CODEX_ARGV_LOG")"; fail=$((fail + 1))
+    failures+=("128b review resume argv missing")
+  fi
 else
   printf 'SKIP  127  review codex-session capture (codex stub unavailable)\n'
+  printf 'SKIP  127b review codex --json (codex stub unavailable)\n'
   printf 'SKIP  128  review codex-session resume (codex stub unavailable)\n'
+  printf 'SKIP  128b review codex resume argv (codex stub unavailable)\n'
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
