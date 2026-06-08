@@ -1342,9 +1342,10 @@ fi
 # --pair adds --input-format stream-json + --session-id (and NEVER
 # --remote-control), that the live steering is captured to .steering.md and
 # folded back as a PAIR STEERING block, that the banner advertises `cerebro
-# watch` + `cerebro steer`, and that the default (no --pair) path stays clean.
-# Test 138 separately stands up a fake live agent and asserts `cerebro watch`
-# (the narrator session) auto-detects it and narrates its activity.
+# observe <session-id>` + `cerebro steer`, and that the default (no --pair) path
+# stays clean. Test 138 separately stands up a fake live paired child under a
+# target session and asserts `cerebro observe <target>`, run from a different
+# observer session, tails it and reports its activity with an active STATUS.
 # ========================================================================
 PAIR_ARGV_LOG="$WORKDIR/pair-argv.log"
 PAIR_STUB_DIR="$WORKDIR/claude-pair-stub"
@@ -1447,11 +1448,11 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("133b pair_steering event missing")
   fi
 
-  # --- 134. the PAIR MODE banner advertises `cerebro watch` + `cerebro steer` ---
-  if [[ "$perr" == *"PAIR MODE"* && "$perr" == *"cerebro watch"* \
+  # --- 134. the PAIR MODE banner advertises `cerebro observe <id>` + `cerebro steer` ---
+  if [[ "$perr" == *"PAIR MODE"* && "$perr" == *"observe $PSESS"* \
         && "$perr" == *"cerebro steer "* && "$perr" == *".steer.fifo"* \
-        && "$perr" != *"claude.ai/code"* ]]; then
-    printf 'PASS  134  pair banner advertises watch + steer\n'; pass=$((pass + 1))
+        && "$perr" != *"cerebro watch"* && "$perr" != *"claude.ai/code"* ]]; then
+    printf 'PASS  134  pair banner advertises observe + steer\n'; pass=$((pass + 1))
   else
     printf 'FAIL  134  pair banner wrong [perr=%s]\n' "$perr"; fail=$((fail + 1))
     failures+=("134 pair banner :: perr=$perr")
@@ -1499,48 +1500,47 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("137 apply-review --pair :: rc=$arc")
   fi
 
-  # --- 138. cerebro watch: the pump auto-detects a live agent and feeds the
-  # narrator its activity. `cerebro watch` itself requires a real terminal, so we
-  # drive its PY_WATCH_PUMP/PY_WATCH_RENDER directly (sourced in a subshell) with
-  # a stub narrator that echoes back whatever activity it is fed. Stand up a fake
-  # live paired child (a stream-json log + a steer pipe held open by a reader)
-  # under CEREBRO_HOME and assert its actions reach the narrator and get printed.
-  WSRC="$WORKDIR/cerebro-src.sh"; grep -v '^main "\$@"$' "$CEREBRO_BIN" > "$WSRC"
-  WCH="$CEREBRO_HOME/sessions/watcher-test/children"; mkdir -p "$WCH"
-  wfifo="$WCH/execute-demo.steer.fifo"; wlog="$WCH/execute-demo.jsonl"
+  # --- 138. cerebro observe: from an OBSERVER session, tail a TARGET session's
+  # live paired children. Stand up a fake live paired child (a stream-json log +
+  # a steer pipe held open by a reader) under a target session, then run the real
+  # `cerebro observe <target>` from a separate observer session and assert it
+  # reports the child label, its message, the edit (with content preview), and an
+  # active STATUS that names the live child. observe needs no tty, so we call the
+  # binary directly with a short window.
+  WTGT="$CEREBRO_HOME/sessions/observe-target/children"; mkdir -p "$WTGT"
+  mkdir -p "$CEREBRO_HOME/sessions/observe-watcher"
+  wfifo="$WTGT/execute-demo.steer.fifo"; wlog="$WTGT/execute-demo.jsonl"
   mkfifo "$wfifo"
-  python3 -c 'import os,sys,time; os.open(sys.argv[1], os.O_RDONLY|os.O_NONBLOCK); time.sleep(3)' "$wfifo" &
+  python3 -c 'import os,sys,time; os.open(sys.argv[1], os.O_RDONLY|os.O_NONBLOCK); time.sleep(6)' "$wfifo" &
   WHOLDER=$!; disown "$WHOLDER" 2>/dev/null || true
   {
-    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Adding the cache layer"}]}}'
-    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/cache.ts"}}]}}'
+    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Introducing a Cache abstraction"}]}}'
+    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Write","input":{"file_path":"src/cache.ts","content":"export interface Cache {}"}}]}}'
     printf '%s\n' '{"type":"result","subtype":"success"}'
   } > "$wlog"
-  WSTUB="$WORKDIR/wstub.py"
-  cat > "$WSTUB" <<'PY'
-import json, sys
-for line in sys.stdin:
-    line = line.strip()
-    if not line: continue
-    try: ev = json.loads(line)
-    except Exception: continue
-    c = ev.get("message", {}).get("content", "")
-    print(json.dumps({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":c}]}}), flush=True)
-PY
-  watchout="$( ( set +e; source "$WSRC"
-      sleep 2 | python3 -c "$PY_WATCH_PUMP" "$CEREBRO_HOME" 2>/dev/null \
-        | python3 "$WSTUB" \
-        | python3 -c "$PY_WATCH_RENDER" ) )"
+  obsout="$(CEREBRO_SESSION_ID=observe-watcher CEREBRO_OBSERVE_WINDOW=3 CEREBRO_OBSERVE_QUIET=1 \
+    "$CEREBRO_BIN" observe observe-target 2>/dev/null)"
   kill "$WHOLDER" 2>/dev/null; rm -f "$wfifo"
-  if [[ "$watchout" == *"execute-demo"* && "$watchout" == *"Adding the cache layer"* \
-        && "$watchout" == *"Edit: src/cache.ts"* ]]; then
-    printf 'PASS  138  cerebro watch pump auto-detects + narrates a live agent\n'; pass=$((pass + 1))
+  if [[ "$obsout" == *"execute-demo"* && "$obsout" == *"Introducing a Cache abstraction"* \
+        && "$obsout" == *"Write src/cache.ts :: export interface Cache {}"* \
+        && "$obsout" == *"OBSERVE STATUS: active"* && "$obsout" == *"live: execute-demo"* ]]; then
+    printf 'PASS  138  cerebro observe tails a target session live paired child\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  138  watch pump wrong [out=%s]\n' "$watchout"; fail=$((fail + 1))
-    failures+=("138 watch pump :: out=$watchout")
+    printf 'FAIL  138  observe wrong [out=%s]\n' "$obsout"; fail=$((fail + 1))
+    failures+=("138 observe :: out=$obsout")
+  fi
+
+  # --- 138b. cerebro observe reports done once the child's pipe closes. ---
+  obsdone="$(CEREBRO_SESSION_ID=observe-watcher CEREBRO_OBSERVE_WINDOW=2 CEREBRO_OBSERVE_QUIET=1 \
+    "$CEREBRO_BIN" observe observe-target 2>/dev/null)"
+  if [[ "$obsdone" == *"OBSERVE STATUS: done"* ]]; then
+    printf 'PASS  138b  cerebro observe reports done when no live children remain\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  138b  observe done wrong [out=%s]\n' "$obsdone"; fail=$((fail + 1))
+    failures+=("138b observe done :: out=$obsdone")
   fi
 else
-  for t in 131 132 133 133b 134 135 136 137 138; do
+  for t in 131 132 133 133b 134 135 136 137 138 138b; do
     printf 'SKIP  %s  pair-mode (claude stub unavailable)\n' "$t"
   done
 fi

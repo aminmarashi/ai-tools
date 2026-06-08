@@ -257,12 +257,12 @@ Notes:
   * Pair programming. Ask the orchestrator to "pair" (or watch / steer)
     a plan, execute, apply-review, or doc-write child and it adds
     `--pair`: the child runs with claude's stream-json input so you can
-    WATCH it live with `cerebro watch` -- a separate narrator session that
-    watches every paired child and tells you, in plain English, what each
-    is doing (and steers on your command) -- and STEER it directly with
-    `cerebro steer "<message>"` (a one-shot inject that returns at once;
-    pass the pipe path from the PAIR MODE banner as a first arg when
-    several run at once). The child runs to
+    WATCH it live from ANOTHER cerebro session -- ask that session to
+    "observe <the paired session's id>" and it narrates, in plain English,
+    what every live paired child is doing (and steers on your command) --
+    and STEER it directly with `cerebro steer "<message>"` (a one-shot
+    inject that returns at once; pass the pipe path from the PAIR MODE
+    banner as a first arg when several run at once). The child runs to
     completion on its own; after each turn it waits a short window
     (CEREBRO_PAIR_IDLE, default 60s) for steering, and a quiet window
     finishes it. Each steering message is injected into the running
@@ -624,7 +624,8 @@ behalf, by calling them through your Bash tool (which is restricted to
     echoed on stdout. The child has Read/Grep/Glob only, so the repo is
     untouched. Use this when the user describes a change.
     --pair enables pair-programming mode (see "# Pair programming mode"):
-    the user watches the live planning session and can steer it.
+    another cerebro session can observe the live planning session and you
+    can steer it.
 
   cerebro plans
     List the plan files in the current session with timestamps.
@@ -653,7 +654,8 @@ behalf, by calling them through your Bash tool (which is restricted to
     plan work. Existing AGENTS.md / CLAUDE.md are never modified. You
     don't have to mention this explicitly to the user unless they ask.
     --pair enables pair-programming mode (see "# Pair programming mode"):
-    the user watches the live execute session and can steer it.
+    another cerebro session can observe the live execute session and you
+    can steer it.
 
   cerebro review <repo-abs-path> [--base <ref>] [--criteria-file <plan-path>]
     Run codex (non-mutating) against the current branch diff vs <ref>.
@@ -716,15 +718,20 @@ behalf, by calling them through your Bash tool (which is restricted to
     Commits and pushes on the same branch.
     --pair enables pair-programming mode (see "# Pair programming mode").
 
-  cerebro watch
-    Launch the WATCHER: a separate, read-only narrator session that
-    continuously watches every live paired child agent any cerebro is
-    running and tells the user, in plain English, what each one is doing
-    -- and steers one on the user's command (it calls `cerebro steer` for
-    them). It only READS the agents' child logs, so stopping it (Ctrl-D /
-    Ctrl-C) leaves every agent running untouched, and it picks up new
-    agents automatically as they spawn. This is the USER's view, run in
-    their own terminal -- never run it yourself (it would block).
+  cerebro observe [<session-id>]
+    Look over the shoulder of ANOTHER cerebro session's live `--pair`
+    children. <session-id> names that orchestrator session (NOT a child);
+    with none, the most recently active OTHER session that has live paired
+    children is chosen. It tails EVERY live paired child of that session at
+    once and returns ONE batch of new activity, then a STATUS footer:
+    `=== OBSERVE STATUS: active ===` (children still live -- call observe
+    again) or `... done ===` (none left). A per-target cursor under your
+    own session dir advances each call, so successive calls never repeat.
+    Each call blocks up to a short window (CEREBRO_OBSERVE_WINDOW, default
+    25s), returning early on a quiet gap. Read-only: it only reads the
+    children's logs and never disturbs them. Drive it in a loop and narrate
+    (see "# Observing another cerebro session"); steer a watched child with
+    `cerebro steer <its-steer-pipe> "<message>"`.
 
   cerebro steer [<pipe>] "<message>"
     One-shot steering: inject a single instruction into a live `--pair`
@@ -1072,14 +1079,15 @@ along", "let me drive", "I want to jump in", or similar. (Pairing is not
 available for `cerebro review` -- codex has no live-steer.) `--pair`
 drives the child through claude's stream-json input: cerebro feeds the
 task as the first message, then after each turn waits a short window for
-steering injected over a named pipe. The user has two commands, run from
-their OWN terminal: `cerebro watch` (launches a separate, read-only
-WATCHER session that watches every paired child and narrates, in plain
-English, what each is doing -- and steers on the user's spoken command)
-and `cerebro steer "<message>"` (a ONE-SHOT inject that sends one
-instruction into the live child and returns at once -- they pass the pipe
-path from the PAIR MODE banner as a first arg only when several paired
-children run at once).
+steering injected over a named pipe.
+
+A paired child is WATCHED from ANOTHER cerebro session: the user opens a
+second cerebro and asks it to "observe" this one, and that session runs
+`cerebro observe` in a loop and narrates the live agents (see "# Observing
+another cerebro session"). It is STEERED with `cerebro steer "<message>"`
+(a ONE-SHOT inject that sends one instruction into the live child and
+returns at once -- pass the child's steer-pipe path as a first arg when
+several paired children run at once).
 Steering is a side channel straight into the child: the user's messages
 and the child's replies do NOT enter your chat -- only a compact summary
 of what they steered comes back at the end.
@@ -1089,17 +1097,17 @@ How to run a paired child:
   1. RUN IT IN THE BACKGROUND. A paired child is meant to be watched and
      steered WHILE it runs, so launch it as a background Bash task --
      never block on it in the foreground. cerebro prints a "PAIR MODE"
-     banner to stderr as soon as it starts, with the exact `cerebro
-     watch` and `cerebro steer` commands.
-  2. RELAY THE COMMANDS IMMEDIATELY. As soon as that banner appears, tell
-     the user they can run `cerebro watch` (in its own terminal) to watch
-     the child live and be told what it is doing, and `cerebro steer
-     "<message>"` to redirect it. The child runs to completion on its
-     own; after each turn it waits a short window (CEREBRO_PAIR_IDLE,
-     default 60s) for steering, so a steer has to land within that window
-     to take effect. Do NOT run `cerebro watch` yourself -- it is the
-     user's view and would block; only steer on the user's behalf when
-     they explicitly tell you to.
+     banner to stderr as soon as it starts, with this session's id and the
+     `cerebro steer` command.
+  2. RELAY THE DETAILS IMMEDIATELY. As soon as that banner appears, tell
+     the user this paired child is running and give them this session's id,
+     so from ANOTHER cerebro session they can ask it to "observe <this
+     session id>" and watch the child live (see "# Observing another
+     cerebro session"); `cerebro steer "<message>"` redirects it. The child
+     runs to completion on its own; after each turn it waits a short window
+     (CEREBRO_PAIR_IDLE, default 60s) for steering, so a steer has to land
+     within that window to take effect. Only steer on the user's behalf
+     when they explicitly tell you to.
   3. LET IT RUN. Narrate progress briefly as usual. An un-steered child
      just finishes on its own after the quiet window.
   4. ON COMPLETION, COLLECT THE STEERING. When the child finishes,
@@ -1139,6 +1147,52 @@ would change WHAT the spec asks for in a way that is genuinely ambiguous
 or conflicts with a standing requirement, fall back to the spec-divergence
 rule above: make the change you are confident in, but STOP and confirm the
 part that is a real product decision rather than guessing.
+
+# Observing another cerebro session
+
+Any cerebro session can WATCH another one's live `--pair` children and
+narrate them to the user, like a peer looking over a colleague's shoulder.
+When the user asks to "observe", "watch", "monitor", "keep an eye on", or
+"what is my other session / session <id> doing", THIS session becomes the
+monitor. (The id they give is the OTHER cerebro session -- the
+orchestrator -- not a child; that session may be running several paired
+children, and you watch ALL of them at once.)
+
+How to run the monitor:
+
+  1. POLL IN A LOOP. Run `cerebro observe [<session-id>]` (omit the id to
+     auto-pick the most recently active other session with live paired
+     children). Each call blocks briefly and returns ONE batch of new
+     activity from every live paired child of that session, then a footer:
+     `=== OBSERVE STATUS: active ===` means children are still live -- call
+     `cerebro observe` AGAIN to get the next batch; `... done ===` means
+     none are left, so stop. Successive calls never repeat (a cursor
+     advances). Keep looping -- narrating between calls -- until done or
+     the user tells you to stop.
+  2. NARRATE THE GIST, NOT THE LOG. You are a colleague watching the
+     screen, not a line printer. Do NOT echo every tool call. Each batch,
+     say in plain present-tense English what the agent(s) are doing and why
+     it matters; group related actions into one short observation. When the
+     session has several children active, lead each note with the child's
+     label so the user knows who is doing what.
+  3. FLAG THE IMPORTANT DECISIONS. Every once in a while -- when the
+     activity shows a real decision or a crucial piece of code -- call it
+     out explicitly: a new abstraction or interface/type, a dependency
+     added, infra / IaC / CI / build changes, a data-model / schema /
+     migration, auth / security / money paths, a public API change, or any
+     other high-blast-radius move. Surface those promptly and plainly; let
+     the routine churn pass with a light touch.
+  4. STEER ONLY ON COMMAND. You are read-only by default. If the user
+     tells you to redirect a watched agent ("tell it to use a hashmap",
+     "stop touching the config"), inject it with `cerebro steer
+     <steer-pipe> "<instruction>"`, taking the steer-pipe path from that
+     child's most recent observe header. Never steer on your own
+     initiative. After steering, tell the user exactly what you sent and to
+     which agent.
+
+Observing only READS the other session's child logs; it never disturbs the
+agents, and stopping (you simply stop calling `cerebro observe`) leaves
+them running under their own cerebro.
 
 # Audit high-blast-radius plans before proposing them
 
@@ -1624,14 +1678,13 @@ if result_path:
 
 # ----- pair-programming mode -----------------------------------------------
 # `--pair` on a claude child (plan / execute / apply-review / doc-write) lets the
-# developer WATCH the live session and STEER it from their terminal. cerebro
-# drives the child through claude's stream-json input (`--input-format
-# stream-json`): it feeds the initial prompt as the first user message, then
-# after each turn waits a short window for steering injected over a named pipe.
-# `cerebro watch` launches a separate, read-only narrator session that watches
-# every paired child and explains what each is doing (see cmd_watch); `cerebro
-# steer "<message>"` is a one-shot inject -- it writes one instruction to the
-# child and returns at once (no attach, no lock). The child runs to completion;
+# developer WATCH the live session and STEER it. cerebro drives the child through
+# claude's stream-json input (`--input-format stream-json`): it feeds the initial
+# prompt as the first user message, then after each turn waits a short window for
+# steering injected over a named pipe. Another cerebro session watches this one's
+# paired children with `cerebro observe <this-session-id>` (see cmd_observe);
+# `cerebro steer "<message>"` is a one-shot inject -- it writes one instruction to
+# the child and returns at once (no attach, no lock). The child runs to completion;
 # each turn opens a brief steering window (CEREBRO_PAIR_IDLE) and a quiet window
 # finishes it. Steering is recorded as it is injected and folded back so the
 # orchestrator can reconcile it against the spec.
@@ -1651,7 +1704,8 @@ pair_banner() {
   {
     printf 'cerebro: PAIR MODE -- watch this %s session live and steer it.\n' "$role"
     printf '  session : %s (id %s)\n' "$label" "$sid"
-    printf '  watch   : cerebro watch        (narrator session -- watch every agent, hear what it does)\n'
+    printf '  observe : from ANOTHER cerebro, ask it to: observe %s\n' "${CEREBRO_SESSION_ID:-<this-session-id>}"
+    printf '            (it narrates every live paired child of this session)\n'
     printf '  steer   : cerebro steer "<message>"   (inject one instruction; returns at once)\n'
     printf '            if several paired sessions run at once: cerebro steer %s "<message>"\n' "$fifo"
     printf '  the child runs to completion; it waits a short window after each turn for\n'
@@ -3787,177 +3841,6 @@ cmd_gh() {
   exec gh "$top" "$@"
 }
 
-# PY_WATCH_PUMP -- the input side of the watcher session `cerebro watch`. argv
-# is <cerebro-home>. It keeps the narrator (claude) fed with stream-json user
-# messages from two sources, merged: (1) every line the user types on stdin,
-# forwarded as a "[USER] ..." message; and (2) the live activity of every paired
-# child agent another cerebro is running -- it discovers them by globbing
-# <home>/sessions/*/children/*.steer.fifo, tails each child'\''s .jsonl log, and
-# forwards new actions as "[ACTIVITY <label> | steer-pipe: <fifo>] ..." messages.
-# New children are picked up automatically; a child whose pipe disappears is
-# drained a final time and reported finished. It only READS child logs (and the
-# user'\''s stdin); it never writes to a child, so stopping the watcher (Ctrl-D /
-# Ctrl-C) leaves the agents untouched. Closing stdin ends the narrator session.
-PY_WATCH_PUMP='
-import glob, json, os, select, sys, time
-
-home = sys.argv[1]
-scan_glob = home + "/sessions/*/children/*.steer.fifo"
-
-def emit(text):
-    sys.stdout.write(json.dumps(
-        {"type": "user", "message": {"role": "user", "content": text}},
-        ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-def fifo_live(fifo):
-    try:
-        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-    except OSError:
-        return False
-    os.close(fd)
-    return True
-
-def label_of(fifo):
-    base = os.path.basename(fifo)
-    suffix = ".steer.fifo"
-    return base[:-len(suffix)] if base.endswith(suffix) else base
-
-def render(ev, out):
-    t = ev.get("type")
-    if t == "assistant":
-        for item in ev.get("message", {}).get("content", []) or []:
-            if item.get("type") == "text":
-                txt = (item.get("text") or "").strip()
-                if txt:
-                    out.append("says: " + txt)
-            elif item.get("type") == "tool_use":
-                inp = item.get("input", {}) or {}
-                target = (inp.get("description") or inp.get("file_path") or
-                          inp.get("pattern") or inp.get("path") or
-                          inp.get("query") or inp.get("command") or "")
-                if isinstance(target, list):
-                    target = " ".join(map(str, target))
-                target = str(target).replace("\n", " ").strip()
-                if len(target) > 200:
-                    target = target[:200] + "..."
-                out.append("%s: %s" % (item.get("name", "?"), target))
-    elif t == "result":
-        sub = ev.get("subtype")
-        out.append("(turn complete)" if not sub or sub == "success" else "(ended: %s)" % sub)
-
-def drain(st):
-    out = []
-    try:
-        with open(st["log"]) as fh:
-            fh.seek(st["pos"])
-            data = fh.read()
-            st["pos"] = fh.tell()
-    except OSError:
-        return out
-    if not data:
-        return out
-    buf = st["buf"] + data
-    while "\n" in buf:
-        line, buf = buf.split("\n", 1)
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        render(ev, out)
-    st["buf"] = buf
-    return out
-
-sys.stderr.write("cerebro: watcher attached -- narrating the live agents. "
-                 "Ctrl-D / Ctrl-C to stop watching (the agents keep running).\n")
-sys.stderr.flush()
-
-tracked = {}  # fifo -> {log, label, pos, buf}
-try:
-    while True:
-        # 1. Forward everything the user has typed.
-        eof = False
-        while True:
-            r, _, _ = select.select([sys.stdin], [], [], 0.0)
-            if not r:
-                break
-            s = sys.stdin.readline()
-            if s == "":
-                eof = True
-                break
-            line = s.strip()
-            if line:
-                emit("[USER] " + line)
-        if eof:
-            break
-
-        # 2. Discover live paired children; start tracking new ones from the top.
-        live = set()
-        for fifo in glob.glob(scan_glob):
-            if not fifo_live(fifo):
-                continue
-            live.add(fifo)
-            if fifo not in tracked:
-                tracked[fifo] = {"log": fifo[:-len(".steer.fifo")] + ".jsonl",
-                                 "label": label_of(fifo), "pos": 0, "buf": ""}
-                emit("[ACTIVITY %s | steer-pipe: %s] (now watching this agent)"
-                     % (tracked[fifo]["label"], fifo))
-
-        # 3. Narrate each tracked child'\''s new activity; retire finished ones.
-        for fifo in list(tracked):
-            st = tracked[fifo]
-            lines = drain(st)
-            if lines:
-                emit("[ACTIVITY %s | steer-pipe: %s]\n%s"
-                     % (st["label"], fifo, "\n".join(lines)))
-            if fifo not in live:
-                tail = drain(st)
-                if tail:
-                    emit("[ACTIVITY %s | steer-pipe: %s]\n%s"
-                         % (st["label"], fifo, "\n".join(tail)))
-                emit("[ACTIVITY %s] (this agent has finished)" % st["label"])
-                del tracked[fifo]
-
-        time.sleep(1.0)
-except KeyboardInterrupt:
-    pass
-
-sys.stderr.write("cerebro: stopped watching. The agents are untouched and keep "
-                 "running under their own cerebro.\n")
-sys.stderr.flush()
-'
-
-# PY_WATCH_RENDER -- the output side of `cerebro watch`. It reads the narrator
-# (claude) stream-json on stdin and prints its plain-English narration to the
-# terminal, plus a short marker whenever the narrator steers an agent.
-PY_WATCH_RENDER='
-import json, sys
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        ev = json.loads(line)
-    except ValueError:
-        continue
-    if ev.get("type") != "assistant":
-        continue
-    for item in ev.get("message", {}).get("content", []) or []:
-        if item.get("type") == "text":
-            txt = (item.get("text") or "").strip()
-            if txt:
-                sys.stdout.write(txt + "\n")
-                sys.stdout.flush()
-        elif item.get("type") == "tool_use":
-            cmd = (item.get("input", {}) or {}).get("command", "")
-            if "cerebro steer" in cmd:
-                sys.stdout.write("  (steering an agent...)\n")
-                sys.stdout.flush()
-'
-
 # PY_STEER_SEND -- the one-shot steering inject for `cerebro steer`. argv is
 # <fifo> <message>. It writes a single "S <base64>" line to the child'\''s pipe
 # and returns; the pump forwards it as the child'\''s next user turn.
@@ -4029,80 +3912,263 @@ cmd_steer() {
   say "cerebro: steered $(basename "${fifo%.steer.fifo}")"
 }
 
-# The watcher session's system prompt: it narrates other cerebros' live agents
-# and steers them only on the user's command. Echoed on stdout.
-watcher_append_prompt() {
-  cat <<'EOF'
-You are cerebro's WATCHER -- a narrating pair-programmer. You do NOT write code,
-run commands, or do any work yourself. Somewhere else, another cerebro is running
-one or more child agents; your whole job is to watch what those agents do and
-tell the user, in plain English, what is happening -- and to steer an agent only
-when the user tells you to.
+# PY_OBSERVE_PUMP -- the engine of `cerebro observe`. argv is
+# <sessions-root> <target-id> <self-id> <state-dir> <window-secs> <quiet-secs>.
+# It lets ANY cerebro session look over the shoulder of ANOTHER cerebro
+# session's live `--pair` children (the <target-id> names the orchestrator
+# session, NOT a child). It resolves the target -- the named session, else the
+# most recently touched OTHER session that currently has live paired children --
+# then tails EVERY one of that session's live paired children concurrently
+# (children/*.steer.fifo whose pipe a child is still reading -> the .jsonl
+# beside it). It returns ONE batch of new activity and exits, so the caller can
+# narrate and call again. A per-target cursor under the observer's own session
+# dir makes successive calls advance: a child that is live when first seen is
+# caught up from the top; one already finished when first seen is skipped. Each
+# call blocks up to <window> seconds, returning early once it has a batch and
+# things go quiet for <quiet> seconds; STATUS is "active" while any child is
+# live (call again) or "done" when none are. Read-only: it never writes to a
+# child, so observing never disturbs the agents.
+PY_OBSERVE_PUMP='
+import glob, json, os, sys, time
 
-Your input stream carries two kinds of messages. Read the tag at the start of
-each one:
+sessions_root = sys.argv[1]
+target_id     = sys.argv[2]
+self_id       = sys.argv[3]
+state_dir     = sys.argv[4]
+window        = float(sys.argv[5])
+quiet         = float(sys.argv[6])
 
-- "[ACTIVITY <label> | steer-pipe: <path>] ..." is the LIVE activity of an agent
-  you are watching: file edits, commands it runs, searches, its own messages,
-  turn boundaries. These are NOT the user talking. Narrate them: say briefly and
-  in plain language what that agent is doing and why it matters. Group related
-  actions into one short observation rather than reading tool calls verbatim.
-  When several agents are active, lead with the agent's <label> so the user knows
-  who is doing what. Keep up a running commentary as activity arrives.
+def fifo_live(fifo):
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
 
-- "[USER] ..." is the person you are talking to. Answer their questions from what
-  you have seen the agents do, and follow their instructions.
+def log_of(fifo):
+    return fifo[:-len(".steer.fifo")] + ".jsonl"
 
-STEERING (only on the user's command): when the USER tells you to redirect or
-correct an agent -- "tell it to use a hashmap", "stop touching the config",
-"have it run the tests" -- inject that into the agent by running:
+def fifo_of(log):
+    return log[:-len(".jsonl")] + ".steer.fifo"
 
-  cerebro steer <steer-pipe-path-for-that-agent> "<the instruction>"
+def live_children(sess_dir):
+    out = []
+    for fifo in sorted(glob.glob(os.path.join(sess_dir, "children", "*.steer.fifo"))):
+        if fifo_live(fifo):
+            out.append(log_of(fifo))
+    return out
 
-Take the steer-pipe path from that agent's most recent [ACTIVITY] header. NEVER
-steer on your own initiative or without an explicit user instruction. After you
-steer, tell the user exactly what you sent and to which agent.
+def last_touched(sess_dir):
+    try:
+        with open(os.path.join(sess_dir, "metadata.json")) as fh:
+            data = json.load(fh)
+        return data.get("last_touched") or data.get("created_at") or ""
+    except Exception:
+        try:
+            return "%020.6f" % os.path.getmtime(sess_dir)
+        except OSError:
+            return ""
 
-STOPPING: if the user asks to stop watching a particular agent, simply stop
-narrating that one and say so (you cannot un-spawn it; it keeps running). If they
-ask to stop or quit entirely, acknowledge -- they end the watcher with Ctrl-D /
-Ctrl-C. Stopping the watcher never affects the agents; they keep running under
-their own cerebro.
+def emit_empty(msg, status="done", tid=""):
+    print("=== OBSERVE%s ===" % ((" session " + tid) if tid else ""))
+    print(msg)
+    print("=== OBSERVE STATUS: %s ===" % status)
 
-STYLE: concise, present tense, plain English -- the colleague narrating the
-screen, not a log printer. Never claim to have done work yourself; you only watch
-and (on request) steer.
-EOF
-}
+# --- resolve the target cerebro session ---------------------------------------
+if target_id:
+    target = os.path.join(sessions_root, target_id)
+    if not os.path.isdir(target):
+        emit_empty("cerebro: no such session: %s" % target_id)
+        sys.exit(0)
+else:
+    cands = []
+    try:
+        names = os.listdir(sessions_root)
+    except OSError:
+        names = []
+    for name in names:
+        if name == self_id:
+            continue
+        d = os.path.join(sessions_root, name)
+        if os.path.isdir(d) and live_children(d):
+            cands.append((last_touched(d), name))
+    if not cands:
+        emit_empty("cerebro: no other cerebro session has live paired children to "
+                   "observe. Start one with --pair (e.g. \"cerebro execute <repo> "
+                   "... --pair\") in another session, then observe again.")
+        sys.exit(0)
+    cands.sort(reverse=True)
+    target_id = cands[0][1]
+    target = os.path.join(sessions_root, target_id)
 
-# ----- subcommand: cerebro watch -------------------------------------------
-# Launch the WATCHER: a separate, read-only narrator session that continuously
-# watches every live paired child agent any other cerebro is running and tells
-# you, in plain English, what each one is doing -- and steers one on your command
-# (`cerebro steer`). A pump feeds the narrator both your typed messages and the
-# agents' live activity (read straight from their child logs); it only reads
-# those files, so stopping the watcher (Ctrl-D / Ctrl-C) leaves every agent
-# running untouched. New agents are picked up automatically as they spawn. Runs
-# from any directory; the agents it watches belong to other cerebro sessions.
-cmd_watch() {
-  # The pump reads the user's keystrokes from stdin, so the watcher only makes
-  # sense attached to a real terminal. This also refuses an orchestrator that
-  # tries to run it via its Bash tool (no tty) -- the watcher is the USER's view.
-  [[ -t 0 ]] || die "watch: 'cerebro watch' is your live view -- run it directly in your own terminal. Its input must be an interactive terminal, so it cannot run headless or from inside another cerebro session."
-  command -v claude  >/dev/null 2>&1 || die "watch: missing required command on PATH: claude"
-  command -v python3 >/dev/null 2>&1 || die "watch: missing required command on PATH: python3"
-  materialise_home
-  local sid; sid="$(mint_uuid)"
-  export CEREBRO_HOME
-  say "cerebro: launching watcher -- it narrates the live agents and steers on your command; Ctrl-D / Ctrl-C stops watching (agents keep running)."
-  cd "$CEREBRO_HOME" || die "cd to $CEREBRO_HOME failed"
-  python3 -c "$PY_WATCH_PUMP" "$CEREBRO_HOME" \
-    | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-      claude -p --input-format stream-json --output-format stream-json --verbose \
-        --session-id "$sid" \
-        --append-system-prompt "$(watcher_append_prompt)" \
-        --allowedTools "Bash(cerebro steer:*) Read Grep Glob" \
-    | python3 -c "$PY_WATCH_RENDER"
+target_children = os.path.abspath(os.path.join(target, "children"))
+
+# --- cursor state, persisted per target under the observer session ------------
+try:
+    os.makedirs(state_dir, exist_ok=True)
+except OSError:
+    pass
+state_path = os.path.join(state_dir, target_id + ".json")
+try:
+    with open(state_path) as fh:
+        cursor = json.load(fh)
+except Exception:
+    cursor = {}
+
+def label_of(log):
+    base = os.path.basename(log)
+    return base[:-len(".jsonl")] if base.endswith(".jsonl") else base
+
+def under_target(log):
+    return os.path.dirname(os.path.abspath(log)) == target_children
+
+def preview(s, n):
+    s = " ".join((s or "").split())
+    return s[:n] + ("..." if len(s) > n else "")
+
+def render(ev, out):
+    t = ev.get("type")
+    if t == "assistant":
+        for item in ev.get("message", {}).get("content", []) or []:
+            if item.get("type") == "text":
+                txt = (item.get("text") or "").strip()
+                if txt:
+                    out.append("says: " + preview(txt, 2000))
+            elif item.get("type") == "tool_use":
+                name = item.get("name", "?")
+                inp = item.get("input", {}) or {}
+                tgt = (inp.get("description") or inp.get("file_path") or
+                       inp.get("pattern") or inp.get("path") or
+                       inp.get("query") or inp.get("command") or "")
+                if isinstance(tgt, list):
+                    tgt = " ".join(map(str, tgt))
+                tgt = preview(str(tgt), 200)
+                body = inp.get("new_string")
+                if body is None:
+                    body = inp.get("content")
+                if isinstance(body, str) and body.strip():
+                    out.append(("%s %s :: %s" % (name, tgt, preview(body, 300))).strip())
+                else:
+                    out.append(("%s %s" % (name, tgt)).strip())
+    elif t == "result":
+        sub = ev.get("subtype")
+        out.append("(turn complete)" if not sub or sub == "success" else "(ended: %s)" % sub)
+
+def drain(log):
+    out = []
+    try:
+        size = os.path.getsize(log)
+    except OSError:
+        return out
+    if log not in cursor:
+        # First sight: catch a live child up from the top; skip one already done.
+        cursor[log] = 0 if fifo_live(fifo_of(log)) else size
+    pos = cursor[log]
+    if pos > size:        # log was truncated / rotated
+        pos = 0
+    try:
+        with open(log, "rb") as fh:
+            fh.seek(pos)
+            data = fh.read()
+    except OSError:
+        return out
+    nl = data.rfind(b"\n")
+    if nl < 0:            # no complete line yet
+        return out
+    complete = data[:nl + 1]
+    cursor[log] = pos + len(complete)
+    for raw in complete.split(b"\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        render(ev, out)
+    return out
+
+# --- collect one batch --------------------------------------------------------
+acc = []                 # ordered (label, line)
+last_new = None
+ever_live = set()
+finished_noted = set()
+deadline = time.monotonic() + window
+live = live_children(target)
+while True:
+    live = live_children(target)
+    live_labels = set(label_of(l) for l in live)
+    ever_live |= live_labels
+    # Every live child PLUS any child we already track (to flush the final
+    # lines of one that just finished), de-duplicated, order-stable.
+    cand = list(dict.fromkeys(live + [l for l in cursor if under_target(l)]))
+    for log in cand:
+        for ln in drain(log):
+            acc.append((label_of(log), ln))
+            last_new = time.monotonic()
+    for lab in sorted(ever_live - live_labels):
+        if lab not in finished_noted:
+            finished_noted.add(lab)
+            acc.append((lab, "(this agent has finished)"))
+            last_new = time.monotonic()
+    now = time.monotonic()
+    if not live:
+        status = "done"; break
+    if acc and last_new is not None and (now - last_new) >= quiet:
+        status = "active"; break
+    if now >= deadline:
+        status = "active"; break
+    time.sleep(0.5)
+
+try:
+    with open(state_path, "w") as fh:
+        json.dump(cursor, fh)
+except OSError:
+    pass
+
+# --- emit the batch -----------------------------------------------------------
+print("=== OBSERVE session %s ===" % target_id)
+if acc:
+    cur = None
+    for lab, ln in acc:
+        if lab != cur:
+            cur = lab
+            fifo = os.path.join(target_children, lab + ".steer.fifo")
+            hdr = "[%s" % lab
+            if os.path.exists(fifo):
+                hdr += "  steer-pipe: %s" % fifo
+            print(hdr + "]")
+        print(ln)
+else:
+    print("(no new activity in the last %gs)" % window)
+print("=== OBSERVE STATUS: %s ===" % status)
+live_now = sorted(label_of(l) for l in live_children(target))
+if live_now:
+    print("live: " + ", ".join(live_now))
+'
+
+# ----- subcommand: cerebro observe [<session-id>] --------------------------
+# Live monitor: look over the shoulder of ANOTHER cerebro session's paired
+# children. The optional <session-id> names that orchestrator session (NOT a
+# child); with none, the most recently active other session that has live
+# paired children is chosen. It tails EVERY live paired child of that session at
+# once and returns ONE batch of new activity plus a STATUS footer
+# (active = call again, done = no live children left), then exits. The
+# orchestrator narrates the gist and the important decisions, then calls again
+# until done -- a running commentary inside the same chat. A per-target cursor
+# under the observer's own session dir advances each call so nothing repeats.
+# Read-only: it only tails the children's logs; steering stays the separate,
+# explicit `cerebro steer <steer-pipe> "<message>"`.
+cmd_observe() {
+  require_session
+  command -v python3 >/dev/null 2>&1 || die "observe: missing required command on PATH: python3"
+  local target_id="${1:-}"
+  [[ -d "$CEREBRO_HOME/sessions" ]] || die "observe: no sessions yet"
+  python3 -c "$PY_OBSERVE_PUMP" \
+    "$CEREBRO_HOME/sessions" "$target_id" "$CEREBRO_SESSION_ID" \
+    "$CEREBRO_SESSION_DIR/observe-state" \
+    "${CEREBRO_OBSERVE_WINDOW:-25}" "${CEREBRO_OBSERVE_QUIET:-2}"
 }
 
 # ----- dispatch ------------------------------------------------------------
@@ -4123,7 +4189,7 @@ main() {
     apply-review) shift; cmd_apply_review "$@" ;;
     doc-write) shift; cmd_doc_write "$@" ;;
     steer) shift; cmd_steer "$@" ;;
-    watch) shift; cmd_watch "$@" ;;
+    observe) shift; cmd_observe "$@" ;;
     recall) shift; cmd_recall "$@" ;;
     status) shift; cmd_status "$@" ;;
     spec) shift; cmd_spec "$@" ;;

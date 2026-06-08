@@ -308,14 +308,18 @@ cerebro never overwrites an existing AGENTS.md in a user repo.
 `cerebro plan`, `execute`, `apply-review`, or `doc-write` (codex
 `review` has no live-steer, so pairing does not apply there). `--pair`
 drives the child through claude's stream-json input so you can follow it
-and redirect it from your own terminal with two commands:
+and redirect it:
 
-- **`cerebro watch`** — launches a separate, read-only **watcher session**
-  that continuously watches *every* live paired child and tells you, in
-  plain English, what each one is doing (a narrating pair-programmer), and
-  steers one on your spoken command. New agents are picked up automatically
-  as they spawn. It only reads the agents' logs, so stopping it (Ctrl-D /
-  Ctrl-C) leaves every agent running untouched.
+- **`cerebro observe [<session-id>]`** — from **another** cerebro session,
+  ask it to *observe* the paired session (the id from the `PAIR MODE`
+  banner names that orchestrator session, not a child). That session tails
+  *every* live paired child of the target at once and tells you, in plain
+  English, what each one is doing — like a colleague watching over your
+  shoulder: it follows the gist rather than every line and flags the
+  important decisions (new abstractions, infra, schema, security, public
+  APIs). It only reads the agents' logs, so observing never disturbs them;
+  it returns one batch of activity per call and the observer loops, narrating
+  until the children finish.
 - **`cerebro steer "<message>"`** — a one-shot inject that sends a single
   instruction into the live child as its next turn and returns at once.
   Pass the pipe path from the child's `PAIR MODE` banner as a first
@@ -325,9 +329,9 @@ and redirect it from your own terminal with two commands:
 The child runs to completion on its own; after each turn it waits a short
 window (`CEREBRO_PAIR_IDLE`, default 60s) for steering, and a quiet
 window finishes it — so a steer takes effect when it lands within that
-window. The orchestrator runs paired children in the background and
-relays the watch/steer commands as soon as the banner appears, so you can
-connect while the work is still going. Each steering message is recorded
+window. The orchestrator runs paired children in the background and prints
+the session id to observe (and the steer command) as soon as the banner
+appears, so another session can connect while the work is still going. Each steering message is recorded
 to a `.steering.md` beside the child log; when the child finishes, cerebro
 reports the steering back and the orchestrator **folds it in
 automatically** — updating the session spec (`cerebro spec set`) for any
