@@ -306,21 +306,30 @@ cerebro never overwrites an existing AGENTS.md in a user repo.
 **Pair programming mode.** Ask the orchestrator to *pair* (or *watch* /
 *steer* / *let me drive*) a child agent and it adds `--pair` to that
 `cerebro plan`, `execute`, `apply-review`, or `doc-write` (codex
-`review` has no live-attach, so pairing does not apply there). `--pair`
-launches the child with claude **Remote Control**: it appears in your
-[claude.ai/code](https://claude.ai/code) session list and the Claude
-mobile app under a recognizable name (`cerebro:<role>:<repo>[:<branch>]`),
-where you can watch it work in real time and type messages to redirect
-it mid-run — just like leaning over to a programmer's keyboard. The
-orchestrator runs paired children in the background and relays the
-attach details as soon as they appear, so you can connect while the work
-is still going. There is no stable URL cerebro can build from a session
-id, so instead it captures the clickable attach URL the Remote Control
-child prints at startup and surfaces it as a `PAIR direct link` line —
-click it to jump straight into the session instead of hunting the list. When the child finishes, cerebro mines its transcript
-for any messages you injected (excluding its own prompt and tool
-output), writes them to a `.steering.md` beside the child log, and
-reports them back. The orchestrator then **folds your steering in
+`review` has no live-steer, so pairing does not apply there). `--pair`
+drives the child through claude's stream-json input so you can follow it
+and redirect it from your own terminal with two commands:
+
+- **`cerebro watch`** — launches a separate, read-only **watcher session**
+  that continuously watches *every* live paired child and tells you, in
+  plain English, what each one is doing (a narrating pair-programmer), and
+  steers one on your spoken command. New agents are picked up automatically
+  as they spawn. It only reads the agents' logs, so stopping it (Ctrl-D /
+  Ctrl-C) leaves every agent running untouched.
+- **`cerebro steer "<message>"`** — a one-shot inject that sends a single
+  instruction into the live child as its next turn and returns at once.
+  Pass the pipe path from the child's `PAIR MODE` banner as a first
+  argument (`cerebro steer <pipe> "<message>"`) only when several paired
+  children are running at once.
+
+The child runs to completion on its own; after each turn it waits a short
+window (`CEREBRO_PAIR_IDLE`, default 60s) for steering, and a quiet
+window finishes it — so a steer takes effect when it lands within that
+window. The orchestrator runs paired children in the background and
+relays the watch/steer commands as soon as the banner appears, so you can
+connect while the work is still going. Each steering message is recorded
+to a `.steering.md` beside the child log; when the child finishes, cerebro
+reports the steering back and the orchestrator **folds it in
 automatically** — updating the session spec (`cerebro spec set`) for any
 changed requirement and revising the affected and upcoming plans (or
 replanning) — and tells you what it changed. Your steering is treated as

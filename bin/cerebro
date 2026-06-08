@@ -257,18 +257,18 @@ Notes:
   * Pair programming. Ask the orchestrator to "pair" (or watch / steer)
     a plan, execute, apply-review, or doc-write child and it adds
     `--pair`: the child runs with claude's stream-json input so you can
-    ATTACH to it from your terminal by running `cerebro steer` (no
-    argument -- it finds the live paired session; the child's PAIR MODE
-    banner also prints the explicit pipe path for when several run at
-    once). That attach streams the child's output and sends whatever you
-    type as steering; the child
-    stays live while you are attached and finishes the moment you detach
-    (Ctrl-D), so there is no wait if you leave. If no one attaches it
-    finishes unattended after a short window (CEREBRO_PAIR_IDLE, default
-    60s). Each steering message is injected into the running session and
-    recorded; when the child ends the orchestrator folds your steering
-    into the session spec and the upcoming plans, then tells you what
-    changed.
+    WATCH it live with `cerebro watch` -- a separate narrator session that
+    watches every paired child and tells you, in plain English, what each
+    is doing (and steers on your command) -- and STEER it directly with
+    `cerebro steer "<message>"` (a one-shot inject that returns at once;
+    pass the pipe path from the PAIR MODE banner as a first arg when
+    several run at once). The child runs to
+    completion on its own; after each turn it waits a short window
+    (CEREBRO_PAIR_IDLE, default 60s) for steering, and a quiet window
+    finishes it. Each steering message is injected into the running
+    session and recorded; when the child ends the orchestrator folds your
+    steering into the session spec and the upcoming plans, then tells you
+    what changed.
 
 Requirements: claude, codex, jq, python3. Child claudes additionally
 need git and gh on PATH for execute / apply-review / doc-write.
@@ -624,7 +624,7 @@ behalf, by calling them through your Bash tool (which is restricted to
     echoed on stdout. The child has Read/Grep/Glob only, so the repo is
     untouched. Use this when the user describes a change.
     --pair enables pair-programming mode (see "# Pair programming mode"):
-    the user attaches to the live planning session and can steer it.
+    the user watches the live planning session and can steer it.
 
   cerebro plans
     List the plan files in the current session with timestamps.
@@ -653,7 +653,7 @@ behalf, by calling them through your Bash tool (which is restricted to
     plan work. Existing AGENTS.md / CLAUDE.md are never modified. You
     don't have to mention this explicitly to the user unless they ask.
     --pair enables pair-programming mode (see "# Pair programming mode"):
-    the user attaches to the live execute session and can steer it.
+    the user watches the live execute session and can steer it.
 
   cerebro review <repo-abs-path> [--base <ref>] [--criteria-file <plan-path>]
     Run codex (non-mutating) against the current branch diff vs <ref>.
@@ -716,17 +716,24 @@ behalf, by calling them through your Bash tool (which is restricted to
     Commits and pushes on the same branch.
     --pair enables pair-programming mode (see "# Pair programming mode").
 
-  cerebro steer [<pipe>]
-    The USER's side of pair mode -- they run it in their own terminal to
-    ATTACH to a live `--pair` child. With NO argument it finds the live
-    paired session automatically (the usual case); the optional <pipe>
-    path (from the child's PAIR MODE banner) picks one when several run
-    at once. The attach streams the child's output as a human-readable
-    feed and sends each line they type as steering; the child stays live
-    while attached and finishes when they detach (Ctrl-D). It runs from
-    any directory. This is an interactive command the USER runs: tell
-    them to run `cerebro steer`, but never run it yourself (it would
-    block and hold the child open).
+  cerebro watch
+    Launch the WATCHER: a separate, read-only narrator session that
+    continuously watches every live paired child agent any cerebro is
+    running and tells the user, in plain English, what each one is doing
+    -- and steers one on the user's command (it calls `cerebro steer` for
+    them). It only READS the agents' child logs, so stopping it (Ctrl-D /
+    Ctrl-C) leaves every agent running untouched, and it picks up new
+    agents automatically as they spawn. This is the USER's view, run in
+    their own terminal -- never run it yourself (it would block).
+
+  cerebro steer [<pipe>] "<message>"
+    One-shot steering: inject a single instruction into a live `--pair`
+    child and return at once. With ONE argument that argument is the
+    message and the live paired session is found automatically (the usual
+    case); with TWO, the first is the <pipe> path (from the child's PAIR
+    MODE banner, to pick one when several run) and the second the
+    message. The message becomes the child's next user turn. Runs from
+    any directory. Steer on the USER's behalf only when they tell you to.
 
   cerebro git <repo-abs-path> <git-subcmd> [args...]
     Run a read-only git command in the user's repo. Allowed subcommands
@@ -1058,41 +1065,43 @@ new or changed requirement with `cerebro spec set` before resuming.
 
 # Pair programming mode
 
-The user can PAIR with a child agent: attach to it live and steer it, the
-way two programmers share a keyboard. Pass `--pair` to `cerebro plan`,
-`execute`, `apply-review`, or `doc-write` when the user asks to "pair",
-"watch", "steer", "follow along", "let me drive", "I want to jump in", or
-similar. (Pairing is not available for `cerebro review` -- codex has no
-live-steer.) `--pair` drives the child through claude's stream-json input:
-cerebro feeds the task as the first message, then relays the user's typed
-steering into the running session over a named pipe. The user ATTACHES
-from their OWN terminal by running `cerebro steer` (no argument -- it
-finds the live paired session itself; they pass the pipe path from the
-PAIR MODE banner only when several are running). That one interactive
-command streams the child's output AND sends whatever they type as
-steering. The child stays live while they are attached and finishes the
-moment they detach (Ctrl-D), so there is no wait if they leave. Steering is a side channel straight into
-the child: the user's messages and the child's replies do NOT enter your
-chat -- only a compact summary of what the user steered comes back at the
-end.
+The user can PAIR with a child agent: watch it live and steer it as it
+works. Pass `--pair` to `cerebro plan`, `execute`, `apply-review`, or
+`doc-write` when the user asks to "pair", "watch", "steer", "follow
+along", "let me drive", "I want to jump in", or similar. (Pairing is not
+available for `cerebro review` -- codex has no live-steer.) `--pair`
+drives the child through claude's stream-json input: cerebro feeds the
+task as the first message, then after each turn waits a short window for
+steering injected over a named pipe. The user has two commands, run from
+their OWN terminal: `cerebro watch` (launches a separate, read-only
+WATCHER session that watches every paired child and narrates, in plain
+English, what each is doing -- and steers on the user's spoken command)
+and `cerebro steer "<message>"` (a ONE-SHOT inject that sends one
+instruction into the live child and returns at once -- they pass the pipe
+path from the PAIR MODE banner as a first arg only when several paired
+children run at once).
+Steering is a side channel straight into the child: the user's messages
+and the child's replies do NOT enter your chat -- only a compact summary
+of what they steered comes back at the end.
 
 How to run a paired child:
 
-  1. RUN IT IN THE BACKGROUND. A paired child is meant to be attached to
-     WHILE it runs, so launch it as a background Bash task -- never block
-     on it in the foreground. cerebro prints a "PAIR MODE" banner to
-     stderr as soon as it starts, including the exact `cerebro steer`
-     attach command.
-  2. RELAY THE ATTACH COMMAND IMMEDIATELY. As soon as that banner
-     appears, tell the user to run `cerebro steer` in their own terminal
-     to attach (no argument -- it finds the live session; it streams the
-     child and lets them type steering; Ctrl-D detaches). Do this at once
-     -- if no one attaches within a short window the child just runs
-     unattended to completion. Do NOT run `cerebro steer` yourself; it is
-     the user's and would block.
-  3. LET IT RUN. Narrate progress briefly as usual. The child keeps
-     itself alive while the user is attached and finishes as soon as
-     they detach; an unattended child finishes on its own.
+  1. RUN IT IN THE BACKGROUND. A paired child is meant to be watched and
+     steered WHILE it runs, so launch it as a background Bash task --
+     never block on it in the foreground. cerebro prints a "PAIR MODE"
+     banner to stderr as soon as it starts, with the exact `cerebro
+     watch` and `cerebro steer` commands.
+  2. RELAY THE COMMANDS IMMEDIATELY. As soon as that banner appears, tell
+     the user they can run `cerebro watch` (in its own terminal) to watch
+     the child live and be told what it is doing, and `cerebro steer
+     "<message>"` to redirect it. The child runs to completion on its
+     own; after each turn it waits a short window (CEREBRO_PAIR_IDLE,
+     default 60s) for steering, so a steer has to land within that window
+     to take effect. Do NOT run `cerebro watch` yourself -- it is the
+     user's view and would block; only steer on the user's behalf when
+     they explicitly tell you to.
+  3. LET IT RUN. Narrate progress briefly as usual. An un-steered child
+     just finishes on its own after the quiet window.
   4. ON COMPLETION, COLLECT THE STEERING. When the child finishes,
      cerebro emits a block on stdout delimited by
      `=== PAIR STEERING (N message(s), applied live) ===` ... `=== END
@@ -1614,19 +1623,18 @@ if result_path:
 '
 
 # ----- pair-programming mode -----------------------------------------------
-# `--pair` on a claude child (plan / execute / apply-review / doc-write) lets
-# the developer ATTACH to the live session from their terminal and steer it.
-# Remote Control cannot run headlessly (it needs an interactive TTY and never
-# registers under `-p`), so cerebro instead drives the child through claude's
-# stream-json input (`--input-format stream-json`): it feeds the initial prompt
-# as the first user message, then relays the attached developer's typed steering
-# into the running session over a named pipe. `cerebro steer <pipe>` is an
-# interactive attach -- it streams the child's output and sends what you type as
-# steering, and holds a presence lock for as long as it is attached. The child
-# stays alive while a developer is attached and finishes the moment they detach
-# (so there is no wait if they leave); if no one attaches within a short window
-# it finishes unattended like a normal run. Steering is recorded as it is
-# injected and folded back so the orchestrator can reconcile it against the spec.
+# `--pair` on a claude child (plan / execute / apply-review / doc-write) lets the
+# developer WATCH the live session and STEER it from their terminal. cerebro
+# drives the child through claude's stream-json input (`--input-format
+# stream-json`): it feeds the initial prompt as the first user message, then
+# after each turn waits a short window for steering injected over a named pipe.
+# `cerebro watch` launches a separate, read-only narrator session that watches
+# every paired child and explains what each is doing (see cmd_watch); `cerebro
+# steer "<message>"` is a one-shot inject -- it writes one instruction to the
+# child and returns at once (no attach, no lock). The child runs to completion;
+# each turn opens a brief steering window (CEREBRO_PAIR_IDLE) and a quiet window
+# finishes it. Steering is recorded as it is injected and folded back so the
+# orchestrator can reconcile it against the spec.
 
 # pair_label <role> <repo> [branch] -- a stable, human-readable session name
 # for the paired child (shown in cerebro's connect banner).
@@ -1641,12 +1649,13 @@ pair_label() {
 pair_banner() {
   local role="$1" sid="$2" label="$3" fifo="$4"
   {
-    printf 'cerebro: PAIR MODE -- attach to watch and steer this %s session live.\n' "$role"
+    printf 'cerebro: PAIR MODE -- watch this %s session live and steer it.\n' "$role"
     printf '  session : %s (id %s)\n' "$label" "$sid"
-    printf '  attach  : cerebro steer        (run in your own terminal, from anywhere)\n'
-    printf '            streams the child; type a line + Enter to steer, Ctrl-D to detach.\n'
-    printf '            if several paired sessions run at once: cerebro steer %s\n' "$fifo"
-    printf '  the child stays live while you are attached and finishes when you detach.\n'
+    printf '  watch   : cerebro watch        (narrator session -- watch every agent, hear what it does)\n'
+    printf '  steer   : cerebro steer "<message>"   (inject one instruction; returns at once)\n'
+    printf '            if several paired sessions run at once: cerebro steer %s "<message>"\n' "$fifo"
+    printf '  the child runs to completion; it waits a short window after each turn for\n'
+    printf '  steering, so steer within that window to keep it open and redirect it.\n'
     printf '  your steering goes straight into the child; it never enters the orchestrator chat.\n'
   } >&2
 }
@@ -1654,12 +1663,10 @@ pair_banner() {
 # pair_begin <role> <repo> <branch> <child_log> [resume-id] -- prepare a fresh
 # or resumed paired child. Sets caller-scoped: PAIR_SID (session id), PAIR_OPTS
 # (extra claude flags -- stream-json input, plus a pinned --session-id for a
-# fresh run), PAIR_FIFO (the named pipe the attached `cerebro steer` writes to),
-# PAIR_STEER (the file live steering is recorded to, folded back by
-# pair_report), PAIR_LOCK (the presence lock `cerebro steer` holds while
-# attached) and PAIR_ATTACH (seconds to wait for a first attach before finishing
-# unattended). On a resume the stored id is reused and the caller's --resume sets
-# the session id.
+# fresh run), PAIR_FIFO (the named pipe `cerebro steer` writes to), PAIR_STEER
+# (the file live steering is recorded to, folded back by pair_report) and
+# PAIR_IDLE (seconds of quiet after a turn before the child finishes). On a
+# resume the stored id is reused and the caller's --resume sets the session id.
 pair_begin() {
   local role="$1" repo="$2" branch="${3:-}" child_log="$4" resume="${5:-}"
   local label; label="$(pair_label "$role" "$repo" "$branch")"
@@ -1672,10 +1679,8 @@ pair_begin() {
   fi
   PAIR_STEER="${child_log%.jsonl}.steering.md"
   PAIR_FIFO="${child_log%.jsonl}.steer.fifo"
-  PAIR_LOCK="${child_log%.jsonl}.steer.lock"
-  PAIR_ATTACH="${CEREBRO_PAIR_IDLE:-60}"
+  PAIR_IDLE="${CEREBRO_PAIR_IDLE:-60}"
   : > "$PAIR_STEER"
-  : > "$PAIR_LOCK"
   rm -f "$PAIR_FIFO"
   mkfifo "$PAIR_FIFO" || die "pair: cannot create steering pipe at $PAIR_FIFO"
   pair_banner "$role" "$PAIR_SID" "$label" "$PAIR_FIFO"
@@ -1686,24 +1691,22 @@ pair_begin() {
 pair_cleanup() {
   (( $1 )) || return 0
   [[ -n "${PAIR_FIFO:-}" ]] && rm -f "$PAIR_FIFO"
-  [[ -n "${PAIR_LOCK:-}" ]] && rm -f "$PAIR_LOCK"
 }
 
 # The input-pump for a paired child. stdin carries the initial prompt; argv is
-# <fifo> <steer_path> <child_log> <lock_path> <attach_grace>. It emits the prompt
-# as the first stream-json user message, then watches <child_log> for the
-# `result` event that ends each turn. After each turn it keeps the child alive
-# only while a developer is ATTACHED -- presence is an exclusive lock on
-# <lock_path> that an interactive `cerebro steer` holds. While attached, steering
-# the developer types arrives over <fifo> ("S <base64>" per message); it is
-# forwarded as the next user message and appended to <steer_path>. The moment the
-# developer detaches the pump closes claude'\''s stdin so the child finishes (no
-# wait). If no one ever attaches, it finishes after <attach_grace> seconds.
+# <fifo> <steer_path> <child_log> <idle_grace>. It emits the prompt as the first
+# stream-json user message, then watches <child_log> for the `result` event that
+# ends each turn. After each turn it waits up to <idle_grace> seconds for a
+# one-shot `cerebro steer` message to arrive over <fifo> ("S <base64>" per
+# message); each message is forwarded as the next user turn and appended to
+# <steer_path>, and resets the window. A quiet window closes claude'\''s stdin so
+# the child finishes. The child therefore runs to completion on its own, with a
+# short steering window after every turn -- no developer needs to stay attached.
 PY_PAIR_PUMP='
-import base64, fcntl, json, os, sys, time
+import base64, json, os, sys, time
 
-fifo, steer_path, child_log, lock_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-attach_grace = float(sys.argv[5])
+fifo, steer_path, child_log = sys.argv[1], sys.argv[2], sys.argv[3]
+idle_grace = float(sys.argv[4])
 
 def emit(text):
     sys.stdout.write(json.dumps(
@@ -1729,22 +1732,10 @@ def turns_completed():
         pass
     return n
 
-# Presence: an attached `cerebro steer` holds an exclusive lock on lock_path. We
-# only TEST it (acquire non-blocking, release at once); we never hold it. A held
-# lock => a developer is attached.
-lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-def attached():
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        return True
-    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    return False
-
 emit(sys.stdin.read())
 
-# O_RDWR keeps a writer fd open on our side so the pipe never reports EOF as the
-# attached steerer comes and goes, and never blocks on open.
+# O_RDWR keeps a writer fd open on our side so the pipe never reports EOF as
+# one-shot `cerebro steer` writers come and go, and never blocks on open.
 fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
 buf = b""
 pending = []
@@ -1767,17 +1758,18 @@ def refill():
             except Exception:
                 pass
 
-start = time.monotonic()
-ever_attached = False
 done_turns = 0
 while True:
-    # Wait for the agent to finish the turn our last message started. A hung
-    # turn is bounded by cerebro'\''s outer timeout, not here.
+    # Wait for the agent to finish the turn our last message started, draining
+    # any steering that lands mid-turn so it is never lost. A hung turn is
+    # bounded by cerebro'\''s outer timeout, not here.
     while turns_completed() <= done_turns:
+        refill()
         time.sleep(0.4)
     done_turns = turns_completed()
-    # Keep the child alive only while a developer is attached. Always drain the
-    # pipe first, so steering sent just before a detach is never lost.
+    # Offer to steer: wait up to idle_grace for a one-shot `cerebro steer`
+    # message. Each message resets the window; a quiet window finishes the child.
+    deadline = time.monotonic() + idle_grace
     while True:
         refill()
         if pending:
@@ -1788,26 +1780,19 @@ while True:
                     sf.write("- " + msg.replace("\n", "\n  ") + "\n")
             except OSError:
                 pass
-            ever_attached = True
             break  # wait for the steered turn to complete, then re-offer
-        if attached():
-            ever_attached = True
-            time.sleep(0.3)
-        elif ever_attached or (time.monotonic() - start) > attach_grace:
-            # Detached after engaging -> finish now. Never attached -> finish
-            # once the initial attach window has elapsed.
+        if time.monotonic() >= deadline:
             sys.exit(0)
-        else:
-            time.sleep(0.3)
+        time.sleep(0.3)
 '
 
-# pair_feed <pair> <fifo> <steer> <child_log> <lock> <attach_grace> -- stdin
-# carries the initial prompt. Unpaired: pass it through unchanged as claude -p
-# text input. Paired: hand it to the stream-json input pump above.
+# pair_feed <pair> <fifo> <steer> <child_log> <idle_grace> -- stdin carries the
+# initial prompt. Unpaired: pass it through unchanged as claude -p text input.
+# Paired: hand it to the stream-json input pump above.
 pair_feed() {
-  local pair="$1" fifo="$2" steer="$3" child_log="$4" lock="$5" grace="$6"
+  local pair="$1" fifo="$2" steer="$3" child_log="$4" grace="$5"
   if (( pair )); then
-    python3 -c "$PY_PAIR_PUMP" "$fifo" "$steer" "$child_log" "$lock" "$grace"
+    python3 -c "$PY_PAIR_PUMP" "$fifo" "$steer" "$child_log" "$grace"
   else
     cat
   fi
@@ -2015,7 +2000,7 @@ outer code fence. Output ONLY the plan.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
-  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_LOCK="" PAIR_ATTACH=""
+  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_IDLE=""
   if (( pair )); then
     pair_begin plan "$repo" "" "$child_log"
     opts+=("${PAIR_OPTS[@]}")
@@ -2031,7 +2016,7 @@ $desc
   local rc
   ( cd "$repo" && \
     printf '%s' "$prompt" \
-      | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_LOCK" "$PAIR_ATTACH" \
+      | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -2223,14 +2208,14 @@ attempt to authenticate. Stop after the PR is open.'
 
   local rc id_capture
   id_capture="$(mktemp)"
-  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_LOCK="" PAIR_ATTACH=""
+  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_IDLE=""
   (( pair )) && pair_begin execute "$repo" "$new_branch" "$child_log" "$prior"
   local run_opts=("${opts[@]}")
   [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
   (( pair )) && run_opts+=("${PAIR_OPTS[@]}")
 
   ( cd "$repo" && printf '%s' "$child_prompt" \
-      | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_LOCK" "$PAIR_ATTACH" \
+      | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -2258,7 +2243,7 @@ attempt to authenticate. Stop after the PR is open.'
       retry_opts+=("${PAIR_OPTS[@]}")
     fi
     ( cd "$repo" && printf '%s' "$child_prompt" \
-        | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_LOCK" "$PAIR_ATTACH" \
+        | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
         | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
           "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>/dev/null \
         | tee "$child_log" \
@@ -2640,7 +2625,7 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
-  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_LOCK="" PAIR_ATTACH=""
+  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_IDLE=""
   if (( pair )); then
     local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
     pair_begin apply-review "$repo" "$_b" "$child_log"
@@ -2656,7 +2641,7 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
       else
         printf 'Apply the following fix on the current branch. Commit and push so the existing PR updates.\n\n<task>\n%s\n</task>\n' "$prompt_text"
       fi
-    } | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_LOCK" "$PAIR_ATTACH" \
+    } | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -2741,7 +2726,7 @@ per AGENTS.md and push so the open PR updates.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
-  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_LOCK="" PAIR_ATTACH=""
+  local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_IDLE=""
   if (( pair )); then
     local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
     pair_begin doc-write "$repo" "$_b" "$child_log"
@@ -2751,7 +2736,7 @@ per AGENTS.md and push so the open PR updates.'
   local rc
   ( cd "$repo" && \
     { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n%s\n</plan>\n' "$notes" "$plan_body"
-    } | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_LOCK" "$PAIR_ATTACH" \
+    } | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
       | tee "$child_log" \
@@ -3802,46 +3787,50 @@ cmd_gh() {
   exec gh "$top" "$@"
 }
 
-# The interactive attach: stream a live paired child and steer it by typing.
-# argv is <fifo> <child_log> <lock_path>. It takes the presence lock (so the
-# child stays alive while attached and finishes when this exits), then loops:
-# render new child output, and send each line typed on stdin as a steering
-# message ("S <base64>" on the fifo). Ctrl-D / Ctrl-C detaches.
-PY_ATTACH='
-import base64, fcntl, json, os, select, sys, time
+# PY_WATCH_PUMP -- the input side of the watcher session `cerebro watch`. argv
+# is <cerebro-home>. It keeps the narrator (claude) fed with stream-json user
+# messages from two sources, merged: (1) every line the user types on stdin,
+# forwarded as a "[USER] ..." message; and (2) the live activity of every paired
+# child agent another cerebro is running -- it discovers them by globbing
+# <home>/sessions/*/children/*.steer.fifo, tails each child'\''s .jsonl log, and
+# forwards new actions as "[ACTIVITY <label> | steer-pipe: <fifo>] ..." messages.
+# New children are picked up automatically; a child whose pipe disappears is
+# drained a final time and reported finished. It only READS child logs (and the
+# user'\''s stdin); it never writes to a child, so stopping the watcher (Ctrl-D /
+# Ctrl-C) leaves the agents untouched. Closing stdin ends the narrator session.
+PY_WATCH_PUMP='
+import glob, json, os, select, sys, time
 
-fifo, child_log, lock_path = sys.argv[1], sys.argv[2], sys.argv[3]
+home = sys.argv[1]
+scan_glob = home + "/sessions/*/children/*.steer.fifo"
 
-# Hold the presence lock for the whole attach. The pump only tests it with a
-# momentary grab, so one failure is not proof another developer is on -- retry
-# briefly before giving up.
-lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-got = False
-for _ in range(40):
+def emit(text):
+    sys.stdout.write(json.dumps(
+        {"type": "user", "message": {"role": "user", "content": text}},
+        ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+def fifo_live(fifo):
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        got = True
-        break
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
     except OSError:
-        time.sleep(0.05)
-if not got:
-    sys.stderr.write("cerebro: another session is already attached to this child.\n")
-    sys.exit(4)
+        return False
+    os.close(fd)
+    return True
 
-try:
-    wfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
-except OSError:
-    sys.stderr.write("cerebro: the child is not listening (it may have finished).\n")
-    sys.exit(3)
+def label_of(fifo):
+    base = os.path.basename(fifo)
+    suffix = ".steer.fifo"
+    return base[:-len(suffix)] if base.endswith(suffix) else base
 
-def render(ev):
+def render(ev, out):
     t = ev.get("type")
     if t == "assistant":
         for item in ev.get("message", {}).get("content", []) or []:
             if item.get("type") == "text":
                 txt = (item.get("text") or "").strip()
                 if txt:
-                    sys.stdout.write(txt + "\n")
+                    out.append("says: " + txt)
             elif item.get("type") == "tool_use":
                 inp = item.get("input", {}) or {}
                 target = (inp.get("description") or inp.get("file_path") or
@@ -3850,59 +3839,140 @@ def render(ev):
                 if isinstance(target, list):
                     target = " ".join(map(str, target))
                 target = str(target).replace("\n", " ").strip()
-                if len(target) > 160:
-                    target = target[:160] + "..."
-                sys.stdout.write("  -> %s: %s\n" % (item.get("name", "?"), target))
+                if len(target) > 200:
+                    target = target[:200] + "..."
+                out.append("%s: %s" % (item.get("name", "?"), target))
     elif t == "result":
         sub = ev.get("subtype")
-        sys.stdout.write("  -- turn complete --\n" if not sub or sub == "success"
-                         else "  -- result: %s --\n" % sub)
+        out.append("(turn complete)" if not sub or sub == "success" else "(ended: %s)" % sub)
 
-sys.stderr.write("cerebro: attached. Streaming the child -- type a line + Enter to steer, Ctrl-D to detach.\n")
+def drain(st):
+    out = []
+    try:
+        with open(st["log"]) as fh:
+            fh.seek(st["pos"])
+            data = fh.read()
+            st["pos"] = fh.tell()
+    except OSError:
+        return out
+    if not data:
+        return out
+    buf = st["buf"] + data
+    while "\n" in buf:
+        line, buf = buf.split("\n", 1)
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        render(ev, out)
+    st["buf"] = buf
+    return out
+
+sys.stderr.write("cerebro: watcher attached -- narrating the live agents. "
+                 "Ctrl-D / Ctrl-C to stop watching (the agents keep running).\n")
 sys.stderr.flush()
 
-pos, buf = 0, ""
+tracked = {}  # fifo -> {log, label, pos, buf}
 try:
     while True:
-        try:
-            with open(child_log) as fh:
-                fh.seek(pos)
-                data = fh.read()
-                pos = fh.tell()
-        except OSError:
-            data = ""
-        if data:
-            buf += data
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                render(ev)
-            sys.stdout.flush()
-        if not os.path.exists(fifo):
-            sys.stderr.write("cerebro: session ended.\n")
-            break
-        r, _, _ = select.select([sys.stdin], [], [], 0.3)
-        if r:
-            s = sys.stdin.readline()
-            if not s:           # Ctrl-D
+        # 1. Forward everything the user has typed.
+        eof = False
+        while True:
+            r, _, _ = select.select([sys.stdin], [], [], 0.0)
+            if not r:
                 break
-            msg = s.strip()
-            if msg:
-                try:
-                    os.write(wfd, ("S " + base64.b64encode(msg.encode("utf-8")).decode() + "\n").encode())
-                    sys.stderr.write("cerebro: steer sent.\n")
-                    sys.stderr.flush()
-                except OSError:
-                    sys.stderr.write("cerebro: child not listening; detaching.\n")
-                    break
+            s = sys.stdin.readline()
+            if s == "":
+                eof = True
+                break
+            line = s.strip()
+            if line:
+                emit("[USER] " + line)
+        if eof:
+            break
+
+        # 2. Discover live paired children; start tracking new ones from the top.
+        live = set()
+        for fifo in glob.glob(scan_glob):
+            if not fifo_live(fifo):
+                continue
+            live.add(fifo)
+            if fifo not in tracked:
+                tracked[fifo] = {"log": fifo[:-len(".steer.fifo")] + ".jsonl",
+                                 "label": label_of(fifo), "pos": 0, "buf": ""}
+                emit("[ACTIVITY %s | steer-pipe: %s] (now watching this agent)"
+                     % (tracked[fifo]["label"], fifo))
+
+        # 3. Narrate each tracked child'\''s new activity; retire finished ones.
+        for fifo in list(tracked):
+            st = tracked[fifo]
+            lines = drain(st)
+            if lines:
+                emit("[ACTIVITY %s | steer-pipe: %s]\n%s"
+                     % (st["label"], fifo, "\n".join(lines)))
+            if fifo not in live:
+                tail = drain(st)
+                if tail:
+                    emit("[ACTIVITY %s | steer-pipe: %s]\n%s"
+                         % (st["label"], fifo, "\n".join(tail)))
+                emit("[ACTIVITY %s] (this agent has finished)" % st["label"])
+                del tracked[fifo]
+
+        time.sleep(1.0)
 except KeyboardInterrupt:
     pass
+
+sys.stderr.write("cerebro: stopped watching. The agents are untouched and keep "
+                 "running under their own cerebro.\n")
+sys.stderr.flush()
+'
+
+# PY_WATCH_RENDER -- the output side of `cerebro watch`. It reads the narrator
+# (claude) stream-json on stdin and prints its plain-English narration to the
+# terminal, plus a short marker whenever the narrator steers an agent.
+PY_WATCH_RENDER='
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except ValueError:
+        continue
+    if ev.get("type") != "assistant":
+        continue
+    for item in ev.get("message", {}).get("content", []) or []:
+        if item.get("type") == "text":
+            txt = (item.get("text") or "").strip()
+            if txt:
+                sys.stdout.write(txt + "\n")
+                sys.stdout.flush()
+        elif item.get("type") == "tool_use":
+            cmd = (item.get("input", {}) or {}).get("command", "")
+            if "cerebro steer" in cmd:
+                sys.stdout.write("  (steering an agent...)\n")
+                sys.stdout.flush()
+'
+
+# PY_STEER_SEND -- the one-shot steering inject for `cerebro steer`. argv is
+# <fifo> <message>. It writes a single "S <base64>" line to the child'\''s pipe
+# and returns; the pump forwards it as the child'\''s next user turn.
+PY_STEER_SEND='
+import base64, os, sys
+fifo, msg = sys.argv[1], sys.argv[2]
+try:
+    fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+except OSError:
+    sys.stderr.write("cerebro: the child is not listening (it may have finished).\n")
+    sys.exit(3)
+try:
+    os.write(fd, ("S " + base64.b64encode(msg.encode("utf-8")).decode() + "\n").encode())
+finally:
+    os.close(fd)
 '
 
 # steer_fifo_live <fifo> -- true if the pipe exists AND the child's pump is
@@ -3920,16 +3990,23 @@ os.close(fd)
 ' "$1" 2>/dev/null
 }
 
-# ----- subcommand: cerebro steer [<pipe>] ----------------------------------
-# The developer's side of pair mode: an interactive ATTACH to a live `--pair`
-# child. With no argument it finds the live paired session for you (the common
-# case); pass the <pipe> path from the child's PAIR MODE banner to pick a
-# specific one when several are running. The attach streams the child's output
-# and sends what you type as steering; the child stays alive while you are
-# attached and finishes the moment you detach (Ctrl-D / Ctrl-C). It can be run
-# from any directory.
+# ----- subcommand: cerebro steer [<pipe>] "<message>" ----------------------
+# One-shot steering: inject a single instruction into a live `--pair` child and
+# return at once (no attach, no lock). With ONE argument that argument is the
+# message and the live paired session is found automatically (the common case);
+# with TWO, the first is the <pipe> path from the child's PAIR MODE banner (to
+# pick one when several run at once) and the second is the message. The message
+# becomes the child's next user turn. Runs from any directory.
 cmd_steer() {
-  local fifo="${1:-}"
+  local fifo="" msg=""
+  if (( $# == 1 )); then
+    msg="$1"
+  elif (( $# >= 2 )); then
+    fifo="$1"; msg="$2"
+  else
+    die "steer: usage: cerebro steer [<pipe>] \"<message>\""
+  fi
+  [[ -n "$msg" ]] || die "steer: empty steering message"
   if [[ -z "$fifo" ]]; then
     local candidates=() f
     shopt -s nullglob
@@ -3938,19 +4015,94 @@ cmd_steer() {
     done
     shopt -u nullglob
     if (( ${#candidates[@]} == 0 )); then
-      die "steer: no live paired session found. Start one with --pair (e.g. 'cerebro plan <repo> \"...\" --pair'), then run 'cerebro steer'; or pass the pipe path from the child's PAIR MODE banner."
+      die "steer: no live paired session found. Start one with --pair (e.g. 'cerebro execute <repo> ... --pair'), then run 'cerebro steer \"<message>\"'."
     elif (( ${#candidates[@]} > 1 )); then
-      { printf 'cerebro: steer: several live paired sessions -- attach to one by passing its pipe:\n'
-        for f in "${candidates[@]}"; do printf '  cerebro steer %s\n' "$f"; done
+      { printf 'cerebro: steer: several live paired sessions -- pass the pipe of the one you mean:\n'
+        for f in "${candidates[@]}"; do printf '  cerebro steer %s "<message>"\n' "$f"; done
       } >&2
       exit 1
     fi
     fifo="${candidates[0]}"
-    say "cerebro: attaching to $(basename "${fifo%.steer.fifo}")"
   fi
   [[ -p "$fifo" ]] || die "steer: no live paired session at $fifo (the child may have finished)"
-  local base="${fifo%.steer.fifo}"
-  exec python3 -c "$PY_ATTACH" "$fifo" "$base.jsonl" "$base.steer.lock"
+  python3 -c "$PY_STEER_SEND" "$fifo" "$msg" || die "steer: could not deliver (the child may have finished)"
+  say "cerebro: steered $(basename "${fifo%.steer.fifo}")"
+}
+
+# The watcher session's system prompt: it narrates other cerebros' live agents
+# and steers them only on the user's command. Echoed on stdout.
+watcher_append_prompt() {
+  cat <<'EOF'
+You are cerebro's WATCHER -- a narrating pair-programmer. You do NOT write code,
+run commands, or do any work yourself. Somewhere else, another cerebro is running
+one or more child agents; your whole job is to watch what those agents do and
+tell the user, in plain English, what is happening -- and to steer an agent only
+when the user tells you to.
+
+Your input stream carries two kinds of messages. Read the tag at the start of
+each one:
+
+- "[ACTIVITY <label> | steer-pipe: <path>] ..." is the LIVE activity of an agent
+  you are watching: file edits, commands it runs, searches, its own messages,
+  turn boundaries. These are NOT the user talking. Narrate them: say briefly and
+  in plain language what that agent is doing and why it matters. Group related
+  actions into one short observation rather than reading tool calls verbatim.
+  When several agents are active, lead with the agent's <label> so the user knows
+  who is doing what. Keep up a running commentary as activity arrives.
+
+- "[USER] ..." is the person you are talking to. Answer their questions from what
+  you have seen the agents do, and follow their instructions.
+
+STEERING (only on the user's command): when the USER tells you to redirect or
+correct an agent -- "tell it to use a hashmap", "stop touching the config",
+"have it run the tests" -- inject that into the agent by running:
+
+  cerebro steer <steer-pipe-path-for-that-agent> "<the instruction>"
+
+Take the steer-pipe path from that agent's most recent [ACTIVITY] header. NEVER
+steer on your own initiative or without an explicit user instruction. After you
+steer, tell the user exactly what you sent and to which agent.
+
+STOPPING: if the user asks to stop watching a particular agent, simply stop
+narrating that one and say so (you cannot un-spawn it; it keeps running). If they
+ask to stop or quit entirely, acknowledge -- they end the watcher with Ctrl-D /
+Ctrl-C. Stopping the watcher never affects the agents; they keep running under
+their own cerebro.
+
+STYLE: concise, present tense, plain English -- the colleague narrating the
+screen, not a log printer. Never claim to have done work yourself; you only watch
+and (on request) steer.
+EOF
+}
+
+# ----- subcommand: cerebro watch -------------------------------------------
+# Launch the WATCHER: a separate, read-only narrator session that continuously
+# watches every live paired child agent any other cerebro is running and tells
+# you, in plain English, what each one is doing -- and steers one on your command
+# (`cerebro steer`). A pump feeds the narrator both your typed messages and the
+# agents' live activity (read straight from their child logs); it only reads
+# those files, so stopping the watcher (Ctrl-D / Ctrl-C) leaves every agent
+# running untouched. New agents are picked up automatically as they spawn. Runs
+# from any directory; the agents it watches belong to other cerebro sessions.
+cmd_watch() {
+  # The pump reads the user's keystrokes from stdin, so the watcher only makes
+  # sense attached to a real terminal. This also refuses an orchestrator that
+  # tries to run it via its Bash tool (no tty) -- the watcher is the USER's view.
+  [[ -t 0 ]] || die "watch: 'cerebro watch' is your live view -- run it directly in your own terminal. Its input must be an interactive terminal, so it cannot run headless or from inside another cerebro session."
+  command -v claude  >/dev/null 2>&1 || die "watch: missing required command on PATH: claude"
+  command -v python3 >/dev/null 2>&1 || die "watch: missing required command on PATH: python3"
+  materialise_home
+  local sid; sid="$(mint_uuid)"
+  export CEREBRO_HOME
+  say "cerebro: launching watcher -- it narrates the live agents and steers on your command; Ctrl-D / Ctrl-C stops watching (agents keep running)."
+  cd "$CEREBRO_HOME" || die "cd to $CEREBRO_HOME failed"
+  python3 -c "$PY_WATCH_PUMP" "$CEREBRO_HOME" \
+    | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+      claude -p --input-format stream-json --output-format stream-json --verbose \
+        --session-id "$sid" \
+        --append-system-prompt "$(watcher_append_prompt)" \
+        --allowedTools "Bash(cerebro steer:*) Read Grep Glob" \
+    | python3 -c "$PY_WATCH_RENDER"
 }
 
 # ----- dispatch ------------------------------------------------------------
@@ -3971,6 +4123,7 @@ main() {
     apply-review) shift; cmd_apply_review "$@" ;;
     doc-write) shift; cmd_doc_write "$@" ;;
     steer) shift; cmd_steer "$@" ;;
+    watch) shift; cmd_watch "$@" ;;
     recall) shift; cmd_recall "$@" ;;
     status) shift; cmd_status "$@" ;;
     spec) shift; cmd_spec "$@" ;;

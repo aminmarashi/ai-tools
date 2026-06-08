@@ -1331,19 +1331,20 @@ else
 fi
 
 # ========================================================================
-# 131-137. Pair-programming mode (--pair). Remote Control cannot run headless,
-# so --pair drives the child through claude's stream-json INPUT instead: cerebro
-# feeds the task as the first message, then relays live `cerebro steer` messages
-# into the running session over a named pipe, and closes stdin (so the child
-# finishes) on `--done` or an idle window. A stub claude records its argv, then
-# -- in streaming mode -- emits an init + one `result` per input line it reads
-# (each input line is a turn), staying alive until stdin closes. The test runs
-# execute --pair while a background steerer waits for the pipe, injects one
-# steering message, then sends --done. We assert that --pair adds
-# --input-format stream-json + --session-id (and NEVER --remote-control), that
-# the live steering is captured to .steering.md and folded back as a PAIR
-# STEERING block, that the banner advertises `cerebro steer`, and that the
-# default (no --pair) path stays clean.
+# 131-138. Pair-programming mode (--pair). --pair drives the child through
+# claude's stream-json INPUT: cerebro feeds the task as the first message, then
+# after each turn waits a short window for a one-shot `cerebro steer` message
+# over a named pipe, and closes stdin (so the child finishes) once a window
+# passes with no steering. A stub claude records its argv, then -- in streaming
+# mode -- emits an init + one `result` per input line it reads (each input line
+# is a turn), staying alive until stdin closes. The test runs execute --pair
+# while a background driver injects one `cerebro steer "<msg>"`. We assert that
+# --pair adds --input-format stream-json + --session-id (and NEVER
+# --remote-control), that the live steering is captured to .steering.md and
+# folded back as a PAIR STEERING block, that the banner advertises `cerebro
+# watch` + `cerebro steer`, and that the default (no --pair) path stays clean.
+# Test 138 separately stands up a fake live agent and asserts `cerebro watch`
+# (the narrator session) auto-detects it and narrates its activity.
 # ========================================================================
 PAIR_ARGV_LOG="$WORKDIR/pair-argv.log"
 PAIR_STUB_DIR="$WORKDIR/claude-pair-stub"
@@ -1379,13 +1380,12 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
   PSESS="pair-session"; PDIR="$CEREBRO_HOME/sessions/$PSESS"
   mkdir -p "$PDIR/children" "$PDIR/plans"; : > "$PDIR/transcript.jsonl"
 
-  # Background steerer: wait for the child's steering pipe AND its first result
-  # (proving the pump has the pipe open), then ATTACH interactively -- send one
-  # steering line on stdin and hold the attach (keeping the presence lock) until
-  # the steering lands in .steering.md, then detach (stdin EOF). The capture file
-  # gets the attach's rendered feed + status lines.
-  pair_attach() {
-    local out="$1" f="" clog sp i
+  # Background driver: wait for the child's steering pipe AND its first result
+  # (proving the pump has the pipe open), then inject one steering message with a
+  # one-shot `cerebro steer "<msg>"` (no pipe arg -- auto-discovers the single
+  # live child). Wait until the steering lands in .steering.md before returning.
+  pair_drive() {
+    local steerout="$1" f="" clog sp i
     for i in $(seq 1 400); do
       f="$(ls "$PDIR"/children/*.steer.fifo 2>/dev/null | head -1)"
       if [[ -n "$f" ]]; then
@@ -1396,24 +1396,20 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     done
     [[ -n "$f" ]] || return 0
     sp="${f%.steer.fifo}.steering.md"
-    # Attach with NO pipe argument -- exercises auto-discovery of the live child.
-    {
-      printf 'actually use a hashmap here\n'
-      for i in $(seq 1 300); do grep -q 'hashmap' "$sp" 2>/dev/null && break; sleep 0.05; done
-    } | "$CEREBRO_BIN" steer >"$out" 2>&1
+    "$CEREBRO_BIN" steer "actually use a hashmap here" >"$steerout" 2>&1
+    for i in $(seq 1 300); do grep -q 'hashmap' "$sp" 2>/dev/null && break; sleep 0.05; done
   }
 
-  # --- 131-133b. execute --pair: live attach + steer round trip ---
+  # --- 131-133b. execute --pair: live one-shot steer round trip ---
   : > "$PAIR_ARGV_LOG"
-  pair_attach "$WORKDIR/attach.out" &
+  pair_drive "$WORKDIR/steer.out" &
   STEERER_PID=$!
-  pout="$(env PATH="$PAIR_STUB_PATH" CEREBRO_SESSION_ID="$PSESS" CEREBRO_PAIR_IDLE=20 \
+  pout="$(env PATH="$PAIR_STUB_PATH" CEREBRO_SESSION_ID="$PSESS" CEREBRO_PAIR_IDLE=5 \
     "$CEREBRO_BIN" execute "$REPO" --prompt "do the work" --pair 2>"$WORKDIR/perr")"
   prc=$?
   wait "$STEERER_PID" 2>/dev/null
   pargv="$(cat "$PAIR_ARGV_LOG")"
   perr="$(cat "$WORKDIR/perr")"
-  aout="$(cat "$WORKDIR/attach.out" 2>/dev/null)"
 
   # --- 131. execute --pair uses stream-json input + --session-id, not RC ---
   if [[ $prc -eq 0 && "$pargv" == *"--input-format stream-json"* \
@@ -1451,11 +1447,11 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("133b pair_steering event missing")
   fi
 
-  # --- 134. the PAIR MODE banner advertises the `cerebro steer` attach ---
-  if [[ "$perr" == *"PAIR MODE"* && "$perr" == *"attach"* \
+  # --- 134. the PAIR MODE banner advertises `cerebro watch` + `cerebro steer` ---
+  if [[ "$perr" == *"PAIR MODE"* && "$perr" == *"cerebro watch"* \
         && "$perr" == *"cerebro steer "* && "$perr" == *".steer.fifo"* \
         && "$perr" != *"claude.ai/code"* ]]; then
-    printf 'PASS  134  pair banner advertises the `cerebro steer` attach\n'; pass=$((pass + 1))
+    printf 'PASS  134  pair banner advertises watch + steer\n'; pass=$((pass + 1))
   else
     printf 'FAIL  134  pair banner wrong [perr=%s]\n' "$perr"; fail=$((fail + 1))
     failures+=("134 pair banner :: perr=$perr")
@@ -1503,15 +1499,45 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("137 apply-review --pair :: rc=$arc")
   fi
 
-  # --- 138. the interactive attach streamed the child as a readable feed ---
-  # aout is what `cerebro steer` (the attach from 131-133b) printed: the status
-  # banner plus the child's rendered output (assistant text + turn boundaries).
-  if [[ "$aout" == *"attached"* && "$aout" == *"child working"* \
-        && "$aout" == *"turn complete"* ]]; then
-    printf 'PASS  138  cerebro steer attach streams the child feed\n'; pass=$((pass + 1))
+  # --- 138. cerebro watch: the pump auto-detects a live agent and feeds the
+  # narrator its activity. `cerebro watch` itself requires a real terminal, so we
+  # drive its PY_WATCH_PUMP/PY_WATCH_RENDER directly (sourced in a subshell) with
+  # a stub narrator that echoes back whatever activity it is fed. Stand up a fake
+  # live paired child (a stream-json log + a steer pipe held open by a reader)
+  # under CEREBRO_HOME and assert its actions reach the narrator and get printed.
+  WSRC="$WORKDIR/cerebro-src.sh"; grep -v '^main "\$@"$' "$CEREBRO_BIN" > "$WSRC"
+  WCH="$CEREBRO_HOME/sessions/watcher-test/children"; mkdir -p "$WCH"
+  wfifo="$WCH/execute-demo.steer.fifo"; wlog="$WCH/execute-demo.jsonl"
+  mkfifo "$wfifo"
+  python3 -c 'import os,sys,time; os.open(sys.argv[1], os.O_RDONLY|os.O_NONBLOCK); time.sleep(3)' "$wfifo" &
+  WHOLDER=$!; disown "$WHOLDER" 2>/dev/null || true
+  {
+    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Adding the cache layer"}]}}'
+    printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/cache.ts"}}]}}'
+    printf '%s\n' '{"type":"result","subtype":"success"}'
+  } > "$wlog"
+  WSTUB="$WORKDIR/wstub.py"
+  cat > "$WSTUB" <<'PY'
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: ev = json.loads(line)
+    except Exception: continue
+    c = ev.get("message", {}).get("content", "")
+    print(json.dumps({"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":c}]}}), flush=True)
+PY
+  watchout="$( ( set +e; source "$WSRC"
+      sleep 2 | python3 -c "$PY_WATCH_PUMP" "$CEREBRO_HOME" 2>/dev/null \
+        | python3 "$WSTUB" \
+        | python3 -c "$PY_WATCH_RENDER" ) )"
+  kill "$WHOLDER" 2>/dev/null; rm -f "$wfifo"
+  if [[ "$watchout" == *"execute-demo"* && "$watchout" == *"Adding the cache layer"* \
+        && "$watchout" == *"Edit: src/cache.ts"* ]]; then
+    printf 'PASS  138  cerebro watch pump auto-detects + narrates a live agent\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  138  attach feed wrong [out=%s]\n' "$aout"; fail=$((fail + 1))
-    failures+=("138 attach feed :: out=$aout")
+    printf 'FAIL  138  watch pump wrong [out=%s]\n' "$watchout"; fail=$((fail + 1))
+    failures+=("138 watch pump :: out=$watchout")
   fi
 else
   for t in 131 132 133 133b 134 135 136 137 138; do
