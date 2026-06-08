@@ -43,6 +43,9 @@
 #   CEREBRO_TIMEOUT       seconds for child agent calls; 0/empty/none/
 #                         unlimited = no cap (default: 0, no cap)
 #   CEREBRO_CODEX_CMD     codex executable (default: codex)
+#   CEREBRO_CHILD_SESSION_TTL
+#                         seconds a stored child session id stays resumable
+#                         before it is treated as stale (default: 86400, 24h)
 #   CEREBRO_DEBUG         if 1, verbose logs and leave temp files
 
 set -uo pipefail
@@ -256,7 +259,7 @@ Requirements: claude, codex, jq, python3. Child claudes additionally
 need git and gh on PATH for execute / apply-review / doc-write.
 
 Env: CEREBRO_HOME, CEREBRO_MODEL, CEREBRO_REVIEW_MODEL, CEREBRO_TIMEOUT,
-CEREBRO_CODEX_CMD, CEREBRO_DEBUG.
+CEREBRO_CODEX_CMD, CEREBRO_CHILD_SESSION_TTL, CEREBRO_DEBUG.
 EOF
 }
 
@@ -580,7 +583,15 @@ behalf, by calling them through your Bash tool (which is restricted to
    requirements>"`. Each time the user adds, removes, or changes a
    requirement, call `spec set` again: the newest text REPLACES the
    current spec, and cerebro first archives the prior version to history,
-   so nothing is ever lost. The current spec lives at
+   so nothing is ever lost. Refining the CURRENT task -- adding,
+   removing, or changing its requirements -- is always expected. But do
+   NOT replace the spec with a DIFFERENT task's requirements while the
+   current task is still in progress (its changes/PRs not yet closed).
+   Switch the spec to a new task ONLY when the current task is COMPLETELY
+   implemented, or when the user EXPLICITLY asks to switch. If a new task
+   arrives before the first is done, KEEP the current spec and hold the
+   new task separately (a short parked note) until the first closes.
+   The current spec lives at
    `sessions/<id>/spec.md` and the full history at
    `sessions/<id>/spec-history.jsonl`; both are plain files you can Read
    directly, so they SURVIVE context compression. When your context has
@@ -1280,17 +1291,76 @@ touch_metadata() {
     > "$tmp" 2>/dev/null && mv "$tmp" "$sess_dir/metadata.json" || rm -f "$tmp"
 }
 
+# ----- child agent session store -------------------------------------------
+# A small per-session JSON map of provider conversation ids so repeated
+# execute/review calls on the same line of work resume the same underlying
+# provider conversation. Keyed by child_key (repo+role+branch). The file is
+# created lazily on first child_session_set and lives alongside spec.md /
+# metadata.json, so it survives context compaction.
+
+child_sessions_file() { printf '%s\n' "$CEREBRO_SESSION_DIR/child-sessions.json"; }
+
+# child_key <repo> <role> <branch> -- stable short hash identifying one line
+# of work. role is execute|review so an execute conversation and a review
+# conversation on the same branch stay distinct.
+child_key() {
+  local repo="$1" role="$2" branch="${3:-default}"
+  printf '%s\0%s\0%s' "$repo" "$role" "$branch" | shasum | cut -d' ' -f1 | cut -c1-16
+}
+
+# child_session_get <key> -- echo the stored provider id for <key>, or
+# nothing when the file or entry is absent.
+child_session_get() {
+  local f; f="$(child_sessions_file)"
+  [[ -f "$f" ]] || return 0
+  jq -r --arg k "$1" '.[$k].id // empty' "$f" 2>/dev/null
+}
+
+# child_session_fresh <key> -- succeed when <key> has a stored entry whose
+# updated_at is within CEREBRO_CHILD_SESSION_TTL seconds (default 24h). A
+# missing/unparseable timestamp or an over-TTL entry is treated as stale.
+child_session_fresh() {
+  local f ts; f="$(child_sessions_file)"
+  [[ -f "$f" ]] || return 1
+  ts="$(jq -r --arg k "$1" '.[$k].updated_at // empty' "$f" 2>/dev/null)"
+  [[ -n "$ts" ]] || return 1
+  python3 - "$ts" "${CEREBRO_CHILD_SESSION_TTL:-86400}" <<'PY'
+import sys, calendar, time
+try:
+    t = calendar.timegm(time.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ"))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if (time.time() - t) <= int(sys.argv[2]) else 1)
+PY
+}
+
+# child_session_set <key> <provider> <id> -- upsert {id, provider,
+# updated_at} for <key>, creating the file on first use. Writes via a temp
+# file + mv like touch_metadata; a no-op when <id> is empty.
+child_session_set() {
+  local key="$1" provider="$2" id="$3" f tmp
+  [[ -n "$id" ]] || return 0
+  f="$(child_sessions_file)"
+  [[ -f "$f" ]] || printf '{}\n' > "$f"
+  tmp="$(mktemp)" || return 0
+  jq --arg k "$key" --arg p "$provider" --arg id "$id" --arg ts "$(ts_iso)" \
+     '.[$k] = {id:$id, provider:$p, updated_at:$ts}' "$f" \
+    > "$tmp" 2>/dev/null && mv "$tmp" "$f" || rm -f "$tmp"
+}
+
 # ----- inline python helpers -----------------------------------------------
 
 # Stream-json parser shared by plan / execute / apply-review / doc-write.
 # Reads claude stream-json on stdin, emits a one-line tool-call summary on
 # stderr per tool use, captures the final `result` event's text to the
-# given file path (if non-empty), and exits non-zero if claude reported
-# anything other than a successful result.
+# given file path (if non-empty), captures the child's session_id to the
+# optional second path (if non-empty), and exits non-zero if claude
+# reported anything other than a successful result.
 PY_PARSE_STREAM='
 import json, sys, os
 
 result_path = sys.argv[1] if len(sys.argv) > 1 else ""
+id_path = sys.argv[2] if len(sys.argv) > 2 else ""
 result_text = None
 result_subtype = None
 saw_any_event = False
@@ -1305,6 +1375,14 @@ for line in sys.stdin:
         continue
     saw_any_event = True
     t = ev.get("type")
+    if t == "system" and ev.get("subtype") == "init":
+        sid = ev.get("session_id")
+        if sid and id_path:
+            try:
+                with open(id_path, "w") as f:
+                    f.write(sid)
+            except OSError:
+                pass
     if t == "assistant":
         for item in ev.get("message", {}).get("content", []) or []:
             if item.get("type") == "tool_use":
@@ -1654,7 +1732,22 @@ attempt to authenticate. Stop after the PR is open.'
   else
     say "cerebro: executing inline prompt in $repo${base_branch:+ (base=$base_branch)}${new_branch:+ (branch=$new_branch)}"
   fi
-  log_event "execute_started" "$source_desc repo=$repo base=${base_branch:-default} branch=${new_branch:-auto}"
+
+  # Child-session continuity: resume the same provider conversation for
+  # repeated executes on the same line of work. We only key when the branch
+  # identity is deterministic (--branch); without it the child picks its own
+  # branch name, so each run is non-resumable. A stale (over-TTL) stored id
+  # is ignored here and falls back to a fresh run.
+  local ckey="" prior=""
+  if [[ -n "$new_branch" ]]; then
+    ckey="$(child_key "$repo" execute "$new_branch")"
+    if prior="$(child_session_get "$ckey")" && [[ -n "$prior" ]] && child_session_fresh "$ckey"; then
+      :
+    else
+      prior=""
+    fi
+  fi
+  log_event "execute_started" "$source_desc repo=$repo base=${base_branch:-default} branch=${new_branch:-auto} resume=${prior:-none}"
 
   local opts=(-p --permission-mode bypassPermissions
               --allowedTools "Read Edit Write Bash Grep Glob WebSearch WebFetch mcp__playwright__*"
@@ -1675,28 +1768,58 @@ attempt to authenticate. Stop after the PR is open.'
     claude_template="$(cat "$CEREBRO_HOME/templates/CLAUDE.md")"
   fi
 
-  local rc
-  ( cd "$repo" && \
-    { printf 'Execute the following plan in this repository. Fetch the base branch first, branch from the freshly-fetched base, implement, commit, push, and open a PR via gh.\n\n'
-      printf 'Before implementing the plan, ensure the repo has AGENTS.md and CLAUDE.md at the root:\n'
-      printf '  * If AGENTS.md is missing, create it from <bootstrap-agents-md> below as a SEPARATE first commit (e.g. "chore: add AGENTS.md") before doing the plan work.\n'
-      printf '  * If CLAUDE.md is missing, create it from <bootstrap-claude-md> in the same first commit.\n'
-      printf '  * If either file already exists, do NOT modify it.\n'
-      printf 'Then read AGENTS.md (existing or just-written) and follow its branch/commit rules for the rest of this run.\n\n'
-      printf '<bootstrap-agents-md>\n%s\n</bootstrap-agents-md>\n\n' "$agents_template"
-      printf '<bootstrap-claude-md>\n%s\n</bootstrap-claude-md>\n\n' "$claude_template"
-      [[ -n "$branch_instr" ]] && printf '%s\n\n' "$branch_instr"
-      printf '<plan>\n%s\n</plan>\n' "$plan_body"
-    } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+  local child_prompt
+  child_prompt="$(
+    printf 'Execute the following plan in this repository. Fetch the base branch first, branch from the freshly-fetched base, implement, commit, push, and open a PR via gh.\n\n'
+    printf 'Before implementing the plan, ensure the repo has AGENTS.md and CLAUDE.md at the root:\n'
+    printf '  * If AGENTS.md is missing, create it from <bootstrap-agents-md> below as a SEPARATE first commit (e.g. "chore: add AGENTS.md") before doing the plan work.\n'
+    printf '  * If CLAUDE.md is missing, create it from <bootstrap-claude-md> in the same first commit.\n'
+    printf '  * If either file already exists, do NOT modify it.\n'
+    printf 'Then read AGENTS.md (existing or just-written) and follow its branch/commit rules for the rest of this run.\n\n'
+    printf '<bootstrap-agents-md>\n%s\n</bootstrap-agents-md>\n\n' "$agents_template"
+    printf '<bootstrap-claude-md>\n%s\n</bootstrap-claude-md>\n\n' "$claude_template"
+    [[ -n "$branch_instr" ]] && printf '%s\n\n' "$branch_instr"
+    printf '<plan>\n%s\n</plan>\n' "$plan_body"
+  )"
+
+  local rc id_capture
+  id_capture="$(mktemp)"
+  local run_opts=("${opts[@]}")
+  [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
+
+  ( cd "$repo" && printf '%s' "$child_prompt" \
+      | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+        "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>/dev/null \
       | tee "$child_log" \
-      | python3 -c "$PY_PARSE_STREAM" "" )
+      | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
   rc=$?
 
+  # Stale fallback: a resume can fail because the provider GC'd or rejected
+  # the stored conversation. Retry once fresh (no --resume) rather than
+  # dying; only a fresh-run failure is fatal.
+  if (( rc != 0 )) && [[ -n "$prior" ]]; then
+    log_event "execute_resume_failed" "rc=$rc resume=$prior; retrying fresh"
+    warn "execute: resume of $prior failed (rc=$rc); retrying without resume"
+    : > "$id_capture"
+    ( cd "$repo" && printf '%s' "$child_prompt" \
+        | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+          "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+        | tee "$child_log" \
+        | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
+    rc=$?
+  fi
+
   if (( rc != 0 )); then
+    rm -f "$id_capture"
     log_event "execute_failed" "rc=$rc log=$child_log"
     die "execute: child claude failed (rc=$rc); see $child_log"
   fi
+
+  # Record (or refresh) the child's provider session id for the next call.
+  if [[ -n "$ckey" && -s "$id_capture" ]]; then
+    child_session_set "$ckey" claude "$(cat "$id_capture")"
+  fi
+  rm -f "$id_capture"
   log_event "execute_finished" "$child_log"
   echo "$child_log"
 }
@@ -1744,6 +1867,21 @@ cmd_review() {
     || die "review: not a git worktree: $repo"
   local state_dir="$CEREBRO_SESSION_DIR/review-state"
   local state_file="$state_dir/$repo_key.json"
+
+  # Child-session continuity: resume the same codex conversation for repeated
+  # reviews on the same branch. Keyed by repo+role+branch (role=review keeps
+  # it distinct from the execute conversation). A stale (over-TTL) stored id
+  # is ignored and falls back to a fresh run.
+  local ckey="" prior="" review_branch
+  review_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  if [[ -n "$review_branch" ]]; then
+    ckey="$(child_key "$canonical_repo" review "$review_branch")"
+    if prior="$(child_session_get "$ckey")" && [[ -n "$prior" ]] && child_session_fresh "$ckey"; then
+      :
+    else
+      prior=""
+    fi
+  fi
 
   local base_ref base_description
   local using_review_state="false"
@@ -1815,7 +1953,7 @@ cmd_review() {
   local err_path="${out_path%.md}.err"
 
   say "cerebro: reviewing $repo against $base_description (merge-base $merge_base)"
-  log_event "review_started" "repo=$repo base=$base_ref merge_base=$merge_base"
+  log_event "review_started" "repo=$repo base=$base_ref merge_base=$merge_base resume=${prior:-none}"
 
   # Short, focused prompt borrowed from aminmarashi/dev-tools `review`. We give
   # codex the merge base directly so it runs the right `git diff` itself
@@ -1837,11 +1975,30 @@ $criteria_block
   local codex_opts=(exec --sandbox read-only --skip-git-repo-check --cd "$repo")
   [[ -n "$CEREBRO_REVIEW_MODEL" ]] && codex_opts+=(--model "$CEREBRO_REVIEW_MODEL")
 
-  local rc
+  # codex options precede the optional `resume <id>` subcommand; the prompt is
+  # always the trailing positional.
+  local rc run_args
+  if [[ -n "$prior" ]]; then
+    run_args=("${codex_opts[@]}" resume "$prior" "$codex_prompt")
+  else
+    run_args=("${codex_opts[@]}" "$codex_prompt")
+  fi
   env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-    "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${codex_opts[@]}" "$codex_prompt" \
+    "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${run_args[@]}" \
     > "$out_path" 2> "$err_path"
   rc=$?
+
+  # Stale fallback: a resume can fail because codex GC'd or rejected the
+  # stored rollout. Retry once fresh rather than dying; only a fresh-run
+  # failure surfaces below.
+  if [[ -n "$prior" ]] && { (( rc != 0 )) || [[ ! -s "$out_path" ]]; }; then
+    log_event "review_resume_failed" "rc=$rc resume=$prior; retrying fresh"
+    warn "review: resume of $prior failed (rc=$rc); retrying without resume"
+    env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+      "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${codex_opts[@]}" "$codex_prompt" \
+      > "$out_path" 2> "$err_path"
+    rc=$?
+  fi
 
   # On any failure -- non-zero exit OR empty output -- preserve the err log
   # but do NOT echo a findings path. The orchestrator must not feed a failed
@@ -1852,6 +2009,15 @@ $criteria_block
     [[ -s "$err_path" ]] && warn "see error log: $err_path"
     [[ -s "$out_path" ]] && warn "partial output preserved at: $out_path"
     die "review: codex run failed; not echoing a findings path"
+  fi
+
+  # Record (or refresh) the codex session id for the next review on this
+  # branch. codex prints it on stderr as "session id: <uuid>"; capture before
+  # the err log is tidied below.
+  if [[ -n "$ckey" && -s "$err_path" ]]; then
+    local cx_id
+    cx_id="$(sed -n 's/.*session id: *\([0-9a-fA-F-]\{36\}\).*/\1/p' "$err_path" | head -1)"
+    [[ -n "$cx_id" ]] && child_session_set "$ckey" codex "$cx_id"
   fi
 
   # Codex's exit was zero and out_path has content; treat that as findings.
@@ -2315,6 +2481,19 @@ spec_set() {
   local sf hf ts
   sf="$(spec_file)"; hf="$(spec_history_file)"
   ts="$(ts_iso)"
+  # Defense-in-depth for rule 9: when REPLACING an existing non-empty spec,
+  # surface the current spec head plus a reminder that switching to a
+  # DIFFERENT task mid-flight is not allowed. Advisory only -- it never
+  # blocks and never alters the record/archive flow below. First-ever set
+  # (empty/absent spec) and same-task refinement see only this note.
+  if [[ -s "$sf" ]]; then
+    {
+      printf 'cerebro: WARNING -- replacing the current session spec. If this is a DIFFERENT task, do not switch unless the current task is complete or the user asked; refining the same task is fine.\n'
+      printf 'cerebro: current spec (head):\n'
+      head -c 200 "$sf" | sed 's/^/    /'
+      printf '\n'
+    } >&2
+  fi
   jq -nc --arg ts "$ts" --arg text "$text" '{ts:$ts, text:$text}' \
     >> "$hf" || die "spec set: cannot write history ($hf)"
   printf '%s\n' "$text" > "$sf" || die "spec set: cannot write spec ($sf)"

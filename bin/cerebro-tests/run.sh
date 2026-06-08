@@ -1071,6 +1071,189 @@ run_case 121b "spec unknown action errors" 1 -- "$CEREBRO_BIN" spec frobnicate
 STDOUT_CONTAINS="session spec: present" \
 run_case 122 "status shows session spec" 0 -- "$CEREBRO_BIN" status
 
+# ========================================================================
+# 123-124. spec set guard (rule 9 defense-in-depth). Replacing an existing
+# non-empty spec prints the current-spec head plus a warning to stderr, but
+# never blocks and never alters the record/archive flow. First-ever set is
+# silent. Use a fresh session dir so spec state is controlled.
+# ========================================================================
+GSESS="guard-session"
+GDIR="$CEREBRO_HOME/sessions/$GSESS"
+mkdir -p "$GDIR"
+
+# --- 123. first-ever spec set emits no replace warning ---
+env CEREBRO_SESSION_ID="$GSESS" "$CEREBRO_BIN" spec set "Task A: first task" \
+  >/dev/null 2>"$WORKDIR/stderr"
+gerr="$(cat "$WORKDIR/stderr")"
+if [[ "$gerr" != *"replacing the current session spec"* ]]; then
+  printf 'PASS  123  first spec set emits no replace warning\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  123  first spec set warned unexpectedly\n'; fail=$((fail + 1))
+  failures+=("123 first set warned :: $gerr")
+fi
+
+# --- 124. replacing an existing spec warns (with current head) on stderr ---
+env CEREBRO_SESSION_ID="$GSESS" "$CEREBRO_BIN" spec set "Task B: a different task" \
+  >/dev/null 2>"$WORKDIR/stderr"
+grc=$?
+gerr="$(cat "$WORKDIR/stderr")"
+if [[ $grc -eq 0 && "$gerr" == *"replacing the current session spec"* \
+      && "$gerr" == *"Task A: first task"* ]]; then
+  printf 'PASS  124  spec replace warns with current head\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  124  spec replace warning missing [rc=%d err=%s]\n' "$grc" "$gerr"; fail=$((fail + 1))
+  failures+=("124 replace warn :: rc=$grc")
+fi
+
+# --- 124b. the warning is advisory: record + archive still happened ---
+if grep -q "Task B: a different task" "$GDIR/spec.md" \
+   && [[ "$(grep -c '' "$GDIR/spec-history.jsonl" 2>/dev/null || printf 0)" -eq 2 ]]; then
+  printf 'PASS  124b  replace still recorded spec + history\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  124b  replace did not record cleanly\n'; fail=$((fail + 1))
+  failures+=("124b replace record")
+fi
+
+# ========================================================================
+# 125-128. Child agent session persistence. A stub claude/codex emits its
+# session id; cerebro stores it under child-sessions.json keyed by
+# repo+role+branch and resumes it on the next call for the same line of work.
+# ========================================================================
+if (( STUB_OK )); then
+  # claude stub variant: emit an init event carrying a session_id, then a
+  # success result. Honours nothing else (ignores --resume).
+  ID_STUB_DIR="$WORKDIR/claude-id-stub"
+  mkdir -p "$ID_STUB_DIR"
+  cat > "$ID_STUB_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"STUBSESSION-1111"}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exit 0
+EOF
+  chmod +x "$ID_STUB_DIR/claude"
+  ID_STUB_PATH="$ID_STUB_DIR:$PATH"
+
+  ESESS="exec-session"; EDIR="$CEREBRO_HOME/sessions/$ESESS"
+  mkdir -p "$EDIR/children"; : > "$EDIR/transcript.jsonl"
+
+  # --- 125. execute with --branch captures the child session id ---
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$ESESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "do the thing" --branch feat/test \
+    >/dev/null 2>&1
+  exec_id="$(jq -r '.[].id' "$EDIR/child-sessions.json" 2>/dev/null)"
+  if [[ "$exec_id" == "STUBSESSION-1111" ]]; then
+    printf 'PASS  125  execute --branch records child session id\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  125  execute did not record child id [got=%s]\n' "$exec_id"; fail=$((fail + 1))
+    failures+=("125 execute capture :: got=$exec_id")
+  fi
+
+  # --- 125b. the first execute logged resume=none (no prior session) ---
+  if grep -q 'resume=none' "$EDIR/transcript.jsonl"; then
+    printf 'PASS  125b  first execute logged resume=none\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  125b  first execute did not log resume=none\n'; fail=$((fail + 1))
+    failures+=("125b resume=none missing")
+  fi
+
+  # --- 126. a second execute on the same repo+branch resumes the stored id ---
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$ESESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "do more" --branch feat/test \
+    >/dev/null 2>&1
+  if grep -q 'resume=STUBSESSION-1111' "$EDIR/transcript.jsonl"; then
+    printf 'PASS  126  second execute resumes the stored session\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  126  second execute did not resume stored session\n'; fail=$((fail + 1))
+    failures+=("126 resume not logged")
+  fi
+  # --- 129. stale fallback: a stored id the provider rejects retries fresh
+  # (without --resume) and overwrites the store with the new id. ---
+  REJECT_STUB_DIR="$WORKDIR/claude-reject-stub"
+  mkdir -p "$REJECT_STUB_DIR"
+  cat > "$REJECT_STUB_DIR/claude" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+for a in "$@"; do
+  if [[ "$a" == "--resume" ]]; then
+    printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true}'
+    exit 1
+  fi
+done
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"FRESH-2222"}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exit 0
+EOF
+  chmod +x "$REJECT_STUB_DIR/claude"
+  REJECT_STUB_PATH="$REJECT_STUB_DIR:$PATH"
+
+  FSESS="fallback-session"; FDIR="$CEREBRO_HOME/sessions/$FSESS"
+  mkdir -p "$FDIR/children"; : > "$FDIR/transcript.jsonl"
+  # Seed a bogus-but-fresh stored id for the execute key (repo+execute+branch)
+  # so it passes the TTL check and is actually offered for resume.
+  FKEY="$(printf '%s\0execute\0feat/test' "$REPO" | shasum | cut -d' ' -f1 | cut -c1-16)"
+  jq -n --arg k "$FKEY" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     '{($k): {id:"BOGUS-OLD", provider:"claude", updated_at:$ts}}' \
+     > "$FDIR/child-sessions.json"
+  env PATH="$REJECT_STUB_PATH" CEREBRO_SESSION_ID="$FSESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "go" --branch feat/test >/dev/null 2>&1
+  frc=$?
+  new_id="$(jq -r --arg k "$FKEY" '.[$k].id' "$FDIR/child-sessions.json" 2>/dev/null)"
+  if [[ $frc -eq 0 && "$new_id" == "FRESH-2222" ]] \
+     && grep -q '"what":"execute_resume_failed"' "$FDIR/transcript.jsonl"; then
+    printf 'PASS  129  rejected resume retries fresh and updates the store\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  129  stale fallback failed [rc=%d id=%s]\n' "$frc" "$new_id"; fail=$((fail + 1))
+    failures+=("129 stale fallback :: rc=$frc id=$new_id")
+  fi
+else
+  printf 'SKIP  125  execute child-session capture (claude stub unavailable)\n'
+  printf 'SKIP  125b execute resume=none log (claude stub unavailable)\n'
+  printf 'SKIP  126  execute child-session resume (claude stub unavailable)\n'
+  printf 'SKIP  129  execute stale fallback (claude stub unavailable)\n'
+fi
+
+# codex stub: print findings on stdout and a codex-style session header on
+# stderr, so review can capture and resume the codex conversation.
+CODEX_STUB_DIR="$WORKDIR/codex-stub"
+mkdir -p "$CODEX_STUB_DIR"
+cat > "$CODEX_STUB_DIR/codex" <<'EOF'
+#!/usr/bin/env bash
+printf 'no issues found\n'
+printf 'session id: 019ea5a7-e570-77d1-ac43-afd5da0f1caf\n' >&2
+exit 0
+EOF
+chmod +x "$CODEX_STUB_DIR/codex"
+if [[ -x "$CODEX_STUB_DIR/codex" ]]; then
+  CODEX_STUB_PATH="$CODEX_STUB_DIR:$PATH"
+  RSESS="review-session"; RDIR="$CEREBRO_HOME/sessions/$RSESS"
+  mkdir -p "$RDIR/children"; : > "$RDIR/transcript.jsonl"
+
+  # --- 127. review captures the codex session id under a review key ---
+  env PATH="$CODEX_STUB_PATH" CEREBRO_SESSION_ID="$RSESS" CEREBRO_CODEX_CMD=codex \
+    "$CEREBRO_BIN" review "$REPO" >/dev/null 2>&1
+  cx_id="$(jq -r '.[] | select(.provider=="codex") | .id' "$RDIR/child-sessions.json" 2>/dev/null)"
+  if [[ "$cx_id" == "019ea5a7-e570-77d1-ac43-afd5da0f1caf" ]]; then
+    printf 'PASS  127  review records codex session id\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  127  review did not record codex id [got=%s]\n' "$cx_id"; fail=$((fail + 1))
+    failures+=("127 review capture :: got=$cx_id")
+  fi
+
+  # --- 128. a second review resumes the stored codex session ---
+  env PATH="$CODEX_STUB_PATH" CEREBRO_SESSION_ID="$RSESS" CEREBRO_CODEX_CMD=codex \
+    "$CEREBRO_BIN" review "$REPO" >/dev/null 2>&1
+  if grep -q 'resume=019ea5a7-e570-77d1-ac43-afd5da0f1caf' "$RDIR/transcript.jsonl"; then
+    printf 'PASS  128  second review resumes the stored codex session\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  128  second review did not resume codex session\n'; fail=$((fail + 1))
+    failures+=("128 review resume not logged")
+  fi
+else
+  printf 'SKIP  127  review codex-session capture (codex stub unavailable)\n'
+  printf 'SKIP  128  review codex-session resume (codex stub unavailable)\n'
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'
