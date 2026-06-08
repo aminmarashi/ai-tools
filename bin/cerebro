@@ -722,14 +722,16 @@ behalf, by calling them through your Bash tool (which is restricted to
     Look over the shoulder of ANOTHER cerebro session's live `--pair`
     children. <session-id> names that orchestrator session (NOT a child);
     with none, the most recently active OTHER session that has live paired
-    children is chosen. It tails EVERY live paired child of that session at
-    once and returns ONE batch of new activity, then a STATUS footer:
+    children is chosen. It tails that session'\''s own transcript (the prompts
+    it received and the cerebro actions it took) AND every live paired child
+    at once and returns ONE batch of new activity, then a STATUS footer:
     `=== OBSERVE STATUS: active ===` (children still live -- call observe
     again) or `... done ===` (none left). A per-target cursor under your
     own session dir advances each call, so successive calls never repeat.
     Each call blocks up to a short window (CEREBRO_OBSERVE_WINDOW, default
     25s), returning early on a quiet gap. Read-only: it only reads the
-    children's logs and never disturbs them. Drive it in a loop and narrate
+    session's transcript and its children's logs and never disturbs them.
+    Drive it in a loop and narrate
     (see "# Observing another cerebro session"); steer a watched child with
     `cerebro steer <its-steer-pipe> "<message>"`.
 
@@ -3918,9 +3920,11 @@ cmd_steer() {
 # session's live `--pair` children (the <target-id> names the orchestrator
 # session, NOT a child). It resolves the target -- the named session, else the
 # most recently touched OTHER session that currently has live paired children --
-# then tails EVERY one of that session's live paired children concurrently
-# (children/*.steer.fifo whose pipe a child is still reading -> the .jsonl
-# beside it). It returns ONE batch of new activity and exits, so the caller can
+# then tails, concurrently, that session's OWN transcript (transcript.jsonl: the
+# prompts it received and the cerebro actions it took) ALONGSIDE every one of its
+# live paired children (children/*.steer.fifo whose pipe a child is still reading
+# -> the .jsonl beside it), so the observer sees the orchestrator AND its
+# children. It returns ONE batch of new activity and exits, so the caller can
 # narrate and call again. A per-target cursor under the observer's own session
 # dir makes successive calls advance: a child that is live when first seen is
 # caught up from the top; one already finished when first seen is skipped. Each
@@ -4003,6 +4007,9 @@ else:
     target = os.path.join(sessions_root, target_id)
 
 target_children = os.path.abspath(os.path.join(target, "children"))
+# The orchestrator session itself, tailed alongside its children so the
+# observer sees the whole picture: the conductor and the orchestra.
+session_log = os.path.abspath(os.path.join(target, "transcript.jsonl"))
 
 # --- cursor state, persisted per target under the observer session ------------
 try:
@@ -4020,6 +4027,10 @@ def label_of(log):
     base = os.path.basename(log)
     return base[:-len(".jsonl")] if base.endswith(".jsonl") else base
 
+def track_label(log):
+    return ("orchestrator session" if os.path.abspath(log) == session_log
+            else label_of(log))
+
 def under_target(log):
     return os.path.dirname(os.path.abspath(log)) == target_children
 
@@ -4028,6 +4039,20 @@ def preview(s, n):
     return s[:n] + ("..." if len(s) > n else "")
 
 def render(ev, out):
+    # The orchestrator session'\''s own transcript.jsonl speaks a different
+    # dialect than a child'\''s stream-json log: {kind:"user"} for prompts it
+    # received and {kind:"event"} for the cerebro actions it took.
+    kind = ev.get("kind")
+    if kind == "user":
+        txt = (ev.get("text") or "").strip()
+        if txt:
+            out.append("user: " + preview(txt, 2000))
+        return
+    if kind == "event":
+        what = ev.get("what") or "?"
+        detail = (ev.get("detail") or "").strip()
+        out.append(("%s: %s" % (what, preview(detail, 300))) if detail else what)
+        return
     t = ev.get("type")
     if t == "assistant":
         for item in ev.get("message", {}).get("content", []) or []:
@@ -4100,12 +4125,13 @@ while True:
     live = live_children(target)
     live_labels = set(label_of(l) for l in live)
     ever_live |= live_labels
-    # Every live child PLUS any child we already track (to flush the final
-    # lines of one that just finished), de-duplicated, order-stable.
-    cand = list(dict.fromkeys(live + [l for l in cursor if under_target(l)]))
+    # The session'\''s own transcript first, THEN every live child PLUS any
+    # child we already track (to flush the final lines of one that just
+    # finished), de-duplicated, order-stable.
+    cand = list(dict.fromkeys([session_log] + live + [l for l in cursor if under_target(l)]))
     for log in cand:
         for ln in drain(log):
-            acc.append((label_of(log), ln))
+            acc.append((track_label(log), ln))
             last_new = time.monotonic()
     for lab in sorted(ever_live - live_labels):
         if lab not in finished_noted:
@@ -4152,7 +4178,8 @@ if live_now:
 # Live monitor: look over the shoulder of ANOTHER cerebro session's paired
 # children. The optional <session-id> names that orchestrator session (NOT a
 # child); with none, the most recently active other session that has live
-# paired children is chosen. It tails EVERY live paired child of that session at
+# paired children is chosen. It tails that session's own transcript (an
+# "orchestrator session" track) AND every live paired child of that session at
 # once and returns ONE batch of new activity plus a STATUS footer
 # (active = call again, done = no live children left), then exits. The
 # orchestrator narrates the gist and the important decisions, then calls again
