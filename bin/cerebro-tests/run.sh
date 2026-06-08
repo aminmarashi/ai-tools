@@ -1331,43 +1331,45 @@ else
 fi
 
 # ========================================================================
-# 131-137. Pair-programming mode (--pair). A stub claude records its argv,
-# detects the pinned --session-id, prints a Remote Control attach URL on
-# stderr, writes a transcript carrying one SDK prompt + one tool_result turn +
-# one human steering message, and emits a success stream. We assert that --pair
-# adds --remote-control + --session-id, that the human steering is mined out
-# (tool_result and the SDK prompt excluded) and surfaced as a PAIR STEERING
-# block, that the live attach URL is captured and relayed as a clickable PAIR
-# direct link, and that the default (no --pair) path stays clean.
+# 131-137. Pair-programming mode (--pair). Remote Control cannot run headless,
+# so --pair drives the child through claude's stream-json INPUT instead: cerebro
+# feeds the task as the first message, then relays live `cerebro steer` messages
+# into the running session over a named pipe, and closes stdin (so the child
+# finishes) on `--done` or an idle window. A stub claude records its argv, then
+# -- in streaming mode -- emits an init + one `result` per input line it reads
+# (each input line is a turn), staying alive until stdin closes. The test runs
+# execute --pair while a background steerer waits for the pipe, injects one
+# steering message, then sends --done. We assert that --pair adds
+# --input-format stream-json + --session-id (and NEVER --remote-control), that
+# the live steering is captured to .steering.md and folded back as a PAIR
+# STEERING block, that the banner advertises `cerebro steer`, and that the
+# default (no --pair) path stays clean.
 # ========================================================================
-PAIR_CFG="$WORKDIR/claude-config"            # CLAUDE_CONFIG_DIR for the run
-PAIR_PROJ="$PAIR_CFG/projects/test"
 PAIR_ARGV_LOG="$WORKDIR/pair-argv.log"
 PAIR_STUB_DIR="$WORKDIR/claude-pair-stub"
-mkdir -p "$PAIR_STUB_DIR" "$PAIR_PROJ"
+mkdir -p "$PAIR_STUB_DIR"
 cat > "$PAIR_STUB_DIR/claude" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$PAIR_ARGV_LOG"
-cat >/dev/null
 sid=""; prev=""
 for a in "\$@"; do
   [[ "\$prev" == "--session-id" ]] && sid="\$a"
   prev="\$a"
 done
 [[ -n "\$sid" ]] || sid="STUB-NOPIN"
-# Real claude --remote-control prints a clickable attach URL at startup; mimic
-# it on stderr so cerebro can capture and relay it as the PAIR direct link.
-printf 'Remote Control: open https://claude.ai/code/\$sid to attach\n' >&2
-# Fabricate a transcript: SDK prompt, a tool_result turn (must be ignored),
-# and one human steering message.
-{
-  printf '%s\n' '{"type":"user","promptSource":"sdk","message":{"role":"user","content":"do the work"}}'
-  printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"on it"}]}}'
-  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ran tests"}]}}'
-  printf '%s\n' '{"type":"user","promptSource":"user","message":{"role":"user","content":"actually use a hashmap here"}}'
-} > "$PAIR_PROJ/\$sid.jsonl"
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "\$sid"
-printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+case "\$*" in
+  *"--input-format stream-json"*)
+    # Paired: one input line = one turn. Emit an assistant line + a result for
+    # each, staying alive until cerebro's pump closes stdin.
+    while IFS= read -r _line; do
+      printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"child working"}]}}'
+      printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+    done ;;
+  *)
+    cat >/dev/null
+    printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}' ;;
+esac
 exit 0
 EOF
 chmod +x "$PAIR_STUB_DIR/claude"
@@ -1377,24 +1379,55 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
   PSESS="pair-session"; PDIR="$CEREBRO_HOME/sessions/$PSESS"
   mkdir -p "$PDIR/children" "$PDIR/plans"; : > "$PDIR/transcript.jsonl"
 
-  # --- 131. execute --pair passes --remote-control and --session-id ---
+  # Background steerer: wait for the child's steering pipe AND its first result
+  # (proving the pump has the pipe open), then ATTACH interactively -- send one
+  # steering line on stdin and hold the attach (keeping the presence lock) until
+  # the steering lands in .steering.md, then detach (stdin EOF). The capture file
+  # gets the attach's rendered feed + status lines.
+  pair_attach() {
+    local out="$1" f="" clog sp i
+    for i in $(seq 1 400); do
+      f="$(ls "$PDIR"/children/*.steer.fifo 2>/dev/null | head -1)"
+      if [[ -n "$f" ]]; then
+        clog="${f%.steer.fifo}.jsonl"
+        grep -q '"type":"result"' "$clog" 2>/dev/null && break
+      fi
+      sleep 0.05
+    done
+    [[ -n "$f" ]] || return 0
+    sp="${f%.steer.fifo}.steering.md"
+    # Attach with NO pipe argument -- exercises auto-discovery of the live child.
+    {
+      printf 'actually use a hashmap here\n'
+      for i in $(seq 1 300); do grep -q 'hashmap' "$sp" 2>/dev/null && break; sleep 0.05; done
+    } | "$CEREBRO_BIN" steer >"$out" 2>&1
+  }
+
+  # --- 131-133b. execute --pair: live attach + steer round trip ---
   : > "$PAIR_ARGV_LOG"
-  pout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
-    CEREBRO_SESSION_ID="$PSESS" \
+  pair_attach "$WORKDIR/attach.out" &
+  STEERER_PID=$!
+  pout="$(env PATH="$PAIR_STUB_PATH" CEREBRO_SESSION_ID="$PSESS" CEREBRO_PAIR_IDLE=20 \
     "$CEREBRO_BIN" execute "$REPO" --prompt "do the work" --pair 2>"$WORKDIR/perr")"
   prc=$?
+  wait "$STEERER_PID" 2>/dev/null
   pargv="$(cat "$PAIR_ARGV_LOG")"
-  if [[ $prc -eq 0 && "$pargv" == *"--remote-control cerebro:execute:"* && "$pargv" == *"--session-id"* ]]; then
-    printf 'PASS  131  execute --pair adds --remote-control + --session-id\n'; pass=$((pass + 1))
+  perr="$(cat "$WORKDIR/perr")"
+  aout="$(cat "$WORKDIR/attach.out" 2>/dev/null)"
+
+  # --- 131. execute --pair uses stream-json input + --session-id, not RC ---
+  if [[ $prc -eq 0 && "$pargv" == *"--input-format stream-json"* \
+        && "$pargv" == *"--session-id"* && "$pargv" != *"--remote-control"* ]]; then
+    printf 'PASS  131  execute --pair adds stream-json input + --session-id (no RC)\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  131  execute --pair flags missing [rc=%d argv=%s]\n' "$prc" "$pargv"; fail=$((fail + 1))
+    printf 'FAIL  131  execute --pair flags wrong [rc=%d argv=%s]\n' "$prc" "$pargv"; fail=$((fail + 1))
     failures+=("131 execute --pair flags :: rc=$prc argv=$pargv")
   fi
 
-  # --- 132. execute --pair surfaces the human steering, excluding noise ---
+  # --- 132. execute --pair folds the live steering into a PAIR STEERING block ---
   if [[ "$pout" == *"=== PAIR STEERING"* && "$pout" == *"actually use a hashmap here"* \
-        && "$pout" != *"do the work"* && "$pout" != *"ran tests"* ]]; then
-    printf 'PASS  132  execute --pair reports steering (sdk/tool_result excluded)\n'; pass=$((pass + 1))
+        && "$pout" != *"do the work"* ]]; then
+    printf 'PASS  132  execute --pair folds back the live steering\n'; pass=$((pass + 1))
   else
     printf 'FAIL  132  execute --pair steering block wrong [out=%s]\n' "$pout"; fail=$((fail + 1))
     failures+=("132 execute --pair steering :: out=$pout")
@@ -1403,8 +1436,7 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
   # --- 133. the steering is persisted to a .steering.md beside the child log ---
   clog="$(printf '%s\n' "$pout" | tail -1)"
   spath="${clog%.jsonl}.steering.md"
-  if [[ -s "$spath" ]] && grep -q 'actually use a hashmap here' "$spath" \
-       && ! grep -q 'ran tests' "$spath"; then
+  if [[ -s "$spath" ]] && grep -q 'actually use a hashmap here' "$spath"; then
     printf 'PASS  133  steering persisted to .steering.md\n'; pass=$((pass + 1))
   else
     printf 'FAIL  133  steering file wrong [path=%s]\n' "$spath"; fail=$((fail + 1))
@@ -1419,63 +1451,70 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("133b pair_steering event missing")
   fi
 
-  # --- 137. execute --pair relays the live attach URL the CLI prints ---
-  # The stub emits a Remote Control URL on stderr; cerebro must capture (not
-  # discard) it and surface it on its own stderr as a clickable PAIR link.
-  perr="$(cat "$WORKDIR/perr")"
-  if [[ "$perr" == *"PAIR direct link"* && "$perr" == *"https://claude.ai/code/"* ]]; then
-    printf 'PASS  137  execute --pair relays the direct attach URL\n'; pass=$((pass + 1))
+  # --- 134. the PAIR MODE banner advertises the `cerebro steer` attach ---
+  if [[ "$perr" == *"PAIR MODE"* && "$perr" == *"attach"* \
+        && "$perr" == *"cerebro steer "* && "$perr" == *".steer.fifo"* \
+        && "$perr" != *"claude.ai/code"* ]]; then
+    printf 'PASS  134  pair banner advertises the `cerebro steer` attach\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  137  execute --pair did not relay the URL [perr=%s]\n' "$perr"; fail=$((fail + 1))
-    failures+=("137 execute --pair URL relay :: perr=$perr")
+    printf 'FAIL  134  pair banner wrong [perr=%s]\n' "$perr"; fail=$((fail + 1))
+    failures+=("134 pair banner :: perr=$perr")
   fi
 
-  # --- 134. plan --pair also pairs (read-only child) and reports steering ---
+  # --- 135. WITHOUT --pair, no stream-json input / session pinning / banner ---
   : > "$PAIR_ARGV_LOG"
-  qout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
-    CEREBRO_SESSION_ID="$PSESS" \
-    "$CEREBRO_BIN" plan "$REPO" "add a cache" --out pair-plan --pair 2>/dev/null)"
-  qrc=$?
-  qargv="$(cat "$PAIR_ARGV_LOG")"
-  if [[ $qrc -eq 0 && "$qargv" == *"--remote-control cerebro:plan:"* \
-        && "$qout" == *"actually use a hashmap here"* ]]; then
-    printf 'PASS  134  plan --pair pairs and reports steering\n'; pass=$((pass + 1))
-  else
-    printf 'FAIL  134  plan --pair wrong [rc=%d argv=%s out=%s]\n' "$qrc" "$qargv" "$qout"; fail=$((fail + 1))
-    failures+=("134 plan --pair :: rc=$qrc")
-  fi
-
-  # --- 135. WITHOUT --pair, no remote-control / session pinning is added ---
-  : > "$PAIR_ARGV_LOG"
-  env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
-    CEREBRO_SESSION_ID="$PSESS" \
+  env PATH="$PAIR_STUB_PATH" CEREBRO_SESSION_ID="$PSESS" \
     "$CEREBRO_BIN" execute "$REPO" --prompt "no pairing" >/dev/null 2>"$WORKDIR/nperr"
   npargv="$(cat "$PAIR_ARGV_LOG")"
   npperr="$(cat "$WORKDIR/nperr")"
-  if [[ "$npargv" != *"--remote-control"* && "$npargv" != *"--session-id"* \
-        && "$npperr" != *"PAIR direct link"* ]]; then
-    printf 'PASS  135  default execute stays clean (no --remote-control / link)\n'; pass=$((pass + 1))
+  if [[ "$npargv" != *"--input-format"* && "$npargv" != *"--session-id"* \
+        && "$npperr" != *"PAIR MODE"* ]]; then
+    printf 'PASS  135  default execute stays clean (no pair flags / banner)\n'; pass=$((pass + 1))
   else
     printf 'FAIL  135  default execute leaked pair flags [argv=%s]\n' "$npargv"; fail=$((fail + 1))
     failures+=("135 default execute pair leak :: argv=$npargv")
   fi
 
-  # --- 136. apply-review --prompt --pair pairs on the current branch ---
+  # --- 136. plan --pair pairs too; with no steerer it auto-finishes on idle ---
   : > "$PAIR_ARGV_LOG"
-  aout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
-    CEREBRO_SESSION_ID="$PSESS" \
-    "$CEREBRO_BIN" apply-review "$REPO" --prompt "tidy up" --pair 2>/dev/null)"
+  qout="$(env PATH="$PAIR_STUB_PATH" CEREBRO_SESSION_ID="$PSESS" CEREBRO_PAIR_IDLE=1 \
+    "$CEREBRO_BIN" plan "$REPO" "add a cache" --out pair-plan --pair 2>/dev/null)"
+  qrc=$?
+  qargv="$(cat "$PAIR_ARGV_LOG")"
+  if [[ $qrc -eq 0 && "$qargv" == *"--input-format stream-json"* \
+        && "$qargv" != *"--remote-control"* && -s "$PDIR/plans/pair-plan.md" ]]; then
+    printf 'PASS  136  plan --pair pairs and auto-finishes on idle\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  136  plan --pair wrong [rc=%d argv=%s]\n' "$qrc" "$qargv"; fail=$((fail + 1))
+    failures+=("136 plan --pair :: rc=$qrc")
+  fi
+
+  # --- 137. apply-review --prompt --pair pairs on the current branch ---
+  : > "$PAIR_ARGV_LOG"
+  env PATH="$PAIR_STUB_PATH" CEREBRO_SESSION_ID="$PSESS" CEREBRO_PAIR_IDLE=1 \
+    "$CEREBRO_BIN" apply-review "$REPO" --prompt "tidy up" --pair >/dev/null 2>&1
   arc=$?
   aargv="$(cat "$PAIR_ARGV_LOG")"
-  if [[ $arc -eq 0 && "$aargv" == *"--remote-control cerebro:apply-review:"* \
-        && "$aout" == *"actually use a hashmap here"* ]]; then
-    printf 'PASS  136  apply-review --pair pairs and reports steering\n'; pass=$((pass + 1))
+  if [[ $arc -eq 0 && "$aargv" == *"--input-format stream-json"* \
+        && "$aargv" != *"--remote-control"* ]]; then
+    printf 'PASS  137  apply-review --pair pairs via stream-json input\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  136  apply-review --pair wrong [rc=%d argv=%s]\n' "$arc" "$aargv"; fail=$((fail + 1))
-    failures+=("136 apply-review --pair :: rc=$arc")
+    printf 'FAIL  137  apply-review --pair wrong [rc=%d argv=%s]\n' "$arc" "$aargv"; fail=$((fail + 1))
+    failures+=("137 apply-review --pair :: rc=$arc")
+  fi
+
+  # --- 138. the interactive attach streamed the child as a readable feed ---
+  # aout is what `cerebro steer` (the attach from 131-133b) printed: the status
+  # banner plus the child's rendered output (assistant text + turn boundaries).
+  if [[ "$aout" == *"attached"* && "$aout" == *"child working"* \
+        && "$aout" == *"turn complete"* ]]; then
+    printf 'PASS  138  cerebro steer attach streams the child feed\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  138  attach feed wrong [out=%s]\n' "$aout"; fail=$((fail + 1))
+    failures+=("138 attach feed :: out=$aout")
   fi
 else
-  for t in 131 132 133 133b 137 134 135 136; do
+  for t in 131 132 133 133b 134 135 136 137 138; do
     printf 'SKIP  %s  pair-mode (claude stub unavailable)\n' "$t"
   done
 fi
