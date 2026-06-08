@@ -295,7 +295,10 @@ where you can watch it work in real time and type messages to redirect
 it mid-run — just like leaning over to a programmer's keyboard. The
 orchestrator runs paired children in the background and relays the
 attach details as soon as they appear, so you can connect while the work
-is still going. When the child finishes, cerebro mines its transcript
+is still going. There is no stable URL cerebro can build from a session
+id, so instead it captures the clickable attach URL the Remote Control
+child prints at startup and surfaces it as a `PAIR direct link` line —
+click it to jump straight into the session instead of hunting the list. When the child finishes, cerebro mines its transcript
 for any messages you injected (excluding its own prompt and tool
 output), writes them to a `.steering.md` beside the child log, and
 reports them back. The orchestrator then **folds your steering in

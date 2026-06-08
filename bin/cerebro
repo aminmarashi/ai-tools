@@ -1022,7 +1022,10 @@ How to run a paired child:
      it starts.
   2. RELAY THE ATTACH DETAILS IMMEDIATELY. As soon as that banner
      appears, tell the user the session name and that they can open
-     claude.ai/code (or the Claude app) to watch and steer. Do this
+     claude.ai/code (or the Claude app) to watch and steer. Shortly after,
+     cerebro prints a "PAIR direct link -- ... <url>" line on stderr (the
+     clickable attach URL the child emits at startup); relay that URL the
+     moment it appears so the user can click straight in. Do all of this
      before the child finishes -- that is the whole point.
   3. LET IT RUN. Narrate progress briefly as usual; the user is also
      watching directly.
@@ -1523,8 +1526,70 @@ pair_banner() {
     printf '  session name : %s\n' "$label"
     printf '  session id   : %s\n' "$sid"
     printf '  attach via   : https://claude.ai/code  (or the Claude mobile app) -- open this session, then type to steer.\n'
+    printf '  direct link  : a clickable attach URL prints here as soon as the child emits it (look for "PAIR direct link").\n'
     printf '  when it ends : cerebro reports your steering and folds it into the spec / next plans.\n'
   } >&2
+}
+
+# pair_grep_url <file...> -- echo the first claude.ai/claude.com session URL
+# found across the given files (the live deep-link the claude --remote-control
+# CLI prints at startup), or nothing. There is no stable URL template we can
+# synthesize from the session id, so we capture the real one the CLI emits.
+pair_grep_url() {
+  grep -haoE 'https://claude\.(ai|com)/[A-Za-z0-9/?=&._#%~-]+' "$@" 2>/dev/null \
+    | head -1
+}
+
+# pair_url_watch <err-file> <stdout-log> -- poll both of the child's streams
+# for the live attach URL and surface it on stderr (the banner channel) as a
+# clickable link the moment it appears, so the developer can click straight in
+# instead of hunting the session list. Runs in the background; the caller kills
+# it once the child exits. Stops early once a URL is found.
+# pair_url_emit <err-file> <stdout-log> <sentinel> -- if a URL is present and
+# not already reported (sentinel empty), surface it and record it. Returns 0
+# only when it newly emits one, so callers can stop polling.
+pair_url_emit() {
+  local errf="$1" outf="$2" sentinel="$3" url=""
+  [[ -s "$sentinel" ]] && return 0
+  url="$(pair_grep_url "$errf" "$outf")"
+  [[ -n "$url" ]] || return 1
+  printf 'cerebro: PAIR direct link -- click to attach and steer: %s\n' "$url" >&2
+  printf '%s' "$url" > "$sentinel"
+  return 0
+}
+
+pair_url_watch() {
+  local errf="$1" outf="$2" sentinel="$3" i=0
+  while (( i < 1200 )); do
+    pair_url_emit "$errf" "$outf" "$sentinel" && return 0
+    sleep 0.5; i=$((i + 1))
+  done
+}
+
+# pair_launch_begin -- in pair mode, start the URL watcher and point the stderr
+# redirect at the capture file so the caller can keep (not discard) the CLI's
+# startup output. Sets caller-scoped PAIR_WATCH_PID and PAIR_ERR_TO. MUST be
+# called as a plain statement (never via $(...)): backgrounding inside a command
+# substitution would orphan the watcher in a subshell and hang the caller on the
+# still-open stdout pipe.
+pair_launch_begin() {
+  local pair="$1" child_log="$2"
+  PAIR_WATCH_PID=""
+  PAIR_ERR_TO=/dev/null
+  (( pair )) || return 0
+  PAIR_ERR_TO="$PAIR_ERR"
+  : > "$PAIR_ERR.url"
+  pair_url_watch "$PAIR_ERR" "$child_log" "$PAIR_ERR.url" & PAIR_WATCH_PID=$!
+}
+
+# pair_launch_end -- stop the URL watcher, do a final synchronous sweep so a
+# fast-finishing child still gets its link surfaced, then drop the temp files.
+pair_launch_end() {
+  local pair="$1" child_log="$2"
+  (( pair )) || return 0
+  [[ -n "${PAIR_WATCH_PID:-}" ]] && { kill "$PAIR_WATCH_PID" 2>/dev/null; wait "$PAIR_WATCH_PID" 2>/dev/null; }
+  pair_url_emit "$PAIR_ERR" "$child_log" "$PAIR_ERR.url"
+  [[ -n "${PAIR_ERR:-}" ]] && rm -f "$PAIR_ERR" "$PAIR_ERR.url"
 }
 
 # pair_begin <role> <repo> <branch-or-empty> [resume-id] -- prepare a fresh or
@@ -1543,6 +1608,7 @@ pair_begin() {
     PAIR_SID="$(mint_uuid)"
     PAIR_OPTS=(--session-id "$PAIR_SID" --remote-control "$label")
   fi
+  PAIR_ERR="$(mktemp)"
   pair_banner "$role" "$PAIR_SID" "$label"
 }
 
@@ -1818,7 +1884,7 @@ outer code fence. Output ONLY the plan.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
-  local PAIR_SID="" PAIR_OPTS=()
+  local PAIR_SID="" PAIR_OPTS=() PAIR_ERR="" PAIR_WATCH_PID=""
   if (( pair )); then
     pair_begin plan "$repo" ""
     opts+=("${PAIR_OPTS[@]}")
@@ -1831,13 +1897,15 @@ outer code fence. Output ONLY the plan.'
 $desc
 </request>"
 
-  local rc
+  local rc PAIR_ERR_TO PAIR_WATCH_PID
+  pair_launch_begin "$pair" "$child_log"
   ( cd "$repo" && \
     printf '%s' "$prompt" | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-      "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+      "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>"$PAIR_ERR_TO" \
       | tee "$child_log" \
       | python3 -c "$PY_PARSE_STREAM" "$out_path" )
   rc=$?
+  pair_launch_end "$pair" "$child_log"
 
   if (( rc != 0 )); then
     log_event "plan_failed" "rc=$rc"
@@ -2011,20 +2079,22 @@ attempt to authenticate. Stop after the PR is open.'
     printf '<plan>\n%s\n</plan>\n' "$plan_body"
   )"
 
-  local rc id_capture
+  local rc id_capture PAIR_ERR_TO
   id_capture="$(mktemp)"
-  local PAIR_SID="" PAIR_OPTS=()
+  local PAIR_SID="" PAIR_OPTS=() PAIR_ERR="" PAIR_WATCH_PID=""
   (( pair )) && pair_begin execute "$repo" "$new_branch" "$prior"
   local run_opts=("${opts[@]}")
   [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
   (( pair )) && run_opts+=("${PAIR_OPTS[@]}")
 
+  pair_launch_begin "$pair" "$child_log"
   ( cd "$repo" && printf '%s' "$child_prompt" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-        "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>/dev/null \
+        "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>"$PAIR_ERR_TO" \
       | tee "$child_log" \
       | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
   rc=$?
+  pair_launch_end "$pair" "$child_log"
 
   # Stale fallback: a resume can be rejected up front because the provider
   # GC'd or no longer recognizes the stored conversation. Retry once fresh
@@ -2045,12 +2115,14 @@ attempt to authenticate. Stop after the PR is open.'
       pair_begin execute "$repo" "$new_branch" ""
       retry_opts+=("${PAIR_OPTS[@]}")
     fi
+    pair_launch_begin "$pair" "$child_log"
     ( cd "$repo" && printf '%s' "$child_prompt" \
         | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-          "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>/dev/null \
+          "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>"$PAIR_ERR_TO" \
         | tee "$child_log" \
         | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
     rc=$?
+    pair_launch_end "$pair" "$child_log"
   fi
 
   if (( rc != 0 )); then
@@ -2426,14 +2498,15 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
-  local PAIR_SID="" PAIR_OPTS=()
+  local PAIR_SID="" PAIR_OPTS=() PAIR_ERR="" PAIR_WATCH_PID=""
   if (( pair )); then
     local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
     pair_begin apply-review "$repo" "$_b"
     opts+=("${PAIR_OPTS[@]}")
   fi
 
-  local rc
+  local rc PAIR_ERR_TO PAIR_WATCH_PID
+  pair_launch_begin "$pair" "$child_log"
   ( cd "$repo" && \
     { if [[ -n "$findings" ]]; then
         printf 'Apply the following review findings on the current branch. Commit and push so the existing PR updates.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<findings>\n' "$notes"
@@ -2443,10 +2516,11 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
         printf 'Apply the following fix on the current branch. Commit and push so the existing PR updates.\n\n<task>\n%s\n</task>\n' "$prompt_text"
       fi
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>"$PAIR_ERR_TO" \
       | tee "$child_log" \
       | python3 -c "$PY_PARSE_STREAM" "" )
   rc=$?
+  pair_launch_end "$pair" "$child_log"
   if (( rc != 0 )); then
     log_event "apply_review_failed" "rc=$rc log=$child_log"
     die "apply-review: child claude failed (rc=$rc); see $child_log"
@@ -2525,21 +2599,23 @@ per AGENTS.md and push so the open PR updates.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
-  local PAIR_SID="" PAIR_OPTS=()
+  local PAIR_SID="" PAIR_OPTS=() PAIR_ERR="" PAIR_WATCH_PID=""
   if (( pair )); then
     local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
     pair_begin doc-write "$repo" "$_b"
     opts+=("${PAIR_OPTS[@]}")
   fi
 
-  local rc
+  local rc PAIR_ERR_TO PAIR_WATCH_PID
+  pair_launch_begin "$pair" "$child_log"
   ( cd "$repo" && \
     { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n%s\n</plan>\n' "$notes" "$plan_body"
     } | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>"$PAIR_ERR_TO" \
       | tee "$child_log" \
       | python3 -c "$PY_PARSE_STREAM" "" )
   rc=$?
+  pair_launch_end "$pair" "$child_log"
   if (( rc != 0 )); then
     log_event "doc_write_failed" "rc=$rc log=$child_log"
     die "doc-write: child claude failed (rc=$rc); see $child_log"

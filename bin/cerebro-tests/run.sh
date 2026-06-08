@@ -1331,13 +1331,14 @@ else
 fi
 
 # ========================================================================
-# 131-136. Pair-programming mode (--pair). A stub claude records its argv,
-# detects the pinned --session-id, writes a transcript carrying one SDK
-# prompt + one tool_result turn + one human steering message, and emits a
-# success stream. We assert that --pair adds --remote-control + --session-id,
-# that the human steering is mined out (tool_result and the SDK prompt
-# excluded) and surfaced as a PAIR STEERING block, and that the default
-# (no --pair) path stays clean.
+# 131-137. Pair-programming mode (--pair). A stub claude records its argv,
+# detects the pinned --session-id, prints a Remote Control attach URL on
+# stderr, writes a transcript carrying one SDK prompt + one tool_result turn +
+# one human steering message, and emits a success stream. We assert that --pair
+# adds --remote-control + --session-id, that the human steering is mined out
+# (tool_result and the SDK prompt excluded) and surfaced as a PAIR STEERING
+# block, that the live attach URL is captured and relayed as a clickable PAIR
+# direct link, and that the default (no --pair) path stays clean.
 # ========================================================================
 PAIR_CFG="$WORKDIR/claude-config"            # CLAUDE_CONFIG_DIR for the run
 PAIR_PROJ="$PAIR_CFG/projects/test"
@@ -1354,6 +1355,9 @@ for a in "\$@"; do
   prev="\$a"
 done
 [[ -n "\$sid" ]] || sid="STUB-NOPIN"
+# Real claude --remote-control prints a clickable attach URL at startup; mimic
+# it on stderr so cerebro can capture and relay it as the PAIR direct link.
+printf 'Remote Control: open https://claude.ai/code/\$sid to attach\n' >&2
 # Fabricate a transcript: SDK prompt, a tool_result turn (must be ignored),
 # and one human steering message.
 {
@@ -1415,6 +1419,17 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("133b pair_steering event missing")
   fi
 
+  # --- 137. execute --pair relays the live attach URL the CLI prints ---
+  # The stub emits a Remote Control URL on stderr; cerebro must capture (not
+  # discard) it and surface it on its own stderr as a clickable PAIR link.
+  perr="$(cat "$WORKDIR/perr")"
+  if [[ "$perr" == *"PAIR direct link"* && "$perr" == *"https://claude.ai/code/"* ]]; then
+    printf 'PASS  137  execute --pair relays the direct attach URL\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  137  execute --pair did not relay the URL [perr=%s]\n' "$perr"; fail=$((fail + 1))
+    failures+=("137 execute --pair URL relay :: perr=$perr")
+  fi
+
   # --- 134. plan --pair also pairs (read-only child) and reports steering ---
   : > "$PAIR_ARGV_LOG"
   qout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
@@ -1434,10 +1449,12 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
   : > "$PAIR_ARGV_LOG"
   env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
     CEREBRO_SESSION_ID="$PSESS" \
-    "$CEREBRO_BIN" execute "$REPO" --prompt "no pairing" >/dev/null 2>&1
+    "$CEREBRO_BIN" execute "$REPO" --prompt "no pairing" >/dev/null 2>"$WORKDIR/nperr"
   npargv="$(cat "$PAIR_ARGV_LOG")"
-  if [[ "$npargv" != *"--remote-control"* && "$npargv" != *"--session-id"* ]]; then
-    printf 'PASS  135  default execute stays clean (no --remote-control)\n'; pass=$((pass + 1))
+  npperr="$(cat "$WORKDIR/nperr")"
+  if [[ "$npargv" != *"--remote-control"* && "$npargv" != *"--session-id"* \
+        && "$npperr" != *"PAIR direct link"* ]]; then
+    printf 'PASS  135  default execute stays clean (no --remote-control / link)\n'; pass=$((pass + 1))
   else
     printf 'FAIL  135  default execute leaked pair flags [argv=%s]\n' "$npargv"; fail=$((fail + 1))
     failures+=("135 default execute pair leak :: argv=$npargv")
@@ -1458,7 +1475,7 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
     failures+=("136 apply-review --pair :: rc=$arc")
   fi
 else
-  for t in 131 132 133 133b 134 135 136; do
+  for t in 131 132 133 133b 137 134 135 136; do
     printf 'SKIP  %s  pair-mode (claude stub unavailable)\n' "$t"
   done
 fi
