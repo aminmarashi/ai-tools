@@ -217,7 +217,12 @@ orchestrator drafts a plan and tells you where it landed → you read
 the plan and say "go" → orchestrator executes it on a feature branch,
 pushes, opens a PR via `gh` → orchestrator runs codex against the
 diff, summarises the findings, and applies the ones that matter → loop
-until codex is quiet → optionally `doc-write` at the end.
+until codex is quiet → **verifies the change end to end by actually using
+the running app** (Playwright, or manual testing with you when it can't be
+driven automatically) → optionally `doc-write` at the end. Codex review is
+static, so it never counts as done on its own — unit tests passing is
+necessary but not sufficient; the work is done only once the behaviour has
+been observed working in the real app.
 
 **Session spec & mid-flight adaptation.** Before planning, the
 orchestrator records what you actually asked for — the specification and
@@ -256,17 +261,31 @@ replaces it. Localized, low-blast-radius changes skip the gate.
 **Large specifications (multi-plan suites).** When a change is too big
 for one coherent PR, the orchestrator breaks the spec into an *ordered
 suite* of smaller plans — one PR each — and drives them with the
-existing subcommands (no special command). It drafts an overview plus
-one detailed plan per step, each ending in an `## Acceptance criteria
-(checkpoint)` section, then summarises the suite and waits for a single
+existing subcommands (no special command). Every plan must obey a
+**workable-state invariant**: each is a self-contained, independently
+shippable increment that leaves the app building, green, and fully
+working on its own — merging the stack one PR at a time never leaves the
+app broken at any boundary. If the spec cannot be split that way (every
+ordering breaks the app mid-suite), the orchestrator does *not* emit
+breaking plans — it stops and reports, proposing one larger plan or a
+different cut instead. It drafts an overview plus one detailed plan per
+step, each ending in an `## Acceptance criteria (checkpoint)` section
+that includes both a still-builds/tests-pass check and an explicit
+end-to-end usage check, then summarises the suite and waits for a single
 "go". After approval it executes the plans in order as **stacked PRs**:
 the first branches off `main`, each later one off the previous plan's
 branch (`cerebro execute … --base <prev-branch> --branch <this-branch>`).
-Each PR is gated by a codex **checkpoint** — `cerebro review …
---criteria-file <plan>` feeds the plan's acceptance criteria into the
-review, and codex ends its findings with `ACCEPTANCE CRITERIA: MET` or
-`NOT MET`. The orchestrator advances to the next plan only when the
-criteria are met and no in-scope finding remains. On a failing
+Each PR is gated by a **checkpoint** — `cerebro review …
+--criteria-file <plan>` feeds the plan's acceptance criteria into a codex
+review, which ends its findings with `ACCEPTANCE CRITERIA: MET` or
+`NOT MET`. Because codex is static and never runs the app, the checkpoint
+also requires an **end-to-end** verification — the orchestrator drives the
+step's user flow against the running app with the Playwright tools (or has
+the user confirm it manually when that's impossible). The orchestrator
+advances to the next plan only when the criteria are met, no in-scope
+finding remains, *and* the step works end to end. If mid-execution it
+finds a step would leave the app broken, it stops and re-cuts the plans
+rather than pushing a broken state forward. On a failing
 checkpoint it makes up to three bounded corrective attempts — a scoped
 `apply-review` when the implementation is buggy, or a *replan* (rewrite
 the failing plan, and any downstream plans/criteria, via `cerebro plan

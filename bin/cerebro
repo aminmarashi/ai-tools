@@ -960,12 +960,46 @@ For a single feature:
      second apply-review until the first finishes. Then re-run
      `cerebro review <repo>` WITHOUT --base (it auto-diffs against
      the previously-reviewed commit) and loop until codex is quiet.
-  7. Optionally `cerebro doc-write <repo> <plan>` to update docs.
+  7. VERIFY END TO END before calling it done. Codex review is static and
+     does not run the app, so it is NOT enough. Exercise the running app
+     through the new behaviour per "# Definition of done: end-to-end
+     verification" -- drive it with the Playwright tools, or, when that is
+     not possible, ask the user to test and wait for their confirmation.
+     Only once the behaviour is observed working is the work done.
+  8. Optionally `cerebro doc-write <repo> <plan>` to update docs.
 
 When deciding between a bridge and a planning child: if the answer fits
 in your context after one or two commands, use a bridge. If you need
 cross-file synthesis, an analysis, or a written artefact, spawn
 `cerebro plan` instead.
+
+# Definition of done: end-to-end verification (non-negotiable)
+
+A plan is NEVER done until it has been verified END-TO-END by actually
+USING the running app the way a user would. Unit tests, type checks,
+linters, and codex's static review are necessary but they DO NOT count as
+done on their own -- they can all pass while the app is broken in a user's
+hands. "Done" requires one of exactly two things, every time:
+
+  * AUTOMATED end-to-end: drive the real, running app through the changed
+    behaviour with the Playwright browser tools (mcp__playwright__*) --
+    serve/launch the app, exercise the actual user flow the plan
+    delivers, and OBSERVE it work. For a non-UI change the equivalent is
+    invoking the real entrypoint / CLI / endpoint end to end against a
+    real run -- not a unit harness, not a mock.
+  * MANUAL end-to-end with the user: when an automated browser/e2e run is
+    genuinely not possible (no UI, credentials or hardware you lack, an
+    environment only they can reach), ask the USER to exercise the flow
+    and confirm it works, and WAIT for their confirmation.
+
+Until one of these has actually happened and shown the behaviour working,
+the plan is NOT done: do not call it complete, do not mark a checkpoint
+passed, and do not advance a suite to the next plan. If you cannot run the
+e2e verification yourself and the user has not confirmed it, say so
+plainly and ask them to test -- never silently downgrade "the tests pass"
+into "done". Prefer the automated Playwright path whenever the app has any
+runnable surface; fall back to manual-with-user only when it truly cannot
+be driven automatically.
 
 # Adapting plans mid-flight against the session spec
 
@@ -1141,6 +1175,42 @@ a plan's body. Those are YOUR orchestration bookkeeping, not the plan's
 content; the overview/sibling context you thread into a plan prompt is
 there to set boundaries, not to be echoed back into the plan.
 
+## The workable-state invariant (non-negotiable)
+
+Every plan in the suite MUST leave the application in a fully WORKABLE
+state on its own: it builds, its tests pass, and everything that worked
+before the plan still works after it. Each plan is a SELF-CONTAINED,
+independently shippable, independently mergeable increment -- never a
+half-finished fragment that only makes sense once a LATER plan lands.
+Merging the stack one PR at a time must NEVER, at any boundary, leave the
+app broken, non-building, or with a regressed or dead feature waiting on a
+future step.
+
+Concretely, no plan may: call something only a later plan defines; remove
+or rename something the running app still needs until the same plan also
+updates every user; or ship a schema / interface / API change without the
+code that keeps the app working against it. If a change cannot be split
+without breaking the app between the halves, the whole workable unit
+belongs in ONE plan -- do not cut it across plans.
+
+Decompose so this invariant holds at EVERY step boundary. If you cannot
+find an ordering where each plan is independently workable and shippable
+-- if every possible split necessarily breaks the app between steps --
+then do NOT emit breaking plans. STOP and report to the user: explain why
+the spec cannot be decomposed into self-contained workable steps and
+propose the alternative (one larger plan, or a different cut). Failing
+loudly is REQUIRED; shipping a suite whose middle leaves the app broken is
+never acceptable under any circumstance.
+
+This invariant also binds you DURING execution. If at any point you
+discover the current plan would leave the app broken at its boundary and
+cannot be made whole within its own scope, STOP -- do not advance the
+suite. Re-cut the plans so each is workable again (fold the breaking
+change together with whatever makes it whole, or re-order the steps),
+updating <slug>-00-overview and the affected downstream plans so the suite
+stays coherent. If no workable re-cut exists, escalate to the user rather
+than pushing a broken state forward.
+
 ## 1. Decompose (then WAIT for go)
 
 First record the whole specification as the session spec with
@@ -1171,7 +1241,14 @@ suite slug (e.g. the feature name) and:
      (checkpoint)' -- a checklist of concrete, independently VERIFIABLE
      conditions (commands to run, behaviours to observe, files/functions
      that must exist and work) that define DONE for this step and must
-     be confirmed before the next step starts." --out <slug>-NN-<short>`.
+     be confirmed before the next step starts. The criteria MUST include
+     (a) that the whole app still builds and its existing tests pass after
+     this step -- the step leaves the app in a fully workable state -- and
+     (b) an explicit END-TO-END usage check: the concrete user flow this
+     step delivers, exercised against the running app (a Playwright
+     browser flow, or the real entrypoint/CLI/endpoint run end to end),
+     not just unit tests. State the exact flow to drive and what to
+     observe." --out <slug>-NN-<short>`.
      Use zero-padded NN (01, 02, ...) so `cerebro plans` lists them in
      order.
 
@@ -1216,11 +1293,18 @@ criteria via codex:
 
 Because the PR's base is the previous plan's branch, the review's
 default base resolves to that branch, so codex sees only THIS plan's
-diff. READ the findings file. The checkpoint PASSES only when both hold:
-the final line says `ACCEPTANCE CRITERIA: MET`, AND there are no
+diff. READ the findings file. The checkpoint PASSES only when ALL THREE
+hold: the final line says `ACCEPTANCE CRITERIA: MET`; there are no
 in-scope, genuinely-important findings (apply the same scope/importance
-gates as the normal loop). Only then advance to the next plan, using
-this plan's branch as the next --base.
+gates as the normal loop); AND you have VERIFIED THE STEP END TO END per
+"# Definition of done: end-to-end verification" -- the app still builds
+and its tests pass, and you have driven the step's user flow against the
+running app with Playwright (or, when that is impossible, the user has
+manually confirmed it). Codex never runs the app, so its MET verdict
+alone is NOT a pass. Only when all three hold do you advance to the next
+plan, using this plan's branch as the next --base. If the e2e check shows
+the step does not actually work, treat it as a failed checkpoint (step 4)
+-- never advance on green static signals while the app is broken.
 
 ## 4. When a checkpoint fails: bounded revise-and-retry, then escalate
 
@@ -1999,7 +2083,17 @@ per AGENTS.md conventions. Implement the plan. If the plan includes an
 definition of done: implement so every criterion is fully and correctly
 met, and verify them yourself (run the relevant tests/commands and
 observe the behaviours they name) before you open the PR. Run the tests,
-type checks, or linters that the repo conventions imply. Commit per
+type checks, or linters that the repo conventions imply. Leave the app in
+a fully WORKABLE state: it must build and its existing tests must still
+pass -- your change is self-contained and does not depend on work that is
+not in this branch. Unit tests are NOT enough: verify the change END TO
+END by actually using the running app the way a user would -- drive the
+user flow your change delivers with the Playwright browser tools
+(mcp__playwright__*), or, for a non-UI change, invoke the real
+entrypoint/CLI/endpoint end to end against a real run -- and observe it
+work before you open the PR. If you genuinely cannot run the app
+end to end yourself, say so explicitly in the PR body so it can be tested
+manually; do not claim done on unit tests alone. Commit per
 AGENTS.md, push the branch, and open a pull request via the `gh` CLI.
 If `gh` is not authenticated, push the branch and tell the user; do not
 attempt to authenticate. Stop after the PR is open.'
