@@ -1305,7 +1305,7 @@ child_sessions_file() { printf '%s\n' "$CEREBRO_SESSION_DIR/child-sessions.json"
 # conversation on the same branch stay distinct.
 child_key() {
   local repo="$1" role="$2" branch="${3:-default}"
-  printf '%s\0%s\0%s' "$repo" "$role" "$branch" | shasum | cut -d' ' -f1 | cut -c1-16
+  printf '%s\0%s\0%s' "$repo" "$role" "$branch" | python3 -c 'import sys,hashlib; print(hashlib.sha1(sys.stdin.buffer.read()).hexdigest())' | cut -c1-16
 }
 
 # child_session_get <key> -- echo the stored provider id for <key>, or
