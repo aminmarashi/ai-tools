@@ -284,6 +284,27 @@ changes without an explicit ask. Edit
 `~/.cerebro/templates/AGENTS.md` to customize what new repos get;
 cerebro never overwrites an existing AGENTS.md in a user repo.
 
+**Pair programming mode.** Ask the orchestrator to *pair* (or *watch* /
+*steer* / *let me drive*) a child agent and it adds `--pair` to that
+`cerebro plan`, `execute`, `apply-review`, or `doc-write` (codex
+`review` has no live-attach, so pairing does not apply there). `--pair`
+launches the child with claude **Remote Control**: it appears in your
+[claude.ai/code](https://claude.ai/code) session list and the Claude
+mobile app under a recognizable name (`cerebro:<role>:<repo>[:<branch>]`),
+where you can watch it work in real time and type messages to redirect
+it mid-run — just like leaning over to a programmer's keyboard. The
+orchestrator runs paired children in the background and relays the
+attach details as soon as they appear, so you can connect while the work
+is still going. When the child finishes, cerebro mines its transcript
+for any messages you injected (excluding its own prompt and tool
+output), writes them to a `.steering.md` beside the child log, and
+reports them back. The orchestrator then **folds your steering in
+automatically** — updating the session spec (`cerebro spec set`) for any
+changed requirement and revising the affected and upcoming plans (or
+replanning) — and tells you what it changed. Your steering is treated as
+a direct instruction; only a steer that changes *what* the spec asks for
+in a genuinely ambiguous way is bounced back for confirmation.
+
 **Scope-filtered review forwarding.** When summarising a `cerebro
 review`, the orchestrator forwards only findings clearly within the
 plan's scope to `cerebro apply-review`. Out-of-scope improvements
@@ -350,6 +371,7 @@ Session state lives under `$CEREBRO_HOME` (default `~/.cerebro/`):
     spec-history.jsonl               # append-only history of every spec version
     plans/                           # plan markdown files
     children/                        # stream-json logs of every sub-agent
+                                     #   (+ <log>.steering.md from paired runs)
     review-state/                    # per-repo last-reviewed SHA + last findings path
 ```
 

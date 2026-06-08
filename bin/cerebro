@@ -254,6 +254,13 @@ Notes:
   * No chat/PR/repo-specific flags are ever passed to `claude` or
     `codex`. The orchestrator addresses repos by absolute path as the
     first positional arg to its sub-agent tools.
+  * Pair programming. Ask the orchestrator to "pair" (or watch / steer)
+    a plan, execute, apply-review, or doc-write child and it adds
+    `--pair`: the child launches with claude Remote Control so you can
+    attach from claude.ai/code or the Claude mobile app, watch it work,
+    and type steering. When the child ends, cerebro mines its transcript
+    for your steering and the orchestrator folds it into the session spec
+    and the upcoming plans, then tells you what changed.
 
 Requirements: claude, codex, jq, python3. Child claudes additionally
 need git and gh on PATH for execute / apply-review / doc-write.
@@ -602,17 +609,19 @@ behalf, by calling them through your Bash tool (which is restricted to
 
 # Available sub-commands
 
-  cerebro plan <repo-abs-path> "<description>" [--out <name>]
+  cerebro plan <repo-abs-path> "<description>" [--out <name>] [--pair]
     Spawn a read-only child claude with cwd=<repo>. It writes a Markdown
     plan to sessions/<this-session>/plans/<name>.md and the path is
     echoed on stdout. The child has Read/Grep/Glob only, so the repo is
     untouched. Use this when the user describes a change.
+    --pair enables pair-programming mode (see "# Pair programming mode"):
+    the user attaches to the live planning session and can steer it.
 
   cerebro plans
     List the plan files in the current session with timestamps.
 
   cerebro execute <repo-abs-path> (<plan-path> | --prompt "<text>")
-                  [--base <branch>] [--branch <name>]
+                  [--base <branch>] [--branch <name>] [--pair]
     Spawn a full-edit child claude with cwd=<repo>. It fetches the base
     branch, branches from the up-to-date base, implements the work,
     commits, pushes, and opens a PR via gh. The
@@ -634,6 +643,8 @@ behalf, by calling them through your Bash tool (which is restricted to
     at $CEREBRO_HOME/templates/ as a separate first commit before the
     plan work. Existing AGENTS.md / CLAUDE.md are never modified. You
     don't have to mention this explicitly to the user unless they ask.
+    --pair enables pair-programming mode (see "# Pair programming mode"):
+    the user attaches to the live execute session and can steer it.
 
   cerebro review <repo-abs-path> [--base <ref>] [--criteria-file <plan-path>]
     Run codex (non-mutating) against the current branch diff vs <ref>.
@@ -655,6 +666,7 @@ behalf, by calling them through your Bash tool (which is restricted to
 
   cerebro apply-review <repo-abs-path>
                        (<findings-path> [--notes "..."] | --prompt "<text>")
+                       [--pair]
     Spawn a full-edit child claude with cwd=<repo> to apply fixes on
     the current branch. The default form takes a <findings-path> from
     `cerebro review`. SCOPE: include in --notes only findings that are
@@ -687,11 +699,13 @@ behalf, by calling them through your Bash tool (which is restricted to
 
   cerebro doc-write <repo-abs-path>
                     (<plan-path> [--notes "..."] | --prompt "<text>")
+                    [--pair]
     Spawn a full-edit child claude with cwd=<repo> to update docs
     based on the plan and the recent diff. The `--prompt "<text>"`
     form takes inline doc instructions instead of a plan file -- only
     when the user has explicitly asked to skip planning (rule 3).
     Commits and pushes on the same branch.
+    --pair enables pair-programming mode (see "# Pair programming mode").
 
   cerebro git <repo-abs-path> <git-subcmd> [args...]
     Run a read-only git command in the user's repo. Allowed subcommands
@@ -986,6 +1000,67 @@ propose, and exactly how it relates to the spec -- then wait for the
 user. Your autonomy covers HOW you satisfy the spec; it NEVER covers
 changing WHAT the spec asks for. When the user resolves it, capture any
 new or changed requirement with `cerebro spec set` before resuming.
+
+# Pair programming mode
+
+The user can PAIR with a child agent: watch it work live and steer it,
+the way two programmers share a keyboard. Pass `--pair` to `cerebro plan`,
+`execute`, `apply-review`, or `doc-write` when the user asks to "pair",
+"watch", "steer", "follow along", "let me drive", "I want to jump in", or
+similar. (Pairing is not available for `cerebro review` -- codex has no
+live-attach.) `--pair` launches the child with claude Remote Control, so
+it appears in the user's claude.ai/code session list and the Claude
+mobile app, where they can read its output and type messages to redirect
+it mid-run.
+
+How to run a paired child:
+
+  1. RUN IT IN THE BACKGROUND. A paired child is meant to be watched
+     WHILE it runs, so launch it as a background Bash task -- never
+     block on it in the foreground. cerebro prints a "PAIR MODE" banner
+     (the session NAME and a claude.ai/code link) to stderr as soon as
+     it starts.
+  2. RELAY THE ATTACH DETAILS IMMEDIATELY. As soon as that banner
+     appears, tell the user the session name and that they can open
+     claude.ai/code (or the Claude app) to watch and steer. Do this
+     before the child finishes -- that is the whole point.
+  3. LET IT RUN. Narrate progress briefly as usual; the user is also
+     watching directly.
+  4. ON COMPLETION, COLLECT THE STEERING. When the child finishes,
+     cerebro emits a block on stdout delimited by
+     `=== PAIR STEERING (N message(s)) ===` ... `=== END PAIR STEERING
+     (file: <path>) ===` and writes the same steering to that
+     `.steering.md` file. READ it. If no steering was detected, cerebro
+     says so and there is nothing to fold in -- proceed normally.
+
+Folding steering back in (AUTO-APPLY, then report):
+
+Steering is the user talking to you through the child -- treat it as a
+DIRECT INSTRUCTION (rule 0): it takes precedence, and you apply it
+WITHOUT asking again. After a paired child returns with steering:
+
+  * UPDATE THE SPEC. If the steering adds, changes, or drops a
+    requirement, capture it with `cerebro spec set` so the spec stays
+    the record of record (rule 9).
+  * REVISE THE PLANS. Rewrite the affected plan to reflect the steer
+    (`cerebro plan <repo> "Revise this plan to incorporate: <the
+    steering>. Current plan: <paste>." --out <same-name>` OVERWRITES
+    it), and adjust any not-yet-executed downstream plans so the suite
+    stays coherent. If the steering invalidates the approach itself,
+    REPLAN rather than patch.
+  * RE-EXECUTE IF NEEDED. If the steered child already did the work the
+    new direction asked for, you are done; if the steer arrived too late
+    to land in that child, apply it on the same branch with the normal
+    follow-up (`apply-review --prompt`) or the next plan step.
+  * THEN REPORT. Tell the user, in a few lines, what you heard them
+    steer and exactly what you changed in response (spec edits, plan
+    revisions, replans, re-runs).
+
+This auto-apply autonomy covers HOW you satisfy the spec. If the steering
+would change WHAT the spec asks for in a way that is genuinely ambiguous
+or conflicts with a standing requirement, fall back to the spec-divergence
+rule above: make the change you are confident in, but STOP and confirm the
+part that is a real product decision rather than guessing.
 
 # Audit high-blast-radius plans before proposing them
 
@@ -1419,6 +1494,149 @@ if result_path:
         f.write(result_text)
 '
 
+# ----- pair-programming mode -----------------------------------------------
+# `--pair` on a claude child (plan / execute / apply-review / doc-write) lets
+# the developer attach to the live session and steer it. cerebro launches the
+# child with claude's --remote-control so it shows up in the claude.ai/code
+# session list (and the Claude mobile app), pins/mints the child's session id
+# up front so the connect banner can name it, and -- after the child finishes
+# -- mines the child's transcript for any messages the human injected. Those
+# steering messages are reported back so the orchestrator can fold them into
+# the session spec and the upcoming plans.
+
+# Where claude writes per-session transcripts (one <session-id>.jsonl each).
+claude_projects_dir() { printf '%s\n' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"; }
+
+# pair_label <role> <repo> [branch] -- a stable, human-readable session name
+# the developer can recognise in the claude.ai/code session list.
+pair_label() {
+  local role="$1" repo="$2" branch="${3:-}"
+  printf 'cerebro:%s:%s%s' "$role" "$(basename "$repo")" "${branch:+:$branch}"
+}
+
+# pair_banner <role> <sid> <label> -- tell the developer how to attach. Goes
+# to stderr so it never pollutes the stdout child-log path contract.
+pair_banner() {
+  local role="$1" sid="$2" label="$3"
+  {
+    printf 'cerebro: PAIR MODE -- attach to this %s session to watch and steer it live.\n' "$role"
+    printf '  session name : %s\n' "$label"
+    printf '  session id   : %s\n' "$sid"
+    printf '  attach via   : https://claude.ai/code  (or the Claude mobile app) -- open this session, then type to steer.\n'
+    printf '  when it ends : cerebro reports your steering and folds it into the spec / next plans.\n'
+  } >&2
+}
+
+# pair_begin <role> <repo> <branch-or-empty> [resume-id] -- prepare a fresh or
+# resumed paired child. Sets two caller-scoped variables: PAIR_SID (the
+# session id to track for steering) and PAIR_OPTS (extra claude flags). On a
+# resume the stored id is reused and the caller's --resume sets the session
+# id; otherwise a fresh id is minted and pinned with --session-id so the
+# connect banner can name it before the child emits anything.
+pair_begin() {
+  local role="$1" repo="$2" branch="${3:-}" resume="${4:-}"
+  local label; label="$(pair_label "$role" "$repo" "$branch")"
+  if [[ -n "$resume" ]]; then
+    PAIR_SID="$resume"
+    PAIR_OPTS=(--remote-control "$label")
+  else
+    PAIR_SID="$(mint_uuid)"
+    PAIR_OPTS=(--session-id "$PAIR_SID" --remote-control "$label")
+  fi
+  pair_banner "$role" "$PAIR_SID" "$label"
+}
+
+# Mine a child transcript for human steering. Steering = human-authored user
+# messages that appear AFTER cerebro's own (SDK-sourced) prompt for this run;
+# tool_result turns and the piped prompt are excluded. Prints one "- <msg>"
+# bullet per steering message, or nothing.
+PY_EXTRACT_STEERING='
+import json, sys
+path = sys.argv[1]
+try:
+    fh = open(path)
+except OSError:
+    sys.exit(0)
+rows = []
+last_sdk = -1
+for line in fh:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if ev.get("type") != "user":
+        continue
+    msg = ev.get("message") or {}
+    if msg.get("role") != "user":
+        continue
+    content = msg.get("content")
+    text = None
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            text = None
+        else:
+            parts = [b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text"]
+            text = "\n".join(p for p in parts if p) or None
+    if text is None or not text.strip():
+        continue
+    src = ev.get("promptSource")
+    rows.append((src, text.strip()))
+    if src == "sdk":
+        last_sdk = len(rows) - 1
+out = []
+for i in range(last_sdk + 1, len(rows)):
+    src, text = rows[i]
+    if src == "sdk":
+        continue
+    out.append(text)
+for m in out:
+    print("- " + m.replace("\n", "\n  "))
+'
+
+# report_steering <sid> <repo> <out_path> -- find the child transcript by
+# session id, extract steering, and (when non-empty) write it to <out_path>.
+# Echoes the steering-message count (0 when none / transcript not found).
+report_steering() {
+  local sid="$1" repo="$2" out_path="$3" pdir tfile steering
+  pdir="$(claude_projects_dir)"
+  [[ -n "$sid" && -d "$pdir" ]] || { printf 0; return 0; }
+  tfile="$(find "$pdir" -type f -name "$sid.jsonl" 2>/dev/null | head -1)"
+  [[ -n "$tfile" ]] || { printf 0; return 0; }
+  steering="$(python3 -c "$PY_EXTRACT_STEERING" "$tfile" 2>/dev/null)"
+  if [[ -n "${steering//[[:space:]]/}" ]]; then
+    printf '%s\n' "$steering" > "$out_path"
+    grep -c '^- ' "$out_path"
+  else
+    printf 0
+  fi
+}
+
+# pair_report <pair-flag> <sid> <repo> <child_log> -- when paired, mine the
+# child transcript for steering, persist it next to the child log, and emit a
+# delimited PAIR STEERING block on stdout for the orchestrator to read. A
+# no-op when pair is 0.
+pair_report() {
+  local pair="$1" sid="$2" repo="$3" child_log="$4"
+  (( pair )) || return 0
+  local steer_path="${child_log%.jsonl}.steering.md" n
+  n="$(report_steering "$sid" "$repo" "$steer_path")"
+  if [[ "${n:-0}" -gt 0 ]]; then
+    log_event "pair_steering" "n=$n sid=$sid path=$steer_path"
+    printf '=== PAIR STEERING (%s message(s)) ===\n' "$n"
+    cat "$steer_path"
+    printf '=== END PAIR STEERING (file: %s) ===\n' "$steer_path"
+    say "cerebro: captured $n steering message(s) from the paired session -> $steer_path"
+  else
+    say "cerebro: pair mode -- no steering detected in the paired session"
+  fi
+}
+
 # ----- subcommand: cerebro (launch new session) ----------------------------
 
 # Global preference files (span every session under $CEREBRO_HOME).
@@ -1555,9 +1773,11 @@ cmd_plan() {
   local repo="${1:-}"; shift || true
   local desc="${1:-}"; shift || true
   local out_name=""
+  local pair=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --out) shift; out_name="${1:-}"; shift || true ;;
+      --pair) pair=1; shift ;;
       *) die "plan: unknown arg: $1" ;;
     esac
   done
@@ -1598,6 +1818,12 @@ outer code fence. Output ONLY the plan.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
+  local PAIR_SID="" PAIR_OPTS=()
+  if (( pair )); then
+    pair_begin plan "$repo" ""
+    opts+=("${PAIR_OPTS[@]}")
+  fi
+
   local prompt
   prompt="Write an implementation plan for the following request, exploring this repository with your read tools as needed.
 
@@ -1619,6 +1845,7 @@ $desc
   fi
 
   log_event "plan_written" "$out_path"
+  pair_report "$pair" "$PAIR_SID" "$repo" "$child_log"
   echo "$out_path"
 }
 
@@ -1652,6 +1879,7 @@ cmd_execute() {
   local prompt_text=""
   local base_branch=""
   local new_branch=""
+  local pair=0
   # Second positional, if present and not a flag, is the plan path.
   if [[ $# -gt 0 && "${1:-}" != --* ]]; then
     plan_path="$1"; shift
@@ -1661,6 +1889,7 @@ cmd_execute() {
       --prompt) shift; prompt_text="${1:-}"; shift || true ;;
       --base)   shift; base_branch="${1:-}"; shift || true ;;
       --branch) shift; new_branch="${1:-}";  shift || true ;;
+      --pair)   pair=1; shift ;;
       *) die "execute: unknown arg: $1" ;;
     esac
   done
@@ -1784,8 +2013,11 @@ attempt to authenticate. Stop after the PR is open.'
 
   local rc id_capture
   id_capture="$(mktemp)"
+  local PAIR_SID="" PAIR_OPTS=()
+  (( pair )) && pair_begin execute "$repo" "$new_branch" "$prior"
   local run_opts=("${opts[@]}")
   [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
+  (( pair )) && run_opts+=("${PAIR_OPTS[@]}")
 
   ( cd "$repo" && printf '%s' "$child_prompt" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
@@ -1807,9 +2039,15 @@ attempt to authenticate. Stop after the PR is open.'
     log_event "execute_resume_failed" "rc=$rc resume=$prior; retrying fresh"
     warn "execute: resume of $prior failed (rc=$rc); retrying without resume"
     : > "$id_capture"
+    local retry_opts=("${opts[@]}")
+    # The rejected resume's session id is dead; pair the retry on a fresh one.
+    if (( pair )); then
+      pair_begin execute "$repo" "$new_branch" ""
+      retry_opts+=("${PAIR_OPTS[@]}")
+    fi
     ( cd "$repo" && printf '%s' "$child_prompt" \
         | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-          "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+          "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>/dev/null \
         | tee "$child_log" \
         | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
     rc=$?
@@ -1827,6 +2065,7 @@ attempt to authenticate. Stop after the PR is open.'
   fi
   rm -f "$id_capture"
   log_event "execute_finished" "$child_log"
+  pair_report "$pair" "$PAIR_SID" "$repo" "$child_log"
   echo "$child_log"
 }
 
@@ -2074,6 +2313,7 @@ cmd_apply_review() {
   local prompt_text=""
   local notes=""
   local saw_prompt=0
+  local pair=0
   if [[ $# -gt 0 && "${1:-}" != --* ]]; then
     findings="$1"; shift
   fi
@@ -2081,6 +2321,7 @@ cmd_apply_review() {
     case "$1" in
       --prompt) saw_prompt=1; shift; prompt_text="${1:-}"; shift || true ;;
       --notes)  shift; notes="${1:-}";                     shift || true ;;
+      --pair)   pair=1; shift ;;
       *) die "apply-review: unknown arg: $1" ;;
     esac
   done
@@ -2185,6 +2426,13 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
+  local PAIR_SID="" PAIR_OPTS=()
+  if (( pair )); then
+    local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    pair_begin apply-review "$repo" "$_b"
+    opts+=("${PAIR_OPTS[@]}")
+  fi
+
   local rc
   ( cd "$repo" && \
     { if [[ -n "$findings" ]]; then
@@ -2204,6 +2452,7 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
     die "apply-review: child claude failed (rc=$rc); see $child_log"
   fi
   log_event "apply_review_finished" "$child_log"
+  pair_report "$pair" "$PAIR_SID" "$repo" "$child_log"
   echo "$child_log"
 }
 
@@ -2217,6 +2466,7 @@ cmd_doc_write() {
   local plan=""
   local prompt_text=""
   local notes=""
+  local pair=0
   if [[ $# -gt 0 && "${1:-}" != --* ]]; then
     plan="$1"; shift
   fi
@@ -2224,6 +2474,7 @@ cmd_doc_write() {
     case "$1" in
       --prompt) shift; prompt_text="${1:-}"; shift || true ;;
       --notes)  shift; notes="${1:-}";       shift || true ;;
+      --pair)   pair=1; shift ;;
       *) die "doc-write: unknown arg: $1" ;;
     esac
   done
@@ -2274,6 +2525,13 @@ per AGENTS.md and push so the open PR updates.'
               --append-system-prompt "$sys_prompt")
   [[ -n "$CEREBRO_MODEL" ]] && opts+=(--model "$CEREBRO_MODEL")
 
+  local PAIR_SID="" PAIR_OPTS=()
+  if (( pair )); then
+    local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    pair_begin doc-write "$repo" "$_b"
+    opts+=("${PAIR_OPTS[@]}")
+  fi
+
   local rc
   ( cd "$repo" && \
     { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n%s\n</plan>\n' "$notes" "$plan_body"
@@ -2287,6 +2545,7 @@ per AGENTS.md and push so the open PR updates.'
     die "doc-write: child claude failed (rc=$rc); see $child_log"
   fi
   log_event "doc_write_finished" "$child_log"
+  pair_report "$pair" "$PAIR_SID" "$repo" "$child_log"
   echo "$child_log"
 }
 

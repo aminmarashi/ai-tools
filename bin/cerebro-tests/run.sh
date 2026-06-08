@@ -1330,6 +1330,139 @@ else
   printf 'SKIP  128b review codex resume argv (codex stub unavailable)\n'
 fi
 
+# ========================================================================
+# 131-136. Pair-programming mode (--pair). A stub claude records its argv,
+# detects the pinned --session-id, writes a transcript carrying one SDK
+# prompt + one tool_result turn + one human steering message, and emits a
+# success stream. We assert that --pair adds --remote-control + --session-id,
+# that the human steering is mined out (tool_result and the SDK prompt
+# excluded) and surfaced as a PAIR STEERING block, and that the default
+# (no --pair) path stays clean.
+# ========================================================================
+PAIR_CFG="$WORKDIR/claude-config"            # CLAUDE_CONFIG_DIR for the run
+PAIR_PROJ="$PAIR_CFG/projects/test"
+PAIR_ARGV_LOG="$WORKDIR/pair-argv.log"
+PAIR_STUB_DIR="$WORKDIR/claude-pair-stub"
+mkdir -p "$PAIR_STUB_DIR" "$PAIR_PROJ"
+cat > "$PAIR_STUB_DIR/claude" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$PAIR_ARGV_LOG"
+cat >/dev/null
+sid=""; prev=""
+for a in "\$@"; do
+  [[ "\$prev" == "--session-id" ]] && sid="\$a"
+  prev="\$a"
+done
+[[ -n "\$sid" ]] || sid="STUB-NOPIN"
+# Fabricate a transcript: SDK prompt, a tool_result turn (must be ignored),
+# and one human steering message.
+{
+  printf '%s\n' '{"type":"user","promptSource":"sdk","message":{"role":"user","content":"do the work"}}'
+  printf '%s\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"on it"}]}}'
+  printf '%s\n' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ran tests"}]}}'
+  printf '%s\n' '{"type":"user","promptSource":"user","message":{"role":"user","content":"actually use a hashmap here"}}'
+} > "$PAIR_PROJ/\$sid.jsonl"
+printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "\$sid"
+printf '%s\n' '{"type":"result","subtype":"success","result":"ok"}'
+exit 0
+EOF
+chmod +x "$PAIR_STUB_DIR/claude"
+
+if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
+  PAIR_STUB_PATH="$PAIR_STUB_DIR:$PATH"
+  PSESS="pair-session"; PDIR="$CEREBRO_HOME/sessions/$PSESS"
+  mkdir -p "$PDIR/children" "$PDIR/plans"; : > "$PDIR/transcript.jsonl"
+
+  # --- 131. execute --pair passes --remote-control and --session-id ---
+  : > "$PAIR_ARGV_LOG"
+  pout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
+    CEREBRO_SESSION_ID="$PSESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "do the work" --pair 2>"$WORKDIR/perr")"
+  prc=$?
+  pargv="$(cat "$PAIR_ARGV_LOG")"
+  if [[ $prc -eq 0 && "$pargv" == *"--remote-control cerebro:execute:"* && "$pargv" == *"--session-id"* ]]; then
+    printf 'PASS  131  execute --pair adds --remote-control + --session-id\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  131  execute --pair flags missing [rc=%d argv=%s]\n' "$prc" "$pargv"; fail=$((fail + 1))
+    failures+=("131 execute --pair flags :: rc=$prc argv=$pargv")
+  fi
+
+  # --- 132. execute --pair surfaces the human steering, excluding noise ---
+  if [[ "$pout" == *"=== PAIR STEERING"* && "$pout" == *"actually use a hashmap here"* \
+        && "$pout" != *"do the work"* && "$pout" != *"ran tests"* ]]; then
+    printf 'PASS  132  execute --pair reports steering (sdk/tool_result excluded)\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  132  execute --pair steering block wrong [out=%s]\n' "$pout"; fail=$((fail + 1))
+    failures+=("132 execute --pair steering :: out=$pout")
+  fi
+
+  # --- 133. the steering is persisted to a .steering.md beside the child log ---
+  clog="$(printf '%s\n' "$pout" | tail -1)"
+  spath="${clog%.jsonl}.steering.md"
+  if [[ -s "$spath" ]] && grep -q 'actually use a hashmap here' "$spath" \
+       && ! grep -q 'ran tests' "$spath"; then
+    printf 'PASS  133  steering persisted to .steering.md\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  133  steering file wrong [path=%s]\n' "$spath"; fail=$((fail + 1))
+    failures+=("133 steering file :: path=$spath")
+  fi
+
+  # --- 133b. a pair_steering event was logged ---
+  if grep -q '"what":"pair_steering"' "$PDIR/transcript.jsonl"; then
+    printf 'PASS  133b  pair_steering event logged\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  133b  pair_steering event not logged\n'; fail=$((fail + 1))
+    failures+=("133b pair_steering event missing")
+  fi
+
+  # --- 134. plan --pair also pairs (read-only child) and reports steering ---
+  : > "$PAIR_ARGV_LOG"
+  qout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
+    CEREBRO_SESSION_ID="$PSESS" \
+    "$CEREBRO_BIN" plan "$REPO" "add a cache" --out pair-plan --pair 2>/dev/null)"
+  qrc=$?
+  qargv="$(cat "$PAIR_ARGV_LOG")"
+  if [[ $qrc -eq 0 && "$qargv" == *"--remote-control cerebro:plan:"* \
+        && "$qout" == *"actually use a hashmap here"* ]]; then
+    printf 'PASS  134  plan --pair pairs and reports steering\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  134  plan --pair wrong [rc=%d argv=%s out=%s]\n' "$qrc" "$qargv" "$qout"; fail=$((fail + 1))
+    failures+=("134 plan --pair :: rc=$qrc")
+  fi
+
+  # --- 135. WITHOUT --pair, no remote-control / session pinning is added ---
+  : > "$PAIR_ARGV_LOG"
+  env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
+    CEREBRO_SESSION_ID="$PSESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "no pairing" >/dev/null 2>&1
+  npargv="$(cat "$PAIR_ARGV_LOG")"
+  if [[ "$npargv" != *"--remote-control"* && "$npargv" != *"--session-id"* ]]; then
+    printf 'PASS  135  default execute stays clean (no --remote-control)\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  135  default execute leaked pair flags [argv=%s]\n' "$npargv"; fail=$((fail + 1))
+    failures+=("135 default execute pair leak :: argv=$npargv")
+  fi
+
+  # --- 136. apply-review --prompt --pair pairs on the current branch ---
+  : > "$PAIR_ARGV_LOG"
+  aout="$(env PATH="$PAIR_STUB_PATH" CLAUDE_CONFIG_DIR="$PAIR_CFG" \
+    CEREBRO_SESSION_ID="$PSESS" \
+    "$CEREBRO_BIN" apply-review "$REPO" --prompt "tidy up" --pair 2>/dev/null)"
+  arc=$?
+  aargv="$(cat "$PAIR_ARGV_LOG")"
+  if [[ $arc -eq 0 && "$aargv" == *"--remote-control cerebro:apply-review:"* \
+        && "$aout" == *"actually use a hashmap here"* ]]; then
+    printf 'PASS  136  apply-review --pair pairs and reports steering\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  136  apply-review --pair wrong [rc=%d argv=%s]\n' "$arc" "$aargv"; fail=$((fail + 1))
+    failures+=("136 apply-review --pair :: rc=$arc")
+  fi
+else
+  for t in 131 132 133 133b 134 135 136; do
+    printf 'SKIP  %s  pair-mode (claude stub unavailable)\n' "$t"
+  done
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 if (( fail > 0 )); then
   printf '\nFailures:\n'
