@@ -728,8 +728,12 @@ behalf, by calling them through your Bash tool (which is restricted to
     `=== OBSERVE STATUS: active ===` (children still live -- call observe
     again) or `... done ===` (none left). A per-target cursor under your
     own session dir advances each call, so successive calls never repeat.
-    Each call blocks up to a short window (CEREBRO_OBSERVE_WINDOW, default
-    25s), returning early on a quiet gap. Read-only: it only reads the
+    Each call blocks up to a window (CEREBRO_OBSERVE_WINDOW, default 90s),
+    returning early only after a longer quiet gap (CEREBRO_OBSERVE_QUIET,
+    default 12s) so each batch is a substantial chunk rather than a trickle.
+    Read-only navigation (reads, greps, listings) is filtered out; the batch
+    carries the agent'\''s reasoning, the code it writes, and the commands it
+    runs. Read-only: it only reads the
     session's transcript and its children's logs and never disturbs them.
     Drive it in a loop and narrate
     (see "# Observing another cerebro session"); steer a watched child with
@@ -1189,26 +1193,33 @@ How to run the monitor:
 
   1. POLL IN A LOOP. Run `cerebro observe [<session-id>]` (omit the id to
      auto-pick the most recently active other session with live paired
-     children). Each call blocks briefly and returns ONE batch of new
+     children). Each call blocks for a window (up to ~90s, returning early
+     after a longer quiet gap) and returns ONE substantial batch of new
      activity from every live paired child of that session, then a footer:
      `=== OBSERVE STATUS: active ===` means children are still live -- call
      `cerebro observe` AGAIN to get the next batch; `... done ===` means
-     none are left, so stop. Successive calls never repeat (a cursor
-     advances). Keep looping -- narrating between calls -- until done or
-     the user tells you to stop.
-  2. NARRATE THE GIST, NOT THE LOG. You are a colleague watching the
-     screen, not a line printer. Do NOT echo every tool call. Each batch,
-     say in plain present-tense English what the agent(s) are doing and why
-     it matters; group related actions into one short observation. When the
+     none are left, so stop. Each batch is deliberately a large chunk, not a
+     trickle, and read-only navigation churn is already filtered out, so you
+     see reasoning, the code being written, and commands -- not every read.
+     Successive calls never repeat (a cursor advances). Keep looping --
+     narrating between calls -- until done or the user tells you to stop.
+  2. NARRATE THE GIST AT ALTITUDE, NOT THE LOG. You are a colleague watching
+     the screen, not a line printer. Do NOT echo tool calls. Each batch
+     covers a large span of work; distill it into a few sentences of plain
+     present-tense English: what the agent(s) are building and why it
+     matters. Group many related actions into ONE observation. When the
      session has several children active, lead each note with the child's
-     label so the user knows who is doing what.
-  3. FLAG THE IMPORTANT DECISIONS. Every once in a while -- when the
-     activity shows a real decision or a crucial piece of code -- call it
-     out explicitly: a new abstraction or interface/type, a dependency
-     added, infra / IaC / CI / build changes, a data-model / schema /
-     migration, auth / security / money paths, a public API change, or any
-     other high-blast-radius move. Surface those promptly and plainly; let
-     the routine churn pass with a light touch.
+     label so the user knows who is doing what. Prefer fewer, denser notes
+     over a running play-by-play.
+  3. FLAG THE IMPORTANT DECISIONS AND SHOW THE DESIGN. When the batch shows
+     a real decision or a shaping piece of code, call it out explicitly: a
+     new abstraction or interface/type, a dependency added, infra / IaC / CI
+     / build changes, a data-model / schema / migration, auth / security /
+     money paths, a public API change, or any other high-blast-radius move.
+     For these, quote the KEY code snippet -- the function signature, type,
+     schema, or interface -- in a short fenced block so the user can see the
+     design taking shape, not just hear it described. Skip snippets for
+     routine churn; reserve them for code that actually informs the design.
   4. STEER ONLY ON COMMAND. You are read-only by default. If the user
      tells you to redirect a watched agent ("tell it to use a hashmap",
      "stop touching the config"), inject it with `cerebro steer
@@ -4361,6 +4372,12 @@ def render(ev, out):
                     out.append("says: " + preview(txt, 2000))
             elif item.get("type") == "tool_use":
                 name = item.get("name", "?")
+                # Read-only navigation (reads, searches, listings) is the bulk
+                # of the churn and carries little signal on its own. Drop it so
+                # the batch is dominated by what matters: the agent'\''s reasoning,
+                # the code it writes, and the commands it runs.
+                if name in ("Read", "Grep", "Glob", "LS", "NotebookRead"):
+                    continue
                 inp = item.get("input", {}) or {}
                 tgt = (inp.get("description") or inp.get("file_path") or
                        inp.get("pattern") or inp.get("path") or
@@ -4372,7 +4389,7 @@ def render(ev, out):
                 if body is None:
                     body = inp.get("content")
                 if isinstance(body, str) and body.strip():
-                    out.append(("%s %s :: %s" % (name, tgt, preview(body, 300))).strip())
+                    out.append(("%s %s :: %s" % (name, tgt, preview(body, 600))).strip())
                 else:
                     out.append(("%s %s" % (name, tgt)).strip())
     elif t == "result":
@@ -4494,7 +4511,7 @@ cmd_observe() {
   python3 -c "$PY_OBSERVE_PUMP" \
     "$CEREBRO_HOME/sessions" "$target_id" "$CEREBRO_SESSION_ID" \
     "$CEREBRO_SESSION_DIR/observe-state" \
-    "${CEREBRO_OBSERVE_WINDOW:-25}" "${CEREBRO_OBSERVE_QUIET:-2}"
+    "${CEREBRO_OBSERVE_WINDOW:-90}" "${CEREBRO_OBSERVE_QUIET:-12}"
 }
 
 # ----- dispatch ------------------------------------------------------------
