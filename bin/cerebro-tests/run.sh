@@ -1209,9 +1209,11 @@ EOF
 
   # --- 130. a resumed execute that DID work (emitted a session init) and then
   # FAILED must NOT be re-run fresh -- re-running would duplicate/partly redo
-  # mutating work. The stub starts a session (init -> id_capture written) on
-  # every call and then fails; cerebro must invoke it exactly ONCE, surface the
-  # failure, and never log execute_resume_failed. ---
+  # mutating work. The stub starts a session (init -> id captured) on every
+  # call and then fails; cerebro must invoke it exactly ONCE, surface the
+  # failure, and never log execute_resume_failed. The id is persisted at
+  # startup (not on success), so the store now holds the LIVE child's id with
+  # status=running -- the half-done work stays resumable on continue. ---
   WORK_COUNT="$WORKDIR/realfail-count"
   WORK_STUB_DIR="$WORKDIR/claude-realfail-stub"
   mkdir -p "$WORK_STUB_DIR"
@@ -1240,13 +1242,15 @@ EOF
   wrc=$?
   invocations="$(wc -c < "$WORK_COUNT" | tr -d ' ')"
   stored_id="$(jq -r --arg k "$WKEY" '.[$k].id' "$WDIR/child-sessions.json" 2>/dev/null)"
-  if [[ $wrc -ne 0 && "$invocations" -eq 1 && "$stored_id" == "PRIOR-1234" ]] \
+  stored_status="$(jq -r --arg k "$WKEY" '.[$k].status' "$WDIR/child-sessions.json" 2>/dev/null)"
+  if [[ $wrc -ne 0 && "$invocations" -eq 1 && "$stored_id" == "WORKED-9999" \
+        && "$stored_status" == "running" ]] \
      && ! grep -q '"what":"execute_resume_failed"' "$WDIR/transcript.jsonl"; then
-    printf 'PASS  130  resumed execute with prior work does not re-run fresh\n'; pass=$((pass + 1))
+    printf 'PASS  130  resumed execute with prior work does not re-run fresh (stays resumable)\n'; pass=$((pass + 1))
   else
-    printf 'FAIL  130  resumed real failure re-ran fresh [rc=%d invocations=%s id=%s]\n' \
-      "$wrc" "$invocations" "$stored_id"; fail=$((fail + 1))
-    failures+=("130 mutating resume re-run :: rc=$wrc invocations=$invocations id=$stored_id")
+    printf 'FAIL  130  resumed real failure re-ran fresh [rc=%d invocations=%s id=%s status=%s]\n' \
+      "$wrc" "$invocations" "$stored_id" "$stored_status"; fail=$((fail + 1))
+    failures+=("130 mutating resume re-run :: rc=$wrc invocations=$invocations id=$stored_id status=$stored_status")
   fi
 else
   printf 'SKIP  125  execute child-session capture (claude stub unavailable)\n'
@@ -1542,6 +1546,99 @@ if [[ -x "$PAIR_STUB_DIR/claude" ]]; then
 else
   for t in 131 132 133 133b 134 135 136 137 138 138b; do
     printf 'SKIP  %s  pair-mode (claude stub unavailable)\n' "$t"
+  done
+fi
+
+# ========================================================================
+# 140-143. Resume-on-continue for in-flight children. A child's resumable id
+# is persisted the instant it starts (not on success), entries carry a
+# running/done status, and `cerebro status` surfaces still-running (=
+# interrupted) children so the orchestrator can resume them on continue.
+# ========================================================================
+
+# --- 141. cerebro status surfaces a still-running (interrupted) child with a
+# resume hint. No stub needed: we seed a fresh running entry directly. ---
+SSESS="status-inflight-session"; SDIR="$CEREBRO_HOME/sessions/$SSESS"
+mkdir -p "$SDIR/children"; : > "$SDIR/transcript.jsonl"
+jq -n --arg k deadbeefdeadbeef --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+   --arg repo "$REPO" \
+   '{($k): {id:"INFLIGHT-1", provider:"claude", role:"execute", repo:$repo,
+            branch:"feat/wip", log:"/tmp/x.jsonl", status:"running",
+            started_at:$ts, updated_at:$ts}}' \
+   > "$SDIR/child-sessions.json"
+sout="$(env CEREBRO_SESSION_ID="$SSESS" "$CEREBRO_BIN" status 2>/dev/null)"
+if grep -q 'interrupted / in-flight children' <<<"$sout" \
+   && grep -q 'feat/wip' <<<"$sout" \
+   && grep -q 'resume:' <<<"$sout"; then
+  printf 'PASS  141  status lists interrupted in-flight children with a resume hint\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  141  status missing in-flight section [out=%s]\n' "$sout"; fail=$((fail + 1))
+  failures+=("141 status in-flight :: out=$sout")
+fi
+
+# --- 142. a stale (over-TTL) running entry is NOT listed as in-flight. ---
+jq -n --arg k cafecafecafecafe \
+   '{($k): {id:"OLD-1", provider:"claude", role:"execute", repo:"/r",
+            branch:"feat/old", log:"/tmp/o.jsonl", status:"running",
+            started_at:"2000-01-01T00:00:00Z", updated_at:"2000-01-01T00:00:00Z"}}' \
+   > "$SDIR/child-sessions.json"
+sout2="$(env CEREBRO_SESSION_ID="$SSESS" "$CEREBRO_BIN" status 2>/dev/null)"
+if ! grep -q 'feat/old' <<<"$sout2"; then
+  printf 'PASS  142  status omits stale (over-TTL) in-flight children\n'; pass=$((pass + 1))
+else
+  printf 'FAIL  142  status listed a stale in-flight child [out=%s]\n' "$sout2"; fail=$((fail + 1))
+  failures+=("142 stale in-flight listed")
+fi
+
+if (( STUB_OK )); then
+  # --- 140. a successful execute marks its child status=done (so it does NOT
+  # show up as interrupted), and the id is recorded. ---
+  DSESS="done-status-session"; DDIR="$CEREBRO_HOME/sessions/$DSESS"
+  mkdir -p "$DDIR/children"; : > "$DDIR/transcript.jsonl"
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$DSESS" \
+    "$CEREBRO_BIN" execute "$REPO" --prompt "do it" --branch feat/done >/dev/null 2>&1
+  dstatus="$(jq -r '.[].status' "$DDIR/child-sessions.json" 2>/dev/null)"
+  dlist="$(env CEREBRO_SESSION_ID="$DSESS" "$CEREBRO_BIN" status 2>/dev/null \
+           | sed -n '/in-flight children/,/last review/p')"
+  if [[ "$dstatus" == "done" ]] && ! grep -q 'feat/done' <<<"$dlist"; then
+    printf 'PASS  140  successful execute marks status=done (off the in-flight list)\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  140  execute did not mark done [status=%s list=%s]\n' "$dstatus" "$dlist"; fail=$((fail + 1))
+    failures+=("140 done status :: status=$dstatus")
+  fi
+
+  # --- 143. apply-review resumes the stored conversation on the same branch:
+  # a second apply-review on the same repo+branch logs resume=<id>. ---
+  ARSESS="apply-resume-session"; ARDIR="$CEREBRO_HOME/sessions/$ARSESS"
+  mkdir -p "$ARDIR/children"; : > "$ARDIR/transcript.jsonl"
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$ARSESS" \
+    "$CEREBRO_BIN" apply-review "$REPO" --prompt "first fix" >/dev/null 2>&1
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$ARSESS" \
+    "$CEREBRO_BIN" apply-review "$REPO" --prompt "second fix" >/dev/null 2>&1
+  if grep -q 'resume=STUBSESSION-1111' "$ARDIR/transcript.jsonl"; then
+    printf 'PASS  143  second apply-review resumes the stored conversation\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  143  apply-review did not resume [transcript=%s]\n' "$(cat "$ARDIR/transcript.jsonl")"; fail=$((fail + 1))
+    failures+=("143 apply-review resume")
+  fi
+
+  # --- 144. doc-write likewise resumes the stored conversation on the same
+  # branch on a second call. ---
+  DWSESS="doc-resume-session"; DWDIR="$CEREBRO_HOME/sessions/$DWSESS"
+  mkdir -p "$DWDIR/children"; : > "$DWDIR/transcript.jsonl"
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$DWSESS" \
+    "$CEREBRO_BIN" doc-write "$REPO" --prompt "doc pass one" >/dev/null 2>&1
+  env PATH="$ID_STUB_PATH" CEREBRO_SESSION_ID="$DWSESS" \
+    "$CEREBRO_BIN" doc-write "$REPO" --prompt "doc pass two" >/dev/null 2>&1
+  if grep -q 'resume=STUBSESSION-1111' "$DWDIR/transcript.jsonl"; then
+    printf 'PASS  144  second doc-write resumes the stored conversation\n'; pass=$((pass + 1))
+  else
+    printf 'FAIL  144  doc-write did not resume [transcript=%s]\n' "$(cat "$DWDIR/transcript.jsonl")"; fail=$((fail + 1))
+    failures+=("144 doc-write resume")
+  fi
+else
+  for t in 140 143 144; do
+    printf 'SKIP  %s  child resume-on-continue (claude stub unavailable)\n' "$t"
   done
 fi
 

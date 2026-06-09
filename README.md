@@ -446,7 +446,9 @@ Env: `CEREBRO_HOME`, `CEREBRO_MODEL`, `CEREBRO_REVIEW_MODEL`,
 
 `CEREBRO_TIMEOUT` is the wall-clock cap (seconds) on each child agent call. It defaults to `0` (no cap) so long-running children — Playwright login/browser driving, waiting on the build pipeline — are never killed. Set it to a positive integer to re-enable a cap.
 
-Repeated `execute`/`review` calls on the same repo+branch resume the same underlying child conversation (claude `--resume` / `codex exec resume`). The provider session ids are stored per session under `sessions/<id>/child-sessions.json`, keyed by repo+role+branch. `CEREBRO_CHILD_SESSION_TTL` (seconds, default `86400` = 24h) bounds how long a stored id stays resumable; past it, or if the provider rejects the id, the child re-runs fresh and the store is refreshed.
+Repeated `execute`/`review`/`apply-review`/`doc-write` calls on the same repo+branch resume the same underlying child conversation (claude `--resume` / `codex exec resume`). The provider session ids are stored per session under `sessions/<id>/child-sessions.json`, keyed by repo+role+branch (an `execute` without `--branch` keys on the plan path or inline prompt instead). `CEREBRO_CHILD_SESSION_TTL` (seconds, default `86400` = 24h) bounds how long a stored id stays resumable; past it, or if the provider rejects the id, the child re-runs fresh and the store is refreshed.
+
+The child id is persisted the **instant** the child starts — not when it finishes — and each entry tracks a `running`/`done` status. So if you interrupt the orchestrator while a child agent is running, the work is not lost: the child is left marked `running` (interrupted), and on the next launch/resume the orchestrator runs `cerebro status` — whose "interrupted / in-flight children" section lists every child that was mid-run — and resumes each by re-issuing the same command, continuing the half-done work via `--resume` instead of redoing it. Concurrent `--pair` children write to the store under an `fcntl` lock so their startup ids never clobber each other.
 
 ## Adding a tool
 

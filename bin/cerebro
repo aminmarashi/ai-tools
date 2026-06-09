@@ -1010,6 +1010,31 @@ in your context after one or two commands, use a bridge. If you need
 cross-file synthesis, an analysis, or a written artefact, spawn
 `cerebro plan` instead.
 
+# Resuming after an interruption
+
+A child agent (execute / review / apply-review / doc-write) runs as a
+single cerebro command. If the user interrupts you while one is running,
+that child process dies -- but cerebro persists the child's resumable
+conversation id the instant it starts, so the work is not lost.
+
+WHENEVER you resume a session, or the user says "continue", "pick up
+where we left off", "carry on", or similar AND a child may have been
+running: FIRST run `cerebro status` and read its "interrupted / in-flight
+children" section. It lists every child that was mid-run when the session
+stopped (role, repo, branch, log).
+
+For each interrupted child, RESUME IT by re-issuing the SAME command you
+ran before -- same role, same repo, and the same `--branch` (for execute)
+or the same branch checked out (for apply-review / doc-write / review).
+cerebro keys on repo+role+branch, finds the stored conversation id, and
+relaunches the child with `--resume` so it continues its half-done work
+instead of starting over and duplicating commits. Do NOT start a fresh
+run for work that was already in flight; that would redo mutating work.
+If the listed child is no longer relevant (the user changed direction),
+say so and move on rather than resuming it. Once a child finishes cleanly
+it drops off this list; only incomplete (interrupted or failed) children
+appear.
+
 # Definition of done: end-to-end verification (non-negotiable)
 
 A plan is NEVER done until it has been verified END-TO-END by actually
@@ -1551,11 +1576,15 @@ touch_metadata() {
 }
 
 # ----- child agent session store -------------------------------------------
-# A small per-session JSON map of provider conversation ids so repeated
-# execute/review calls on the same line of work resume the same underlying
-# provider conversation. Keyed by child_key (repo+role+branch). The file is
-# created lazily on first child_session_set and lives alongside spec.md /
-# metadata.json, so it survives context compaction.
+# A small per-session JSON map of provider conversation ids + in-flight state
+# so repeated execute/review/apply-review/doc-write calls on the same line of
+# work resume the same underlying provider conversation -- and so a child that
+# was interrupted mid-run can be resumed on continue rather than redone. Keyed
+# by child_key (repo+role+branch). Each entry carries {id, provider, role,
+# repo, branch, log, status, started_at, updated_at}; status is "running"
+# until the child cleanly finishes (then "done"). The file is created lazily
+# on the first child_store_begin and lives alongside spec.md / metadata.json,
+# so it survives context compaction.
 
 child_sessions_file() { printf '%s\n' "$CEREBRO_SESSION_DIR/child-sessions.json"; }
 
@@ -1567,59 +1596,209 @@ child_key() {
   printf '%s\0%s\0%s' "$repo" "$role" "$branch" | python3 -c 'import sys,hashlib; print(hashlib.sha1(sys.stdin.buffer.read()).hexdigest())' | cut -c1-16
 }
 
+# child_store <op> [args...] -- the single entry point for every mutation
+# and query of child-sessions.json. All access goes through one fcntl-locked
+# python process (PY_CHILD_STORE) so concurrent --pair children that each
+# persist their own id at startup cannot clobber the whole-file rewrite.
+child_store() { python3 -c "$PY_CHILD_STORE" "$(child_sessions_file)" "$@"; }
+
 # child_session_get <key> -- echo the stored provider id for <key>, or
 # nothing when the file or entry is absent.
 child_session_get() {
   local f; f="$(child_sessions_file)"
   [[ -f "$f" ]] || return 0
-  jq -r --arg k "$1" '.[$k].id // empty' "$f" 2>/dev/null
+  child_store get "$1"
 }
 
 # child_session_fresh <key> -- succeed when <key> has a stored entry whose
 # updated_at is within CEREBRO_CHILD_SESSION_TTL seconds (default 24h). A
 # missing/unparseable timestamp or an over-TTL entry is treated as stale.
 child_session_fresh() {
-  local f ts; f="$(child_sessions_file)"
+  local f; f="$(child_sessions_file)"
   [[ -f "$f" ]] || return 1
-  ts="$(jq -r --arg k "$1" '.[$k].updated_at // empty' "$f" 2>/dev/null)"
-  [[ -n "$ts" ]] || return 1
-  python3 - "$ts" "${CEREBRO_CHILD_SESSION_TTL:-86400}" <<'PY'
-import sys, calendar, time
-try:
-    t = calendar.timegm(time.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ"))
-except Exception:
-    sys.exit(1)
-sys.exit(0 if (time.time() - t) <= int(sys.argv[2]) else 1)
-PY
+  child_store fresh "$1" "${CEREBRO_CHILD_SESSION_TTL:-86400}"
 }
 
-# child_session_set <key> <provider> <id> -- upsert {id, provider,
-# updated_at} for <key>, creating the file on first use. Writes via a temp
-# file + mv like touch_metadata; a no-op when <id> is empty.
-child_session_set() {
-  local key="$1" provider="$2" id="$3" f tmp
-  [[ -n "$id" ]] || return 0
-  f="$(child_sessions_file)"
+# child_store_begin <key> <provider> <role> <repo> <branch> <log> -- mark a
+# child as in-flight (status=running) the moment before it launches, so an
+# interrupt mid-run leaves a discoverable, resumable record. Any id already
+# stored for <key> (from a prior run we are resuming) is preserved.
+child_store_begin() {
+  [[ -n "${1:-}" ]] || return 0
+  local f; f="$(child_sessions_file)"
   [[ -f "$f" ]] || printf '{}\n' > "$f"
-  tmp="$(mktemp)" || return 0
-  jq --arg k "$key" --arg p "$provider" --arg id "$id" --arg ts "$(ts_iso)" \
-     '.[$k] = {id:$id, provider:$p, updated_at:$ts}' "$f" \
-    > "$tmp" 2>/dev/null && mv "$tmp" "$f" || rm -f "$tmp"
+  child_store begin "$1" "$2" "$3" "$4" "$5" "$6" "$(ts_iso)"
+}
+
+# child_store_done <key> -- mark a child cleanly finished (status=done). An
+# entry left at status=running is treated as interrupted/incomplete and is
+# surfaced by `cerebro status` for the orchestrator to resume on continue.
+child_store_done() {
+  [[ -n "${1:-}" ]] || return 0
+  child_store done "$1" "$(ts_iso)"
+}
+
+# child_store_list_running -- emit a TSV row
+# (key, role, repo, branch, log, started_at) for every still-fresh child left
+# at status=running (interrupted or failed before it could mark itself done).
+child_store_list_running() {
+  local f; f="$(child_sessions_file)"
+  [[ -f "$f" ]] || return 0
+  child_store list-running "${CEREBRO_CHILD_SESSION_TTL:-86400}"
 }
 
 # ----- inline python helpers -----------------------------------------------
 
+# Shared child-session store library. Prepended to every python program that
+# touches child-sessions.json (the store CLI, the claude stream parser, the
+# codex stream capture) so the id a child emits at startup is persisted the
+# INSTANT it is known -- not at the end of the run -- and an interrupt
+# therefore leaves a resumable pointer. All writes take an exclusive flock on
+# a sidecar .lock file and rewrite the JSON atomically, so concurrent --pair
+# children persisting their own ids never clobber each other.
+PY_CHILD_STORE_LIB='
+import json, sys, os, time, calendar, tempfile
+try:
+    import fcntl
+    _HAVE_FCNTL = True
+except Exception:
+    _HAVE_FCNTL = False
+
+def _now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+def _fresh(ts, ttl):
+    try:
+        t = calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return False
+    return (time.time() - t) <= ttl
+
+def _load(f):
+    try:
+        with open(f) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+def _atomic_write(f, data):
+    d = os.path.dirname(f) or "."
+    fd, tmp = tempfile.mkstemp(dir=d)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, f)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+def store_upsert(f, key, fields):
+    lf = open(f + ".lock", "w")
+    try:
+        if _HAVE_FCNTL:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+        data = _load(f)
+        entry = data.get(key) or {}
+        entry.update(fields)
+        data[key] = entry
+        _atomic_write(f, data)
+    finally:
+        try:
+            if _HAVE_FCNTL:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        lf.close()
+'
+
+# child-session store CLI. `child_store <file> <op> [args...]`. Ops:
+#   begin <key> <provider> <role> <repo> <branch> <log> <ts>  -- mark running
+#   set-id <key> <provider> <id> <ts>                          -- record the id
+#   done <key> <ts>                                            -- mark finished
+#   get <key>                  -- print the stored id (empty if none)
+#   fresh <key> <ttl>          -- exit 0 if updated_at within ttl, else 1
+#   list-running <ttl>         -- TSV of still-fresh status=running entries
+PY_CHILD_STORE="$PY_CHILD_STORE_LIB"'
+f = sys.argv[1]
+op = sys.argv[2]
+if op == "begin":
+    key, provider, role, repo, branch, log, ts = sys.argv[3:10]
+    store_upsert(f, key, {"provider": provider, "role": role, "repo": repo,
+                          "branch": branch, "log": log, "status": "running",
+                          "started_at": ts, "updated_at": ts})
+elif op == "set-id":
+    key, provider, cid, ts = sys.argv[3:7]
+    if cid:
+        store_upsert(f, key, {"id": cid, "provider": provider, "updated_at": ts})
+elif op == "done":
+    key, ts = sys.argv[3:5]
+    store_upsert(f, key, {"status": "done", "updated_at": ts})
+elif op == "get":
+    e = _load(f).get(sys.argv[3]) or {}
+    sys.stdout.write(e.get("id") or "")
+elif op == "fresh":
+    e = _load(f).get(sys.argv[3]) or {}
+    ts = e.get("updated_at") or ""
+    sys.exit(0 if (ts and _fresh(ts, int(sys.argv[4]))) else 1)
+elif op == "list-running":
+    ttl = int(sys.argv[3])
+    for key, e in _load(f).items():
+        if e.get("status") == "running" and _fresh(e.get("updated_at") or "", ttl):
+            sys.stdout.write("\t".join([
+                key, e.get("role") or "", e.get("repo") or "",
+                e.get("branch") or "", e.get("log") or "",
+                e.get("started_at") or e.get("updated_at") or "",
+            ]) + "\n")
+else:
+    sys.exit(2)
+'
+
+# codex stream capture. `python3 -c "$PY_CODEX_CAPTURE" <json_path> [store] [key]`.
+# Tees codex`s --json stream to <json_path> (for the post-run early-rejection
+# check) and, the moment the first `thread.started` event arrives, persists the
+# resumable thread_id to the store -- so an interrupted review is resumable too.
+PY_CODEX_CAPTURE="$PY_CHILD_STORE_LIB"'
+json_path = sys.argv[1]
+store_file = sys.argv[2] if len(sys.argv) > 2 else ""
+child_key = sys.argv[3] if len(sys.argv) > 3 else ""
+captured = False
+with open(json_path, "w") as out:
+    for line in sys.stdin:
+        out.write(line)
+        out.flush()
+        if captured or not (store_file and child_key):
+            continue
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            ev = json.loads(s)
+        except Exception:
+            continue
+        if ev.get("type") == "thread.started":
+            tid = ev.get("thread_id")
+            if tid:
+                store_upsert(store_file, child_key,
+                             {"id": tid, "provider": "codex", "updated_at": _now_iso()})
+                captured = True
+'
+
 # Stream-json parser shared by plan / execute / apply-review / doc-write.
 # Reads claude stream-json on stdin, emits a one-line tool-call summary on
-# stderr per tool use, captures the final `result` event's text to the
-# given file path (if non-empty), captures the child's session_id to the
-# optional second path (if non-empty), and exits non-zero if claude
-# reported anything other than a successful result.
-PY_PARSE_STREAM='
-import json, sys, os
-
+# stderr per tool use, captures the final `result` event`s text to the
+# given file path (if non-empty), captures the child`s session_id to the
+# optional second path (if non-empty) AND -- when a store file + key are
+# given -- persists it to the store at init so an interrupt stays resumable,
+# and exits non-zero if claude reported anything other than a successful
+# result.
+PY_PARSE_STREAM="$PY_CHILD_STORE_LIB"'
 result_path = sys.argv[1] if len(sys.argv) > 1 else ""
 id_path = sys.argv[2] if len(sys.argv) > 2 else ""
+store_file = sys.argv[3] if len(sys.argv) > 3 else ""
+child_key = sys.argv[4] if len(sys.argv) > 4 else ""
 result_text = None
 result_subtype = None
 saw_any_event = False
@@ -1642,6 +1821,9 @@ for line in sys.stdin:
                     f.write(sid)
             except OSError:
                 pass
+        if sid and store_file and child_key:
+            store_upsert(store_file, child_key,
+                         {"id": sid, "provider": "claude", "updated_at": _now_iso()})
     if t == "assistant":
         for item in ev.get("message", {}).get("content", []) or []:
             if item.get("type") == "tool_use":
@@ -2214,18 +2396,24 @@ attempt to authenticate. Stop after the PR is open.'
   fi
 
   # Child-session continuity: resume the same provider conversation for
-  # repeated executes on the same line of work. We only key when the branch
-  # identity is deterministic (--branch); without it the child picks its own
-  # branch name, so each run is non-resumable. A stale (over-TTL) stored id
-  # is ignored here and falls back to a fresh run.
-  local ckey="" prior=""
-  if [[ -n "$new_branch" ]]; then
-    ckey="$(child_key "$repo" execute "$new_branch")"
-    if prior="$(child_session_get "$ckey")" && [[ -n "$prior" ]] && child_session_fresh "$ckey"; then
-      :
-    else
-      prior=""
-    fi
+  # repeated executes on the same line of work -- and, crucially, for an
+  # execute that was INTERRUPTED mid-run (its id is persisted at startup, so
+  # the next call resumes the half-done work instead of redoing it). The key
+  # discriminator is --branch when given; without it we key on the plan path
+  # or the inline prompt so re-issuing the same command resumes the same
+  # conversation. A stale (over-TTL) stored id is ignored and falls back to a
+  # fresh run.
+  local store_file; store_file="$(child_sessions_file)"
+  local key_disc="${new_branch:-}"
+  if [[ -z "$key_disc" ]]; then
+    [[ -n "$plan_path" ]] && key_disc="plan:$plan_path" || key_disc="prompt:$prompt_text"
+  fi
+  local ckey prior=""
+  ckey="$(child_key "$repo" execute "$key_disc")"
+  if prior="$(child_session_get "$ckey")" && [[ -n "$prior" ]] && child_session_fresh "$ckey"; then
+    :
+  else
+    prior=""
   fi
   log_event "execute_started" "$source_desc repo=$repo base=${base_branch:-default} branch=${new_branch:-auto} resume=${prior:-none}"
 
@@ -2270,12 +2458,15 @@ attempt to authenticate. Stop after the PR is open.'
   [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
   (( pair )) && run_opts+=("${PAIR_OPTS[@]}")
 
+  # Mark the child in-flight (preserving any prior id we are resuming) BEFORE
+  # it launches, so an interrupt now leaves a resumable record.
+  child_store_begin "$ckey" claude execute "$repo" "${new_branch:-auto}" "$child_log"
   ( cd "$repo" && printf '%s' "$child_prompt" \
       | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
         "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>/dev/null \
       | tee "$child_log" \
-      | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
+      | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" "$store_file" "$ckey" )
   rc=$?
   pair_cleanup "$pair"
 
@@ -2303,7 +2494,7 @@ attempt to authenticate. Stop after the PR is open.'
         | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
           "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>/dev/null \
         | tee "$child_log" \
-        | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" )
+        | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" "$store_file" "$ckey" )
     rc=$?
     pair_cleanup "$pair"
   fi
@@ -2314,10 +2505,10 @@ attempt to authenticate. Stop after the PR is open.'
     die "execute: child claude failed (rc=$rc); see $child_log"
   fi
 
-  # Record (or refresh) the child's provider session id for the next call.
-  if [[ -n "$ckey" && -s "$id_capture" ]]; then
-    child_session_set "$ckey" claude "$(cat "$id_capture")"
-  fi
+  # The child's provider id was already persisted at startup (see
+  # PY_PARSE_STREAM); just mark this line of work cleanly finished so it no
+  # longer shows up as interrupted in `cerebro status`.
+  child_store_done "$ckey"
   rm -f "$id_capture"
   log_event "execute_finished" "$child_log"
   pair_report "$pair" "$child_log"
@@ -2369,9 +2560,12 @@ cmd_review() {
   local state_file="$state_dir/$repo_key.json"
 
   # Child-session continuity: resume the same codex conversation for repeated
-  # reviews on the same branch. Keyed by repo+role+branch (role=review keeps
-  # it distinct from the execute conversation). A stale (over-TTL) stored id
-  # is ignored and falls back to a fresh run.
+  # reviews on the same branch -- including a review that was INTERRUPTED
+  # mid-run (its thread_id is persisted as soon as codex emits it). Keyed by
+  # repo+role+branch (role=review keeps it distinct from the execute
+  # conversation). A stale (over-TTL) stored id is ignored and falls back to a
+  # fresh run.
+  local store_file; store_file="$(child_sessions_file)"
   local ckey="" prior="" review_branch
   review_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
   if [[ -n "$review_branch" ]]; then
@@ -2489,10 +2683,15 @@ $criteria_block
   else
     run_args=("${codex_opts[@]}" "$codex_prompt")
   fi
+  # Mark the review in-flight (preserving any prior thread we are resuming)
+  # before it launches; PY_CODEX_CAPTURE tees the stream to json_path AND
+  # persists the thread_id the instant codex emits it, so an interrupt mid
+  # run leaves a resumable record.
+  child_store_begin "$ckey" codex review "$repo" "${review_branch:-auto}" "$out_path"
   env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-    "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${run_args[@]}" \
-    > "$json_path" 2> "$err_path"
-  rc=$?
+    "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${run_args[@]}" 2> "$err_path" \
+    | python3 -c "$PY_CODEX_CAPTURE" "$json_path" "$store_file" "$ckey"
+  rc=${PIPESTATUS[0]}
 
   # Stale fallback: a resume can be rejected up front because codex GC'd or no
   # longer recognizes the stored rollout -- the run then fails before emitting
@@ -2505,9 +2704,9 @@ $criteria_block
     warn "review: resume of $prior failed (rc=$rc); retrying without resume"
     : > "$json_path"
     env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-      "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${codex_opts[@]}" "$codex_prompt" \
-      > "$json_path" 2> "$err_path"
-    rc=$?
+      "${TIMEOUT_CMD[@]}" "$CEREBRO_CODEX_CMD" "${codex_opts[@]}" "$codex_prompt" 2> "$err_path" \
+      | python3 -c "$PY_CODEX_CAPTURE" "$json_path" "$store_file" "$ckey"
+    rc=${PIPESTATUS[0]}
   fi
 
   # On any failure -- non-zero exit OR empty output -- preserve the err log
@@ -2522,16 +2721,10 @@ $criteria_block
     die "review: codex run failed; not echoing a findings path"
   fi
 
-  # Record (or refresh) the codex thread id for the next review on this branch.
-  # codex exposes the resumable id as thread_id in the first 'thread.started'
-  # event of the --json stream (it is NOT printed on stderr); re-review then
-  # uses `codex exec resume <thread_id>`.
-  if [[ -n "$ckey" && -s "$json_path" ]]; then
-    local cx_id
-    cx_id="$(grep -m1 '"type":"thread.started"' "$json_path" \
-             | jq -r '.thread_id // empty' 2>/dev/null)"
-    [[ -n "$cx_id" ]] && child_session_set "$ckey" codex "$cx_id"
-  fi
+  # The codex thread id was already persisted when PY_CODEX_CAPTURE saw the
+  # first 'thread.started' event (so an interrupted review stays resumable);
+  # just mark this review cleanly finished.
+  child_store_done "$ckey"
   rm -f "$json_path"
 
   # Codex's exit was zero and out_path has content; treat that as findings.
@@ -2667,12 +2860,26 @@ instruction). Skip nits and style-only items unless explicitly called
 out. Run the repo'\''s test or type-check command if one is obvious.
 Commit per AGENTS.md and push so the existing PR updates in place.'
 
+  # Child-session continuity: apply-review stays on the current branch, so we
+  # key on repo+role+branch. Repeated apply-reviews on the same PR branch
+  # resume the same conversation -- and an apply-review INTERRUPTED mid-run
+  # resumes its half-applied work instead of starting over.
+  local store_file; store_file="$(child_sessions_file)"
+  local ar_branch; ar_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  local ckey prior=""
+  ckey="$(child_key "$repo" apply-review "${ar_branch:-default}")"
+  if prior="$(child_session_get "$ckey")" && [[ -n "$prior" ]] && child_session_fresh "$ckey"; then
+    :
+  else
+    prior=""
+  fi
+
   if [[ -n "$findings" ]]; then
     say "cerebro: applying review fixes in $repo"
-    log_event "apply_review_started" "findings=$findings"
+    log_event "apply_review_started" "findings=$findings resume=${prior:-none}"
   else
     say "cerebro: applying inline fix in $repo"
-    log_event "apply_review_started" "prompt=inline"
+    log_event "apply_review_started" "prompt=inline resume=${prior:-none}"
   fi
 
   local opts=(-p --permission-mode bypassPermissions
@@ -2683,31 +2890,64 @@ Commit per AGENTS.md and push so the existing PR updates in place.'
 
   local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_IDLE=""
   if (( pair )); then
-    local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    pair_begin apply-review "$repo" "$_b" "$child_log"
+    pair_begin apply-review "$repo" "$ar_branch" "$child_log" "$prior"
     opts+=("${PAIR_OPTS[@]}")
   fi
 
-  local rc
-  ( cd "$repo" && \
-    { if [[ -n "$findings" ]]; then
-        printf 'Apply the following review findings on the current branch. Commit and push so the existing PR updates.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<findings>\n' "$notes"
-        cat "$findings"
-        printf '\n</findings>\n'
-      else
-        printf 'Apply the following fix on the current branch. Commit and push so the existing PR updates.\n\n<task>\n%s\n</task>\n' "$prompt_text"
-      fi
-    } | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
+  local child_prompt
+  child_prompt="$(
+    if [[ -n "$findings" ]]; then
+      printf 'Apply the following review findings on the current branch. Commit and push so the existing PR updates.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<findings>\n' "$notes"
+      cat "$findings"
+      printf '\n</findings>\n'
+    else
+      printf 'Apply the following fix on the current branch. Commit and push so the existing PR updates.\n\n<task>\n%s\n</task>\n' "$prompt_text"
+    fi
+  )"
+
+  local rc id_capture; id_capture="$(mktemp)"
+  local run_opts=("${opts[@]}")
+  [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
+  child_store_begin "$ckey" claude apply-review "$repo" "${ar_branch:-default}" "$child_log"
+  ( cd "$repo" && printf '%s' "$child_prompt" \
+      | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+        "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>/dev/null \
       | tee "$child_log" \
-      | python3 -c "$PY_PARSE_STREAM" "" )
+      | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" "$store_file" "$ckey" )
   rc=$?
   pair_cleanup "$pair"
+
+  # Stale fallback (same rule as execute): only retry fresh when the resumed
+  # run never started -- no init event, so id_capture is empty and nothing was
+  # mutated. A resume that started then failed is fatal (handled below); a
+  # fresh re-run would duplicate the work it already applied.
+  if (( rc != 0 )) && [[ -n "$prior" ]] && [[ ! -s "$id_capture" ]]; then
+    log_event "apply_review_resume_failed" "rc=$rc resume=$prior; retrying fresh"
+    warn "apply-review: resume of $prior failed (rc=$rc); retrying without resume"
+    : > "$id_capture"
+    local retry_opts=("${opts[@]}")
+    if (( pair )); then
+      pair_begin apply-review "$repo" "$ar_branch" "$child_log" ""
+      retry_opts+=("${PAIR_OPTS[@]}")
+    fi
+    ( cd "$repo" && printf '%s' "$child_prompt" \
+        | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
+        | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+          "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>/dev/null \
+        | tee "$child_log" \
+        | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" "$store_file" "$ckey" )
+    rc=$?
+    pair_cleanup "$pair"
+  fi
+
   if (( rc != 0 )); then
+    rm -f "$id_capture"
     log_event "apply_review_failed" "rc=$rc log=$child_log"
     die "apply-review: child claude failed (rc=$rc); see $child_log"
   fi
+  child_store_done "$ckey"
+  rm -f "$id_capture"
   log_event "apply_review_finished" "$child_log"
   pair_report "$pair" "$child_log"
   echo "$child_log"
@@ -2773,8 +3013,21 @@ samples, and command summaries so the docs accurately describe the new
 behaviour. Do not invent features the diff does not contain. Commit
 per AGENTS.md and push so the open PR updates.'
 
+  # Child-session continuity: doc-write stays on the current branch, keyed on
+  # repo+role+branch. A doc-write INTERRUPTED mid-run resumes its conversation
+  # instead of redoing the doc edits.
+  local store_file; store_file="$(child_sessions_file)"
+  local dw_branch; dw_branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  local ckey prior=""
+  ckey="$(child_key "$repo" doc-write "${dw_branch:-default}")"
+  if prior="$(child_session_get "$ckey")" && [[ -n "$prior" ]] && child_session_fresh "$ckey"; then
+    :
+  else
+    prior=""
+  fi
+
   say "cerebro: updating docs in $repo"
-  log_event "doc_write_started" "$source_desc"
+  log_event "doc_write_started" "$source_desc resume=${prior:-none}"
 
   local opts=(-p --permission-mode bypassPermissions
               --allowedTools "Read Edit Write Bash Grep Glob WebSearch WebFetch mcp__playwright__*"
@@ -2784,25 +3037,54 @@ per AGENTS.md and push so the open PR updates.'
 
   local PAIR_SID="" PAIR_OPTS=() PAIR_FIFO="" PAIR_STEER="" PAIR_IDLE=""
   if (( pair )); then
-    local _b; _b="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    pair_begin doc-write "$repo" "$_b" "$child_log"
+    pair_begin doc-write "$repo" "$dw_branch" "$child_log" "$prior"
     opts+=("${PAIR_OPTS[@]}")
   fi
 
-  local rc
-  ( cd "$repo" && \
-    { printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n%s\n</plan>\n' "$notes" "$plan_body"
-    } | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
+  local child_prompt
+  child_prompt="$(printf 'Update the docs to reflect the work described in the plan and the recent commits on this branch. Commit and push on the current branch.\n\n<orchestrator-notes>\n%s\n</orchestrator-notes>\n\n<plan>\n%s\n</plan>\n' "$notes" "$plan_body")"
+
+  local rc id_capture; id_capture="$(mktemp)"
+  local run_opts=("${opts[@]}")
+  [[ -n "$prior" ]] && run_opts+=(--resume "$prior")
+  child_store_begin "$ckey" claude doc-write "$repo" "${dw_branch:-default}" "$child_log"
+  ( cd "$repo" && printf '%s' "$child_prompt" \
+      | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
       | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
-        "${TIMEOUT_CMD[@]}" claude "${opts[@]}" 2>/dev/null \
+        "${TIMEOUT_CMD[@]}" claude "${run_opts[@]}" 2>/dev/null \
       | tee "$child_log" \
-      | python3 -c "$PY_PARSE_STREAM" "" )
+      | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" "$store_file" "$ckey" )
   rc=$?
   pair_cleanup "$pair"
+
+  # Stale fallback (same rule as execute): only retry fresh when the resumed
+  # run never started (no init -> id_capture empty), so nothing was written.
+  if (( rc != 0 )) && [[ -n "$prior" ]] && [[ ! -s "$id_capture" ]]; then
+    log_event "doc_write_resume_failed" "rc=$rc resume=$prior; retrying fresh"
+    warn "doc-write: resume of $prior failed (rc=$rc); retrying without resume"
+    : > "$id_capture"
+    local retry_opts=("${opts[@]}")
+    if (( pair )); then
+      pair_begin doc-write "$repo" "$dw_branch" "$child_log" ""
+      retry_opts+=("${PAIR_OPTS[@]}")
+    fi
+    ( cd "$repo" && printf '%s' "$child_prompt" \
+        | pair_feed "$pair" "$PAIR_FIFO" "$PAIR_STEER" "$child_log" "$PAIR_IDLE" \
+        | env -u CEREBRO_SESSION_ID -u CEREBRO_SESSION_DIR \
+          "${TIMEOUT_CMD[@]}" claude "${retry_opts[@]}" 2>/dev/null \
+        | tee "$child_log" \
+        | python3 -c "$PY_PARSE_STREAM" "" "$id_capture" "$store_file" "$ckey" )
+    rc=$?
+    pair_cleanup "$pair"
+  fi
+
   if (( rc != 0 )); then
+    rm -f "$id_capture"
     log_event "doc_write_failed" "rc=$rc log=$child_log"
     die "doc-write: child claude failed (rc=$rc); see $child_log"
   fi
+  child_store_done "$ckey"
+  rm -f "$id_capture"
   log_event "doc_write_finished" "$child_log"
   pair_report "$pair" "$child_log"
   echo "$child_log"
@@ -2897,6 +3179,23 @@ cmd_status() {
   if [[ -d "$CEREBRO_SESSION_DIR/children" ]] && \
      [[ -n "$(ls -A "$CEREBRO_SESSION_DIR/children" 2>/dev/null)" ]]; then
     (cd "$CEREBRO_SESSION_DIR/children" && ls -1t 2>/dev/null | head -5 | sed 's/^/  /')
+  else
+    echo "  (none)"
+  fi
+  echo
+  # In-flight children: any keyed child (execute / review / apply-review /
+  # doc-write) left at status=running was interrupted or failed before it
+  # could finish. Its provider conversation id is already stored, so
+  # re-issuing the SAME command resumes the half-done work instead of redoing
+  # it. The orchestrator checks this on continue (see the system prompt).
+  echo "interrupted / in-flight children (incomplete -- resume on continue):"
+  local _inflight; _inflight="$(child_store_list_running)"
+  if [[ -n "$_inflight" ]]; then
+    printf '%s\n' "$_inflight" | while IFS=$'\t' read -r _k _role _repo _branch _log _started; do
+      printf '  [%s] %s  repo=%s  branch=%s\n' "$_role" "$_started" "$_repo" "${_branch:-?}"
+      printf '      log: %s\n' "$_log"
+      printf '      resume: re-issue the same `cerebro %s %s ...` command -- cerebro --resumes this child automatically.\n' "$_role" "$_repo"
+    done
   else
     echo "  (none)"
   fi
