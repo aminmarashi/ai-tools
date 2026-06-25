@@ -190,6 +190,41 @@ Env: `REVIEW_MODEL` (default `sonnet`), `REVIEW_EFFORT` (default
 `main`), `REVIEW_ALLOWED_TOOLS` (default `Read Grep Glob Bash`),
 `REVIEW_DEBUG`.
 
+### `serialproxy`
+
+A reverse proxy that **serializes** requests to an upstream HTTP API:
+only one request is ever in flight at a time, and the rest wait in FIFO
+order rather than being rejected. Point a tool's base URL at
+`serialproxy` and every caller — across processes and sessions —
+funnels through a single global lock.
+
+```bash
+serialproxy --upstream https://api.openai.com
+serialproxy --upstream https://api.cheapestinference.com --port 8787
+SERIALPROXY_UPSTREAM=https://api.openai.com serialproxy
+```
+
+The lock is held until the **entire** response has streamed back,
+including server-sent-event (SSE) streams, so streaming API calls
+serialize correctly instead of overlapping. Callers see ordinary (if
+slower) responses, never a `429`/`503`. It is provider-agnostic — the
+method, path, headers, and body are forwarded to `--upstream`
+untouched.
+
+The motivating use is a rate-limited or single-flight LLM endpoint:
+pin an OpenAI-compatible provider's `baseURL` to `serialproxy` so every
+agent session shares one queue. Set the caller's base URL to
+`http://127.0.0.1:<port>/<api-path>`; for a provider whose real
+`baseURL` ends in `/v1`, use `http://127.0.0.1:8787/v1` and
+`serialproxy` forwards the `/v1/...` path verbatim. `GET /healthz`
+returns `{"ok": true, "active": N, "waiting": N}`.
+
+Requirements: `python3` (standard library only).
+
+Env: `SERIALPROXY_UPSTREAM`, `SERIALPROXY_PORT` (default `8787`),
+`SERIALPROXY_HOST` (default `127.0.0.1`), `SERIALPROXY_DEBUG` (default
+`1`).
+
 ## Adding a tool
 
 1. Drop the script into `bin/` and `chmod +x` it.

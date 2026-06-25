@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# serialproxy - A reverse proxy that serializes requests to an upstream HTTP
+# API: only one request is ever in flight at a time, the rest queue in FIFO
+# order. Point a tool's base URL at serialproxy and every caller — across
+# processes and sessions — funnels through a single global lock.
+#
+# The lock is held until the *entire* response has been streamed back,
+# including server-sent-event (SSE) streams, so streaming API calls serialize
+# correctly rather than overlapping. Requests wait their turn instead of being
+# rejected, so callers see ordinary (if slower) responses, never a 429/503.
+#
+# The original motivation is rate-limited or single-flight LLM endpoints: pin
+# an OpenAI-compatible provider's baseURL to serialproxy so every agent
+# session shares one queue. It is provider-agnostic — method, path, headers
+# and body are forwarded to --upstream untouched.
+#
+# Usage:
+#   serialproxy --upstream <url> [--port <n>] [--host <addr>]
+#   serialproxy --help
+#
+# Examples:
+#   serialproxy --upstream https://api.openai.com
+#   serialproxy --upstream https://api.cheapestinference.com --port 8787
+#   SERIALPROXY_UPSTREAM=https://api.openai.com serialproxy
+#
+# Then set the caller's base URL to http://127.0.0.1:<port>/<api-path>. For an
+# opencode OpenAI-compatible provider whose real baseURL ends in /v1, use
+# "http://127.0.0.1:8787/v1"; serialproxy forwards the /v1/... path verbatim.
+#
+# Health check: GET /healthz -> {"ok": true, "active": N, "waiting": N}.
+#
+# Env:
+#   SERIALPROXY_UPSTREAM   upstream base URL (same as --upstream)
+#   SERIALPROXY_PORT       listen port      (default: 8787)
+#   SERIALPROXY_HOST       listen address   (default: 127.0.0.1)
+#   SERIALPROXY_DEBUG      if 1, log every request line to stderr (default: 1)
+#
+# Requires: python3 (standard library only).
+
+set -uo pipefail
+
+UPSTREAM="${SERIALPROXY_UPSTREAM:-}"
+PORT="${SERIALPROXY_PORT:-8787}"
+HOST="${SERIALPROXY_HOST:-127.0.0.1}"
+DEBUG="${SERIALPROXY_DEBUG:-1}"
+
+usage() {
+  cat <<'EOF'
+serialproxy - serialize requests to an upstream HTTP API (one in flight at a time).
+
+Usage:
+  serialproxy --upstream <url> [--port <n>] [--host <addr>]
+  serialproxy --help
+
+Options:
+  -u, --upstream <url>   upstream base URL (env: SERIALPROXY_UPSTREAM)
+  -p, --port <n>         listen port, default 8787 (env: SERIALPROXY_PORT)
+      --host <addr>      listen address, default 127.0.0.1 (env: SERIALPROXY_HOST)
+  -h, --help             show this help
+EOF
+}
+
+die() {
+  printf 'serialproxy: %s\n\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -u|--upstream) UPSTREAM="${2:-}"; [[ -n "$UPSTREAM" ]] || die "missing value for $1"; shift 2 ;;
+    -p|--port) PORT="${2:-}"; [[ -n "$PORT" ]] || die "missing value for $1"; shift 2 ;;
+    --host) HOST="${2:-}"; [[ -n "$HOST" ]] || die "missing value for $1"; shift 2 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "$UPSTREAM" ]] || die "an upstream base URL is required (--upstream or SERIALPROXY_UPSTREAM)"
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+
+UPSTREAM="${UPSTREAM%/}"
+
+exec python3 - "$UPSTREAM" "$PORT" "$HOST" "$DEBUG" <<'PY'
+import sys, threading, collections, urllib.parse, http.client, socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM, PORT, HOST, DEBUG = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
+UP = urllib.parse.urlsplit(UPSTREAM)
+
+# Hop-by-hop headers must not be forwarded. accept-encoding is stripped so the
+# upstream replies uncompressed and we can re-stream bytes as-is.
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "accept-encoding",
+}
+
+
+class FairLock:
+    """A strictly FIFO single-slot lock: requests are served in arrival order."""
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._queue = collections.deque()
+        self._busy = False
+
+    def acquire(self):
+        with self._cv:
+            me = object()
+            self._queue.append(me)
+            while self._busy or self._queue[0] is not me:
+                self._cv.wait()
+            self._busy = True
+            self._queue.popleft()
+
+    def release(self):
+        with self._cv:
+            self._busy = False
+            self._cv.notify_all()
+
+
+LOCK = FairLock()
+COUNTERS = threading.Lock()
+active = 0
+waiting = 0
+
+
+def log(line):
+    if DEBUG:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):  # silence the default per-request stderr spam
+        pass
+
+    def _handle(self):
+        global active, waiting
+        if self.path == "/healthz":
+            self._respond_json(200, b'{"ok": true, "active": %d, "waiting": %d}'
+                               % (active, waiting))
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+
+        with COUNTERS:
+            waiting += 1
+        LOCK.acquire()
+        with COUNTERS:
+            waiting -= 1
+            active += 1
+        try:
+            self._forward(body)
+        finally:
+            with COUNTERS:
+                active -= 1
+            LOCK.release()
+
+    def _forward(self, body):
+        headers = [(k, v) for k, v in self.headers.items()
+                   if k.lower() not in HOP_BY_HOP]
+        if UP.scheme == "https":
+            conn = http.client.HTTPSConnection(UP.hostname, UP.port or 443, timeout=600)
+        else:
+            conn = http.client.HTTPConnection(UP.hostname, UP.port or 80, timeout=600)
+
+        try:
+            path = (UP.path.rstrip("/") + self.path) if UP.path else self.path
+            conn.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
+            for k, v in headers:
+                conn.putheader(k, v)
+            conn.putheader("Host", UP.netloc)
+            conn.putheader("Content-Length", str(len(body)))
+            conn.endheaders()
+            if body:
+                conn.send(body)
+
+            up = conn.getresponse()
+            out = [(k, v) for k, v in up.getheaders() if k.lower() not in HOP_BY_HOP]
+            has_len = any(k.lower() == "content-length" for k, _ in out)
+
+            self.send_response(up.status)
+            for k, v in out:
+                self.send_header(k, v)
+            # No upstream content-length (e.g. an SSE stream): frame our reply
+            # as chunked so we can stream it without buffering the whole body.
+            if not has_len:
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            while True:
+                chunk = up.read(65536)
+                if not chunk:
+                    break
+                if has_len:
+                    self.wfile.write(chunk)
+                else:
+                    self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
+                self.wfile.flush()
+            if not has_len:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+            log("%s %s -> %d (waiting=%d)" % (self.command, self.path, up.status, waiting))
+        except Exception as e:
+            log("%s %s -> ERROR %s" % (self.command, self.path, e))
+            try:
+                self._respond_json(502, b'{"error": {"message": "serialproxy upstream error"}}')
+            except Exception:
+                pass
+        finally:
+            conn.close()
+
+    def _respond_json(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _handle
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+httpd = Server((HOST, PORT), Handler)
+log("serialproxy listening on http://%s:%d -> %s (concurrency=1)" % (HOST, PORT, UPSTREAM))
+try:
+    httpd.serve_forever()
+except KeyboardInterrupt:
+    pass
+PY
