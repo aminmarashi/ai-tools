@@ -9,6 +9,19 @@
 # correctly rather than overlapping. Requests wait their turn instead of being
 # rejected, so callers see ordinary (if slower) responses, never a 429/503.
 #
+# Two more guards smooth over providers that release their per-key rate-limit
+# slot with a lag — serializing to one in-flight request isn't enough when calls
+# fire in rapid succession, because the just-finished request's slot is still
+# counted for a moment:
+#   1. Pacing      - leave a minimum gap (SERIALPROXY_MIN_GAP_MS) since the
+#                    previous upstream call finished, so its slot has time to
+#                    free before the next call goes out.
+#   2. Retry on 429 - if upstream still returns 429, retry with exponential
+#                    backoff (SERIALPROXY_MAX_RETRIES) transparently, so the
+#                    caller sees a clean response instead of a failed turn. The
+#                    lock is held across the whole retry sequence, so nothing
+#                    else hits upstream meanwhile.
+#
 # The original motivation is rate-limited or single-flight LLM endpoints: pin
 # an OpenAI-compatible provider's baseURL to serialproxy so every agent
 # session shares one queue. It is provider-agnostic — method, path, headers
@@ -30,10 +43,14 @@
 # Health check: GET /healthz -> {"ok": true, "active": N, "waiting": N}.
 #
 # Env:
-#   SERIALPROXY_UPSTREAM   upstream base URL (same as --upstream)
-#   SERIALPROXY_PORT       listen port      (default: 8787)
-#   SERIALPROXY_HOST       listen address   (default: 127.0.0.1)
-#   SERIALPROXY_DEBUG      if 1, log every request line to stderr (default: 1)
+#   SERIALPROXY_UPSTREAM     upstream base URL (same as --upstream)
+#   SERIALPROXY_PORT         listen port      (default: 8787)
+#   SERIALPROXY_HOST         listen address   (default: 127.0.0.1)
+#   SERIALPROXY_DEBUG        if 1, log every request line to stderr (default: 1)
+#   SERIALPROXY_MIN_GAP_MS   min gap since the previous upstream call finished
+#                            before the next goes out, ms; 0 disables (default: 1500)
+#   SERIALPROXY_MAX_RETRIES  times to retry upstream on a 429 before surfacing
+#                            it (default: 6)
 #
 # Requires: python3 (standard library only).
 
@@ -82,11 +99,31 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required"
 UPSTREAM="${UPSTREAM%/}"
 
 exec python3 - "$UPSTREAM" "$PORT" "$HOST" "$DEBUG" <<'PY'
-import sys, threading, collections, urllib.parse, http.client, socket
+import sys, os, time, threading, collections, urllib.parse, http.client, socket
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM, PORT, HOST, DEBUG = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
 UP = urllib.parse.urlsplit(UPSTREAM)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "").strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+# Minimum gap (seconds) between the end of one upstream call and the start of
+# the next, giving a provider's lagged per-key rate-limit slot time to release.
+MIN_GAP = max(0, _env_int("SERIALPROXY_MIN_GAP_MS", 1500)) / 1000.0
+# How many times to retry upstream on a 429 before surfacing it to the caller.
+MAX_RETRIES = max(0, _env_int("SERIALPROXY_MAX_RETRIES", 6))
+
+
+def retry_backoff(attempt):
+    """Backoff (seconds) before the attempt-th retry (1-based): 0.5,1,2,4,…cap 6."""
+    shift = min(max(attempt - 1, 0), 6)
+    return min(0.5 * (1 << shift), 6.0)
 
 # Hop-by-hop headers must not be forwarded. accept-encoding is stripped so the
 # upstream replies uncompressed and we can re-stream bytes as-is.
@@ -125,6 +162,32 @@ COUNTERS = threading.Lock()
 active = 0
 waiting = 0
 
+# When the previous upstream call finished (response fully drained, or errored).
+# Drives pacing; stamped while still holding LOCK so the next waiter measures the
+# gap from the moment the response actually finished.
+LAST_CALL_LOCK = threading.Lock()
+last_call = None
+
+
+def mark_call_finished():
+    global last_call
+    with LAST_CALL_LOCK:
+        last_call = time.monotonic()
+
+
+def pace():
+    """Sleep out the remainder of MIN_GAP since the previous upstream call ended,
+    so the provider's per-key slot has released before we hit it again."""
+    if MIN_GAP <= 0:
+        return
+    with LAST_CALL_LOCK:
+        prev = last_call
+    if prev is None:
+        return
+    wait = MIN_GAP - (time.monotonic() - prev)
+    if wait > 0:
+        time.sleep(wait)
+
 
 def log(line):
     if DEBUG:
@@ -155,32 +218,55 @@ class Handler(BaseHTTPRequestHandler):
             waiting -= 1
             active += 1
         try:
+            # Pace, then forward — both under the lock, so nothing else hits
+            # upstream while we wait out the previous call's lagged slot.
+            pace()
             self._forward(body)
         finally:
             with COUNTERS:
                 active -= 1
             LOCK.release()
 
+    def _open_conn(self):
+        if UP.scheme == "https":
+            return http.client.HTTPSConnection(UP.hostname, UP.port or 443, timeout=600)
+        return http.client.HTTPConnection(UP.hostname, UP.port or 80, timeout=600)
+
     def _forward(self, body):
         headers = [(k, v) for k, v in self.headers.items()
                    if k.lower() not in HOP_BY_HOP]
-        if UP.scheme == "https":
-            conn = http.client.HTTPSConnection(UP.hostname, UP.port or 443, timeout=600)
-        else:
-            conn = http.client.HTTPConnection(UP.hostname, UP.port or 80, timeout=600)
+        path = (UP.path.rstrip("/") + self.path) if UP.path else self.path
+        conn = None
 
         try:
-            path = (UP.path.rstrip("/") + self.path) if UP.path else self.path
-            conn.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
-            for k, v in headers:
-                conn.putheader(k, v)
-            conn.putheader("Host", UP.netloc)
-            conn.putheader("Content-Length", str(len(body)))
-            conn.endheaders()
-            if body:
-                conn.send(body)
+            # Retry on 429 with exponential backoff — transparent to the caller.
+            # The lock (and pacing) are held for the whole sequence, so nothing
+            # else hits upstream meanwhile.
+            attempt = 0
+            while True:
+                conn = self._open_conn()
+                conn.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
+                for k, v in headers:
+                    conn.putheader(k, v)
+                conn.putheader("Host", UP.netloc)
+                conn.putheader("Content-Length", str(len(body)))
+                conn.endheaders()
+                if body:
+                    conn.send(body)
 
-            up = conn.getresponse()
+                up = conn.getresponse()
+                if up.status == 429 and attempt < MAX_RETRIES:
+                    attempt += 1
+                    up.read()  # drain the 429 body so we can discard the conn
+                    conn.close()
+                    conn = None
+                    time.sleep(retry_backoff(attempt))
+                    continue
+                break
+            if attempt:
+                log("%s %s retried past 429s (attempts=%d) -> %d"
+                    % (self.command, self.path, attempt + 1, up.status))
+
             out = [(k, v) for k, v in up.getheaders() if k.lower() not in HOP_BY_HOP]
             has_len = any(k.lower() == "content-length" for k, _ in out)
 
@@ -213,7 +299,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
+            # Stamp when this call finished, so pacing measures from here. Still
+            # under LOCK (released by _handle's finally after this returns).
+            mark_call_finished()
 
     def _respond_json(self, status, payload):
         self.send_response(status)
