@@ -206,8 +206,9 @@ SERIALPROXY_UPSTREAM=https://api.openai.com serialproxy
 
 The lock is held until the **entire** response has streamed back,
 including server-sent-event (SSE) streams, so streaming API calls
-serialize correctly instead of overlapping. Callers see ordinary (if
-slower) responses, never a `429`/`503`. It is provider-agnostic — the
+serialize correctly instead of overlapping. It just forwards each
+request as its turn comes up and surfaces whatever upstream returns
+verbatim — no pacing, no retries. It is provider-agnostic — the
 method, path, headers, and body are forwarded to `--upstream`
 untouched.
 
