@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# ollama-stopfix - A corrective reverse proxy in front of ollama's Anthropic
+# API that enforces spec-correct stop_reason. Point claude (or any Anthropic
+# Messages API client) at ollama-stopfix instead of ollama directly and every
+# /v1/messages response is checked: if it contains a tool_use content block,
+# its stop_reason is forced to "tool_use" — which the Anthropic spec requires
+# whenever tool_use is present, regardless of what the upstream reports.
+#
+# WHY
+# ollama 0.31.x's Anthropic-compatibility layer (and ollama Cloud behind it)
+# stochastically returns stop_reason "end_turn" for an assistant turn that
+# carries a tool_use block but no text block. The Claude Code CLI, seeing
+# "end_turn" with no assistant text, treats the turn as "no visible output"
+# and injects a synthetic user nudge:
+#
+#     [Your previous response had no visible output. Please continue and
+#      produce a user-visible response.]
+#
+# In an interactive session that nudge is noise; in a non-interactive agent
+# child it is read as "stop working and give a final answer," terminating the
+# run early. The correction here is strictly spec-compliant: it only ever sets
+# stop_reason to "tool_use" when a tool_use block is actually present, so it
+# can never make a correct response wrong.
+#
+# The fix targets /v1/messages only (buffered and streamed/SSE). Every other
+# path, header, status, and body is forwarded untouched — ollama-stopfix is a
+# transparent pass-through outside of that one correction.
+#
+# Usage:
+#   ollama-stopfix [--upstream <url>] [--port <n>] [--host <addr>]
+#   ollama-stopfix --help
+#
+# Examples:
+#   ollama-stopfix                                  # -> 127.0.0.1:11435 -> 127.0.0.1:11434
+#   ollama-stopfix --upstream http://127.0.0.1:11434 --port 11435
+#   OLLAMA_STOPFIX_UPSTREAM=http://127.0.0.1:11434 ollama-stopfix
+#
+# Then point the client at the proxy:
+#   export ANTHROPIC_BASE_URL=http://127.0.0.1:11435
+#
+# Health check: GET /healthz -> {"ok": true}.
+#
+# Env:
+#   OLLAMA_STOPFIX_UPSTREAM   upstream base URL (default: http://127.0.0.1:11434)
+#   OLLAMA_STOPFIX_PORT       listen port      (default: 11435)
+#   OLLAMA_STOPFIX_HOST       listen address   (default: 127.0.0.1)
+#   OLLAMA_STOPFIX_DEBUG      if 1, log requests + stop_reason corrections to stderr (default: 1)
+#
+# Requires: python3 (standard library only).
+
+set -uo pipefail
+
+UPSTREAM="${OLLAMA_STOPFIX_UPSTREAM:-http://127.0.0.1:11434}"
+PORT="${OLLAMA_STOPFIX_PORT:-11435}"
+HOST="${OLLAMA_STOPFIX_HOST:-127.0.0.1}"
+DEBUG="${OLLAMA_STOPFIX_DEBUG:-1}"
+
+usage() {
+  cat <<'EOF'
+ollama-stopfix - enforce spec-correct stop_reason in front of ollama's Anthropic API.
+
+Usage:
+  ollama-stopfix [--upstream <url>] [--port <n>] [--host <addr>]
+  ollama-stopfix --help
+
+Options:
+  -u, --upstream <url>   upstream base URL (env: OLLAMA_STOPFIX_UPSTREAM)
+                         default: http://127.0.0.1:11434
+  -p, --port <n>         listen port, default 11435 (env: OLLAMA_STOPFIX_PORT)
+      --host <addr>      listen address, default 127.0.0.1 (env: OLLAMA_STOPFIX_HOST)
+  -h, --help             show this help
+EOF
+}
+
+die() {
+  printf 'ollama-stopfix: %s\n\n' "$1" >&2
+  usage >&2
+  exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -u|--upstream) UPSTREAM="${2:-}"; [[ -n "$UPSTREAM" ]] || die "missing value for $1"; shift 2 ;;
+    -p|--port) PORT="${2:-}"; [[ -n "$PORT" ]] || die "missing value for $1"; shift 2 ;;
+    --host) HOST="${2:-}"; [[ -n "$HOST" ]] || die "missing value for $1"; shift 2 ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required"
+UPSTREAM="${UPSTREAM%/}"
+
+exec python3 - "$UPSTREAM" "$PORT" "$HOST" "$DEBUG" <<'PY'
+import sys, json, urllib.parse, http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UPSTREAM, PORT, HOST, DEBUG = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1"
+UP = urllib.parse.urlsplit(UPSTREAM)
+
+# Hop-by-hop headers must not be forwarded. accept-encoding is stripped so the
+# upstream replies uncompressed and we can rewrite the JSON / SSE safely.
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "accept-encoding",
+}
+
+
+def log(line):
+    if DEBUG:
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+
+def buffered_has_tool_use(body: bytes) -> bool:
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    content = parsed.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content)
+
+
+def fix_buffered(body: bytes):
+    """Return (new_body, corrected: bool) for a buffered /v1/messages response."""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return body, False
+    if not isinstance(parsed, dict):
+        return body, False
+    if parsed.get("stop_reason") == "tool_use":
+        return body, False  # already correct; never touch it
+    content = parsed.get("content")
+    if not isinstance(content, list):
+        return body, False
+    if not any(isinstance(b, dict) and b.get("type") == "tool_use" for b in content):
+        return body, False  # no tool_use -> leave the model's stop_reason alone
+    before = parsed.get("stop_reason")
+    parsed["stop_reason"] = "tool_use"
+    return json.dumps(parsed, ensure_ascii=False).encode("utf-8"), before
+
+
+class SSEStopReasonRewriter:
+    """Relay an SSE stream, forcing the terminal message_delta stop_reason to
+    "tool_use" when a tool_use content_block appeared earlier in the stream.
+
+    All events pass through byte-for-byte except the one message_delta whose
+    stop_reason needs correcting. SSE lines are newline-delimited; a trailing
+    partial line is carried in `carry` across chunks.
+    """
+
+    def __init__(self):
+        self.saw_tool_use = False
+        self.carry = b""
+        self.corrected_from = None
+
+    def feed(self, raw: bytes):
+        """Process a chunk; return bytes to emit downstream."""
+        data = self.carry + raw
+        *lines, self.carry = data.split(b"\n")
+        out = bytearray()
+        for line in lines:
+            out += self._rewrite_line(line)
+            out += b"\n"
+        return bytes(out)
+
+    def flush(self):
+        """Emit any trailing partial line at stream end."""
+        if self.carry:
+            line, self.carry = self.carry, b""
+            return self._rewrite_line(line)
+        return b""
+
+    def _rewrite_line(self, line: bytes) -> bytes:
+        stripped = line.strip()
+        if not stripped.startswith(b"data:"):
+            return line
+        try:
+            ev = json.loads(stripped[len(b"data:"):].lstrip())
+        except ValueError:
+            return line
+        if not isinstance(ev, dict):
+            return line
+        etype = ev.get("type")
+        if etype == "content_block_start":
+            block = ev.get("content_block")
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                self.saw_tool_use = True
+        elif etype == "message_delta":
+            delta = ev.get("delta")
+            if isinstance(delta, dict) and self.saw_tool_use and delta.get("stop_reason") != "tool_use":
+                self.corrected_from = delta.get("stop_reason")
+                delta["stop_reason"] = "tool_use"
+                return b"data: " + json.dumps(ev, ensure_ascii=False).encode("utf-8")
+        return line
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):  # silence the default per-request stderr spam
+        pass
+
+    def _handle(self):
+        if self.path == "/healthz":
+            self._respond_json(200, b'{"ok": true}')
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+
+        is_messages = self.path.startswith("/v1/messages")
+        streaming = False
+        if is_messages and body:
+            try:
+                req = json.loads(body)
+                if isinstance(req, dict) and req.get("stream") is True:
+                    streaming = True
+            except ValueError:
+                pass
+
+        conn = None
+        try:
+            conn = self._open_conn()
+            headers = [(k, v) for k, v in self.headers.items() if k.lower() not in HOP_BY_HOP]
+            path = (UP.path.rstrip("/") + self.path) if UP.path else self.path
+            conn.putrequest(self.command, path, skip_host=True, skip_accept_encoding=True)
+            for k, v in headers:
+                conn.putheader(k, v)
+            conn.putheader("Host", UP.netloc)
+            conn.putheader("Content-Length", str(len(body)))
+            conn.endheaders()
+            if body:
+                conn.send(body)
+
+            up = conn.getresponse()
+            out_headers = [(k, v) for k, v in up.getheaders() if k.lower() not in HOP_BY_HOP]
+            has_len = any(k.lower() == "content-length" for k, _ in out_headers)
+
+            if is_messages and not streaming:
+                raw = up.read()
+                fixed, corrected_from = fix_buffered(raw)
+                self.send_response(up.status)
+                for k, v in out_headers:
+                    if k.lower() == "content-length":
+                        self.send_header("Content-Length", str(len(fixed)))
+                    else:
+                        self.send_header(k, v)
+                if not any(k.lower() == "content-length" for k, _ in out_headers):
+                    self.send_header("Content-Length", str(len(fixed)))
+                self.end_headers()
+                self.wfile.write(fixed)
+                if corrected_from is not False:
+                    log("%s %s -> %d stop_reason %s->tool_use" % (
+                        self.command, self.path, up.status, corrected_from))
+                else:
+                    log("%s %s -> %d" % (self.command, self.path, up.status))
+            else:
+                self.send_response(up.status)
+                for k, v in out_headers:
+                    self.send_header(k, v)
+                rewriter = SSEStopReasonRewriter() if (is_messages and streaming) else None
+                # SSE streams have no content-length; frame chunked so we can
+                # relay (and patch) without buffering the whole body.
+                if not has_len:
+                    self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+
+                while True:
+                    chunk = up.read(65536)
+                    if not chunk:
+                        break
+                    if rewriter is not None:
+                        chunk = rewriter.feed(chunk)
+                        if chunk:
+                            if has_len:
+                                self.wfile.write(chunk)
+                            else:
+                                self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
+                    else:
+                        if has_len:
+                            self.wfile.write(chunk)
+                        else:
+                            self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
+                    self.wfile.flush()
+                if rewriter is not None:
+                    tail = rewriter.flush()
+                    if tail:
+                        if has_len:
+                            self.wfile.write(tail)
+                        else:
+                            self.wfile.write(b"%X\r\n%s\r\n" % (len(tail), tail))
+                if not has_len:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                if rewriter is not None:
+                    if rewriter.corrected_from is not None:
+                        log("%s %s -> %d stop_reason %s->tool_use (stream)" % (
+                            self.command, self.path, up.status, rewriter.corrected_from))
+                    else:
+                        log("%s %s -> %d (stream)" % (self.command, self.path, up.status))
+                else:
+                    log("%s %s -> %d" % (self.command, self.path, up.status))
+        except Exception as e:
+            log("%s %s -> ERROR %s" % (self.command, self.path, e))
+            try:
+                self._respond_json(502, b'{"error": {"message": "ollama-stopfix upstream error"}}')
+            except Exception:
+                pass
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def _open_conn(self):
+        if UP.scheme == "https":
+            return http.client.HTTPSConnection(UP.hostname, UP.port or 443, timeout=600)
+        return http.client.HTTPConnection(UP.hostname, UP.port or 80, timeout=600)
+
+    def _respond_json(self, status, payload):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _handle
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+httpd = Server((HOST, PORT), Handler)
+log("ollama-stopfix listening on http://%s:%d -> %s" % (HOST, PORT, UPSTREAM))
+try:
+    httpd.serve_forever()
+except KeyboardInterrupt:
+    pass
+PY

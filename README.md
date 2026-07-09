@@ -226,6 +226,53 @@ Env: `SERIALPROXY_UPSTREAM`, `SERIALPROXY_PORT` (default `8787`),
 `SERIALPROXY_HOST` (default `127.0.0.1`), `SERIALPROXY_DEBUG` (default
 `1`).
 
+### `ollama-stopfix`
+
+A corrective reverse proxy in front of ollama's Anthropic-compatibility API
+that enforces **spec-correct `stop_reason`**. Point claude (or any Anthropic
+Messages API client) at `ollama-stopfix` instead of ollama directly, and
+every `/v1/messages` response is checked: if it carries a `tool_use` content
+block, its `stop_reason` is forced to `tool_use` — which the Anthropic spec
+requires whenever `tool_use` is present, regardless of what the upstream
+reports. Everything else (other paths, headers, status, body) is forwarded
+untouched.
+
+```bash
+ollama-stopfix                                  # 127.0.0.1:11435 -> 127.0.0.1:11434
+ollama-stopfix --upstream http://127.0.0.1:11434 --port 11435
+OLLAMA_STOPFIX_UPSTREAM=http://127.0.0.1:11434 ollama-stopfix
+```
+
+Then point the client at the proxy:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:11435
+```
+
+**Why it exists.** ollama 0.31.x's Anthropic layer (and ollama Cloud behind
+it) stochastically returns `stop_reason: "end_turn"` for an assistant turn
+that carries a `tool_use` block but no `text` block. The Claude Code CLI,
+seeing `end_turn` with no assistant text, treats the turn as "no visible
+output" and injects a synthetic user nudge
+(`[Your previous response had no visible output. Please continue and
+produce a user-visible response.]`). In an interactive session that nudge
+is noise; in a non-interactive agent child it reads as "stop working and give
+a final answer," terminating the run early.
+
+The correction is strictly spec-compliant: it only ever sets `stop_reason`
+to `tool_use` when a `tool_use` block is actually present, so it can never
+turn a correct response into a wrong one. It handles both buffered JSON and
+SSE-streamed responses (rewriting the terminal `message_delta`
+`stop_reason` in-flight while tracking `content_block_start` for
+`tool_use`). `GET /healthz` returns `{"ok": true}`.
+
+Requirements: `python3` (standard library only).
+
+Env: `OLLAMA_STOPFIX_UPSTREAM` (default `http://127.0.0.1:11434`),
+`OLLAMA_STOPFIX_PORT` (default `11435`), `OLLAMA_STOPFIX_HOST` (default
+`127.0.0.1`), `OLLAMA_STOPFIX_DEBUG` (default `1`, logs each request and each
+`stop_reason` correction to stderr).
+
 ## Adding a tool
 
 1. Drop the script into `bin/` and `chmod +x` it.

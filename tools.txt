@@ -4,3 +4,4 @@ plan2pdf
 diff2plan
 review
 serialproxy
+ollama-stopfix
